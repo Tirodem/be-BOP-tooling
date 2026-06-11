@@ -193,45 +193,64 @@ main() {
     fi
     log_info "upgrade-all: target=${VERSION}, mode=${MODE}, filter='${FILTER:-(none)}', tenants=${#filtered[@]}: ${filtered[*]}"
 
+    # Categorize tenants BEFORE iterating: a tenant whose current symlink
+    # already resolves to the target tag is bypassed entirely (no child
+    # process, no service restart). Cleaner separation in the summary +
+    # notification than relying on each child to no-op silently.
+    local bypassed=() to_upgrade=()
+    local t current
+    for t in "${filtered[@]}"; do
+        current=$(release_get_current_tag "$t")
+        if [[ "$current" == "$VERSION" ]]; then
+            bypassed+=("$t")
+        else
+            to_upgrade+=("$t")
+        fi
+    done
+    if (( ${#bypassed[@]} > 0 )); then
+        log_info "upgrade-all: bypassing ${#bypassed[@]} tenant(s) already on ${VERSION}: ${bypassed[*]}"
+    fi
+
     local failed=() succeeded=()
 
-    case "$MODE" in
-        rolling)
-            local t
-            for t in "${filtered[@]}"; do
-                log_info "==== upgrading ${t} (rolling) ===="
-                local rc=0
-                "$upgrade_tenant_path" $(upgrade_tenant_argv "$t") || rc=$?
-                if (( rc == 0 )); then
-                    succeeded+=("$t")
-                else
-                    failed+=("$t")
-                    if [[ "$CONTINUE_ON_FAILURE" != "true" ]]; then
-                        log_error "rolling upgrade aborted on failure of '${t}' (use --continue-on-failure to keep going)"
-                        break
+    if (( ${#to_upgrade[@]} > 0 )); then
+        case "$MODE" in
+            rolling)
+                for t in "${to_upgrade[@]}"; do
+                    log_info "==== upgrading ${t} (rolling) ===="
+                    local rc=0
+                    "$upgrade_tenant_path" $(upgrade_tenant_argv "$t") || rc=$?
+                    if (( rc == 0 )); then
+                        succeeded+=("$t")
+                    else
+                        failed+=("$t")
+                        if [[ "$CONTINUE_ON_FAILURE" != "true" ]]; then
+                            log_error "rolling upgrade aborted on failure of '${t}' (use --continue-on-failure to keep going)"
+                            break
+                        fi
                     fi
-                fi
-            done
-            ;;
-        parallel)
-            local t pids=() pid t_for_pid=()
-            for t in "${filtered[@]}"; do
-                log_info "==== launching upgrade for ${t} (parallel) ===="
-                "$upgrade_tenant_path" $(upgrade_tenant_argv "$t") &
-                pid=$!
-                pids+=("$pid")
-                t_for_pid+=("$t")
-            done
-            local i
-            for (( i=0; i<${#pids[@]}; i++ )); do
-                if wait "${pids[$i]}" 2>/dev/null; then
-                    succeeded+=("${t_for_pid[$i]}")
-                else
-                    failed+=("${t_for_pid[$i]}")
-                fi
-            done
-            ;;
-    esac
+                done
+                ;;
+            parallel)
+                local pids=() pid t_for_pid=()
+                for t in "${to_upgrade[@]}"; do
+                    log_info "==== launching upgrade for ${t} (parallel) ===="
+                    "$upgrade_tenant_path" $(upgrade_tenant_argv "$t") &
+                    pid=$!
+                    pids+=("$pid")
+                    t_for_pid+=("$t")
+                done
+                local i
+                for (( i=0; i<${#pids[@]}; i++ )); do
+                    if wait "${pids[$i]}" 2>/dev/null; then
+                        succeeded+=("${t_for_pid[$i]}")
+                    else
+                        failed+=("${t_for_pid[$i]}")
+                    fi
+                done
+                ;;
+        esac
+    fi
 
     cat <<EOF
 
@@ -239,7 +258,8 @@ main() {
   upgrade-all summary  (target: ${VERSION}, mode: ${MODE})
 ==========================================================================
   Selected:   ${#filtered[@]}  (${filtered[*]})
-  Succeeded:  ${#succeeded[@]} ${succeeded[*]:-}
+  Bypassed:   ${#bypassed[@]}  ${bypassed[*]:-}    (already on target)
+  Upgraded:   ${#succeeded[@]} ${succeeded[*]:-}
   Failed:     ${#failed[@]}    ${failed[*]:-}
 ==========================================================================
 EOF
@@ -248,14 +268,25 @@ EOF
     if (( ${#failed[@]} > 0 )); then
         notify_failure \
             "[be-BOP tooling] upgrade-all (${VERSION}) had ${#failed[@]} failure(s)" \
-            "Failed tenants: ${failed[*]}
-Succeeded: ${succeeded[*]:-(none)}
-Mode: ${MODE}"
+            "Failed tenants:  ${failed[*]}
+Upgraded:        ${succeeded[*]:-(none)}
+Bypassed:        ${bypassed[*]:-(none)}
+Mode:            ${MODE}"
         exit 1
     fi
-    notify_success \
-        "[be-BOP tooling] upgrade-all OK (${#succeeded[@]} tenants → ${VERSION})" \
-        "Tenants: ${succeeded[*]}"
+    # All-bypass case: nothing actually changed; still notify so operators
+    # know the run happened, but with a clear "no-op" subject.
+    if (( ${#succeeded[@]} == 0 )); then
+        notify_success \
+            "[be-BOP tooling] upgrade-all NO-OP (${#bypassed[@]} tenants already on ${VERSION})" \
+            "All ${#bypassed[@]} selected tenants were already on ${VERSION} — nothing to do.
+Tenants: ${bypassed[*]}"
+    else
+        notify_success \
+            "[be-BOP tooling] upgrade-all OK (${#succeeded[@]} upgraded, ${#bypassed[@]} bypassed → ${VERSION})" \
+            "Upgraded:  ${succeeded[*]}
+Bypassed:  ${bypassed[*]:-(none)}"
+    fi
 }
 
 main "$@"
