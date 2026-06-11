@@ -45,9 +45,14 @@ source "$BEBOP_TOOLING_LIB_DIR/log.sh"
 source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
 # shellcheck source=lib/registry.sh
 source "$BEBOP_TOOLING_LIB_DIR/registry.sh"
+# shellcheck source=lib/notify.sh
+source "$BEBOP_TOOLING_LIB_DIR/notify.sh"
 
 # GitHub repository for be-BOP releases
 readonly BEBOP_GITHUB_REPO="${BEBOP_GITHUB_REPO:-be-BOP-io-SA/be-BOP}"
+
+# Secrets file (Zulip + SMTP credentials for notifications).
+readonly SECRETS_FILE="${SECRETS_FILE:-/etc/be-BOP-tooling/secrets.env}"
 
 # Network timeout constants
 readonly CURL_CONNECT_TIMEOUT=${CURL_CONNECT_TIMEOUT:-30}
@@ -379,19 +384,34 @@ list_releases() {
 install_release() {
     local target_version="${RELEASE_VERSION:-}"
 
+    # Load notification credentials (Zulip + SMTP) from the operator secrets
+    # file. install paths run as root (main() re-execs via sudo), so the
+    # 0600 secrets.env is directly readable here.
+    if [[ -f "$SECRETS_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$SECRETS_FILE"
+    else
+        log_warn "secrets file ${SECRETS_FILE} missing; notifications will be skipped"
+    fi
+
+    # Resolve the tenant's public domain for notification bodies.
+    local tenant_domain
+    tenant_domain="$(registry_get_field "$TENANT_ID" domain)"
+
     if [[ -z "${RELEASE_META:-}" ]]; then
         fetch_all_releases
     fi
 
-    local target_url
-    local target_name
+    local target_url target_name version_for_message
     case "$target_version" in
       ""|latest)
         target_url="$(echo "$RELEASE_META" | jq -r '.[0].asset_url')"
         target_name="$(echo "$RELEASE_META" | jq -r '.[0].asset_name | sub("\\.zip$"; "")')"
+        version_for_message="$(echo "$RELEASE_META" | jq -r '.[0].tag_name')"
         ;;
       branch=*)
         local branch_name="${target_version#branch=}"
+        version_for_message="branch ${branch_name}"
         # GitHub's artifact.ci encodes '/' as '__' in branch names.
         branch_name="${branch_name//\//__}"
         target_url="https://www.artifact.ci/artifact/view/be-BOP-io-SA/be-BOP/branch/$branch_name/be-BOP-release/be-BOP-release.zip"
@@ -402,8 +422,13 @@ install_release() {
         target_meta="$(echo "$RELEASE_META" | jq -r 'first(.[]|select(.tag_name == "'"$target_version"'"))')"
         target_url="$(echo "$target_meta" | jq -r '.asset_url')"
         target_name="$(echo "$target_meta" | jq -r '.asset_name | sub("\\.zip$"; "")')"
+        version_for_message="$target_version"
         ;;
     esac
+
+    # On any error past this point, notify operators before the script exits.
+    # shellcheck disable=SC2064
+    trap "on_install_failure '${TENANT_ID}' '${version_for_message}' \$?" ERR
 
     if [[ -z "$target_url" || "$target_url" = "null" ]]; then
         die_unknown_release "$target_version"
@@ -501,6 +526,23 @@ install_release() {
     else
         log_info "skipping ${service} restart (--no-restart-after-install)"
     fi
+
+    trap - ERR
+    notify_success \
+        "[be-BOP tooling] tenant-cli install ${TENANT_ID} OK" \
+        "Tenant ${TENANT_ID} switched to be-BOP ${version_for_message} at https://${tenant_domain}/."
+}
+
+# on_install_failure: ERR trap helper called from install_release.
+# Sends an operator alert (Zulip + SMTP) and lets the exit propagate.
+on_install_failure() {
+    local tenant="$1" version="$2" rc="$3"
+    log_error "tenant-cli install failed (tenant=${tenant}, target=${version}, rc=${rc})"
+    notify_failure \
+        "[be-BOP tooling] tenant-cli install ${tenant} FAILED" \
+        "$(printf 'Tenant: %s\nTarget: %s\nExit code: %s\n\nSee journalctl -t %s --since "1 hour ago" for the full log.\n' \
+            "$tenant" "$version" "$rc" "$BEBOP_TOOLING_SYSLOG_IDENT")" \
+        || true
 }
 
 show_status() {
@@ -587,6 +629,15 @@ execute_command() {
 
 main() {
     parse_cli_arguments "$@"
+    # `release install` needs to source /etc/be-BOP-tooling/secrets.env (0600,
+    # root-only) for notification credentials. Re-exec under sudo so the rest
+    # of the install path runs as root throughout — matches add-tenant.sh UX
+    # and removes the need to sluice secrets through run_privileged.
+    # Other commands (list / status / help / version) stay caller-owned.
+    if [[ "$COMMAND" == "release" && "$SUBCOMMAND" == "install" && $EUID -ne 0 ]]; then
+        log_info "elevating to root for install (sudo)..."
+        exec sudo -E -- "$0" "$@"
+    fi
     scope_check
     execute_command
 }
