@@ -104,6 +104,24 @@ BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_TENANT_ID BEBOP_TOOLING_SYSLOG_IDENT
 export RUN_NON_INTERACTIVE VERBOSE DRY_RUN
 
+# EXIT-trap operator notification — catches die()-style failures (resolve,
+# get_asset_url, cache ensure, restart…) that previously exited silently
+# before the healthcheck path could call notify_failure. The healthcheck
+# branch sets NOTIFIED=true to avoid duplicate notifications.
+NOTIFIED=false
+on_upgrade_exit() {
+    local rc=$?
+    [[ "$NOTIFIED" == "true" ]] && return
+    (( rc == 0 )) && return
+    # notify_failure auto-appends the per-session ERROR/WARN tail (see
+    # lib/log.sh + lib/notify.sh) so the actual cause lands in the body.
+    notify_failure \
+        "[be-BOP tooling] upgrade ${TENANT_ID} FAILED" \
+        "$(printf 'Tenant: %s\nTarget: %s\nExit code: %s\n' \
+            "$TENANT_ID" "$VERSION" "$rc")"
+}
+trap 'on_upgrade_exit' EXIT
+
 # === Main ===============================================================
 main() {
     require_privileges
@@ -186,11 +204,12 @@ main() {
             log_error "rollback to ${old_tag} ALSO failed — service is broken"
         fi
     fi
+    NOTIFIED=true
     notify_failure \
-        "[be-BOP tooling] upgrade ${TENANT_ID} FAILED" \
-        "Tenant ${TENANT_ID} upgrade ${old_tag} → ${new_tag} failed.
-Rollback: ${ROLLBACK_ON_FAILURE}
-See journalctl -u bebop@${TENANT_ID} --since '15 min ago'."
+        "[be-BOP tooling] upgrade ${TENANT_ID} FAILED (healthcheck)" \
+        "Tenant ${TENANT_ID} upgrade ${old_tag} → ${new_tag} failed at the post-upgrade healthcheck.
+Rollback attempted: ${ROLLBACK_ON_FAILURE}
+Inspect runtime: journalctl -u bebop@${TENANT_ID} --since '15 min ago'"
     exit 1
 }
 

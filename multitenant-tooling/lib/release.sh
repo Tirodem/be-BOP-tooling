@@ -29,6 +29,55 @@ readonly _BEBOP_RELEASE_SOURCED=1
 : "${BEBOP_RELEASE_CACHE_ROOT:=/var/lib/be-BOP-releases-cache}"
 readonly _BEBOP_RELEASE_ASSET_RE='^be-BOP\.release\.[0-9]{4}-[0-9]{2}-[0-9]{2}\.[a-f0-9]+.*\.zip$'
 
+# _release_gh_get <url>
+# GET a GitHub API URL and print the body on HTTP 2xx. Auto-attaches
+# BEBOP_GITHUB_PAT if set. Inspects the HTTP status code so the error
+# message tells the operator what actually happened — the old `curl --fail`
+# approach treated every 4xx as "tag not found", which made rate-limit
+# failures (403) impossible to diagnose from the notification alone.
+_release_gh_get() {
+    local url="$1" tmp http_code body
+    local hdr=(
+        -H "Accept: application/vnd.github+json"
+        -H "X-GitHub-Api-Version: 2022-11-28"
+    )
+    if [[ -n "${BEBOP_GITHUB_PAT:-}" ]]; then
+        hdr+=(-H "Authorization: Bearer ${BEBOP_GITHUB_PAT}")
+    fi
+    tmp=$(mktemp)
+    http_code=$(curl -sS --max-time 30 \
+        -o "$tmp" -w '%{http_code}' \
+        "${hdr[@]}" \
+        "$url" 2>/dev/null || true)
+    body=$(cat "$tmp")
+    rm -f "$tmp"
+    case "$http_code" in
+        2*)
+            printf '%s' "$body"
+            return 0
+            ;;
+        401)
+            die "GitHub API ${url}: HTTP 401 — BEBOP_GITHUB_PAT invalid, revoked, or expired"
+            ;;
+        403)
+            if [[ -z "${BEBOP_GITHUB_PAT:-}" ]]; then
+                die "GitHub API ${url}: HTTP 403 — rate-limited (unauthenticated quota is 60 req/h). Set BEBOP_GITHUB_PAT in /etc/be-BOP-tooling/secrets.env (Actions:read + Contents:read on ${BEBOP_GITHUB_REPO})."
+            else
+                die "GitHub API ${url}: HTTP 403 — rate-limited OR PAT missing required scopes (Actions:read + Contents:read on ${BEBOP_GITHUB_REPO})"
+            fi
+            ;;
+        404)
+            die "GitHub API ${url}: HTTP 404 — resource does not exist"
+            ;;
+        000)
+            die "GitHub API ${url}: connection failed (no HTTP response — DNS / network / TLS issue)"
+            ;;
+        *)
+            die "GitHub API ${url}: HTTP ${http_code}"
+            ;;
+    esac
+}
+
 # release_resolve_version <version_arg>
 # - "latest" → most recent release tag with a matching asset
 # - any other string is taken as a concrete tag and validated to exist
@@ -36,18 +85,12 @@ readonly _BEBOP_RELEASE_ASSET_RE='^be-BOP\.release\.[0-9]{4}-[0-9]{2}-[0-9]{2}\.
 release_resolve_version() {
     local arg="$1"
     if [[ "$arg" != "latest" && -n "$arg" ]]; then
-        if ! curl -sS --fail --max-time 30 \
-            "https://api.github.com/repos/${BEBOP_GITHUB_REPO}/releases/tags/${arg}" \
-            >/dev/null ; then
-            die "release_resolve_version: tag '${arg}' not found in ${BEBOP_GITHUB_REPO}"
-        fi
+        _release_gh_get "https://api.github.com/repos/${BEBOP_GITHUB_REPO}/releases/tags/${arg}" >/dev/null
         printf '%s\n' "$arg"
         return 0
     fi
     local resp
-    resp=$(curl -sS --fail --max-time 30 \
-        "https://api.github.com/repos/${BEBOP_GITHUB_REPO}/releases?per_page=20") \
-        || die "release_resolve_version: GitHub API request failed"
+    resp=$(_release_gh_get "https://api.github.com/repos/${BEBOP_GITHUB_REPO}/releases?per_page=20")
     local tag
     tag=$(printf '%s' "$resp" \
         | jq -r --arg re "$_BEBOP_RELEASE_ASSET_RE" \
@@ -63,9 +106,7 @@ release_resolve_version() {
 release_get_asset_url() {
     local tag="$1"
     local resp
-    resp=$(curl -sS --fail --max-time 30 \
-        "https://api.github.com/repos/${BEBOP_GITHUB_REPO}/releases/tags/${tag}") \
-        || die "release_get_asset_url: failed to fetch release ${tag}"
+    resp=$(_release_gh_get "https://api.github.com/repos/${BEBOP_GITHUB_REPO}/releases/tags/${tag}")
     local url
     url=$(printf '%s' "$resp" \
         | jq -r --arg re "$_BEBOP_RELEASE_ASSET_RE" \

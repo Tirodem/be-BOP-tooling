@@ -476,9 +476,12 @@ install_release() {
         ;;
     esac
 
-    # ERR-trap operator notification past this point.
+    # EXIT-trap operator notification — ERR doesn't fire on die() (which
+    # exits directly), so use EXIT and gate on $?. notify_failure auto-tails
+    # the per-session ERROR log (lib/log.sh + lib/notify.sh) so the cause
+    # (e.g. "HTTP 403 — rate-limited") lands in the Zulip / email body.
     # shellcheck disable=SC2064
-    trap "on_install_failure '${TENANT_ID}' '${version_for_message}' \$?" ERR
+    trap "on_install_failure '${TENANT_ID}' '${version_for_message}' \$?" EXIT
 
     # Populate the host cache if needed (no-op if another tenant already
     # installed this exact release; flock-protected against concurrent calls).
@@ -511,21 +514,22 @@ install_release() {
         log_info "skipping ${service} restart (--no-restart-after-install)"
     fi
 
-    trap - ERR
+    trap - EXIT
     notify_success \
         "[be-BOP tooling] tenant-cli install ${TENANT_ID} OK" \
         "Tenant ${TENANT_ID} switched to be-BOP ${version_for_message} at https://${tenant_domain}/."
 }
 
-# on_install_failure: ERR trap helper called from install_release.
-# Sends an operator alert (Zulip + SMTP) and lets the exit propagate.
+# on_install_failure: EXIT trap helper. Fires for any non-zero exit during
+# install_release. notify_failure auto-appends the per-session error tail.
 on_install_failure() {
     local tenant="$1" version="$2" rc="$3"
+    (( rc == 0 )) && return
     log_error "tenant-cli install failed (tenant=${tenant}, target=${version}, rc=${rc})"
     notify_failure \
         "[be-BOP tooling] tenant-cli install ${tenant} FAILED" \
-        "$(printf 'Tenant: %s\nTarget: %s\nExit code: %s\n\nSee journalctl -t %s --since "1 hour ago" for the full log.\n' \
-            "$tenant" "$version" "$rc" "$BEBOP_TOOLING_SYSLOG_IDENT")" \
+        "$(printf 'Tenant: %s\nTarget: %s\nExit code: %s\n' \
+            "$tenant" "$version" "$rc")" \
         || true
 }
 

@@ -83,8 +83,23 @@ ${body}"
 
 # notify_failure <subject> <body>
 # For mutation failures and rollbacks: send to BOTH SMTP and Zulip.
+# Auto-appends the tail of the per-session ERROR/WARN log (written by
+# lib/log.sh) so the operator sees the actual cause (e.g. "HTTP 403 —
+# rate-limited") directly in the notification, instead of needing to ssh
+# in and grep journalctl.
 notify_failure() {
     local subject="$1" body="$2"
+    local err_log="${TMPDIR:-/tmp}/bebop-tooling.${BEBOP_TOOLING_SESSION_ID:-unknown}.err"
+    if [[ -r "$err_log" ]]; then
+        local context
+        context=$(tail -12 "$err_log" 2>/dev/null)
+        if [[ -n "$context" ]]; then
+            body="${body}
+
+--- Last errors / warnings (this run) ---
+${context}"
+        fi
+    fi
     local smtp_rc=0 zulip_rc=0
     notify_smtp  "$subject" "$body" || smtp_rc=$?
     notify_zulip "$subject" "$body" || zulip_rc=$?

@@ -49,6 +49,16 @@ _log_emit() {
         esac
         printf '%s\n' "$line" | systemd-cat -t "$BEBOP_TOOLING_SYSLOG_IDENT" -p "$prio" 2>/dev/null || true
     fi
+    # Persist ERROR / WARN lines to a per-session file so notify_failure can
+    # include the actual cause in the body — instead of operators having to
+    # ssh in and grep journalctl to figure out what went wrong.
+    if [[ "$level" == "ERROR" || "$level" == "WARN" ]]; then
+        local err_log="${TMPDIR:-/tmp}/bebop-tooling.${BEBOP_TOOLING_SESSION_ID}.err"
+        if [[ ! -e "$err_log" ]]; then
+            (umask 077 && : >"$err_log") 2>/dev/null || true
+        fi
+        printf '%s\n' "$line" >>"$err_log" 2>/dev/null || true
+    fi
 }
 
 log_info()  { _log_emit INFO  "$@"; }
