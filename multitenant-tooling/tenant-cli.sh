@@ -538,7 +538,23 @@ install_release() {
         die "failed to extract be-BOP release archive"
     fi
     local extracted_dir
-    extracted_dir=$(find "$extract_root" -mindepth 1 -maxdepth 2 -name "package.json" -type f -printf '%h\n' 2>/dev/null | head -1)
+    extracted_dir=$(find "$extract_root" -name "package.json" -type f -printf '%h\n' 2>/dev/null | head -1)
+    if [[ -z "$extracted_dir" ]]; then
+        # GitHub Actions artifacts are zip-wrapped: if the workflow uploaded
+        # a single .zip, /artifacts/<id>/zip returns a zip-of-zip. Unwrap one
+        # level and look again.
+        local inner_zip
+        inner_zip=$(find "$extract_root" -mindepth 1 -maxdepth 2 -name "*.zip" -type f | head -1)
+        if [[ -n "$inner_zip" ]]; then
+            log_debug "no package.json at top level; unwrapping inner zip ${inner_zip}"
+            local inner_root="${tmp}/inner"
+            mkdir -p "$inner_root"
+            ( cd "$inner_root" && unzip -q "$inner_zip" ) \
+                || die "failed to extract inner zip ${inner_zip}"
+            extract_root="$inner_root"
+            extracted_dir=$(find "$extract_root" -name "package.json" -type f -printf '%h\n' 2>/dev/null | head -1)
+        fi
+    fi
     if [[ -z "$extracted_dir" ]]; then
         die "could not locate package.json after extracting be-BOP release archive"
     fi
