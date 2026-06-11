@@ -109,6 +109,7 @@ chmod 0755 \
     "${INSTALL_DIR}/upgrade-tenant.sh" \
     "${INSTALL_DIR}/upgrade-all.sh" \
     "${INSTALL_DIR}/list-tenants.sh" \
+    "${INSTALL_DIR}/tenant-cli.sh" \
     "${INSTALL_DIR}/install.sh" 2>/dev/null || true
 # Hooks must be executable for certbot --manual-{auth,cleanup}-hook
 # to invoke them; safety net if the tarball didn't preserve +x.
