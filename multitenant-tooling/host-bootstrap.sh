@@ -629,6 +629,31 @@ step_install_tooling_libs_and_scripts() {
     done
 }
 
+# === Nightly fleet upgrade timer (optional) ============================
+# Installs bebop-upgrade-all.{service,timer} unconditionally (cheap, no
+# behavior unless the timer is enabled). Then enables OR disables the
+# timer based on BEBOP_NIGHTLY_UPGRADE_ENABLED in secrets.env. Toggling
+# the var + re-running host-bootstrap.sh is the supported on/off switch.
+step_setup_nightly_upgrade() {
+    log_info "Installing bebop-upgrade-all.{service,timer} units..."
+    local u
+    for u in bebop-upgrade-all.service bebop-upgrade-all.timer; do
+        maybe_run run_privileged install -m 0644 \
+            "${BEBOP_TOOLING_TEMPLATE_DIR}/${u}" "/etc/systemd/system/${u}"
+    done
+    maybe_run run_privileged systemctl daemon-reload
+    case "${BEBOP_NIGHTLY_UPGRADE_ENABLED:-}" in
+        true|1|yes|on)
+            log_info "BEBOP_NIGHTLY_UPGRADE_ENABLED=true — enabling bebop-upgrade-all.timer (daily 04:00)"
+            maybe_run run_privileged systemctl enable --now bebop-upgrade-all.timer
+            ;;
+        *)
+            log_info "BEBOP_NIGHTLY_UPGRADE_ENABLED unset/false — keeping bebop-upgrade-all.timer disabled"
+            maybe_run run_privileged systemctl disable --now bebop-upgrade-all.timer 2>/dev/null || true
+            ;;
+    esac
+}
+
 # === Registry ==========================================================
 step_init_registry() {
     log_info "Initialising tenant registry..."
@@ -1090,6 +1115,8 @@ main() {
     step_install_netdata
     step_setup_netdata_public_access
     step_setup_kuma_public_access
+
+    step_setup_nightly_upgrade
 
     step_print_summary
 }
