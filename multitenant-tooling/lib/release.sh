@@ -271,13 +271,26 @@ release_cache_set_current() {
 }
 
 # release_get_current_tag <tenant>
-# Returns the basename of whatever <tenant>/releases/current points to.
-# Works transparently for legacy relative symlinks (basename = old tag) and
-# new absolute cache symlinks (basename = cache name).
+# Returns the FULL release name pointed at by <tenant>/releases/current
+# (e.g. "rel/2026-06-11/f705055"), not just its last path segment.
+# The naive `basename "$(readlink -f current)"` we had before truncated
+# slash-bearing tags to their last component, which made the "skip if
+# new_tag == old_tag" guard in upgrade-tenant.sh always miss — every
+# upgrade-all run was redeploying the same release.
 release_get_current_tag() {
     local tenant="$1"
     local link="/var/lib/be-BOP/${tenant}/releases/current"
-    if [[ -L "$link" ]]; then
-        basename "$(readlink -f "$link")"
+    [[ -L "$link" ]] || return 0
+    local target
+    target=$(readlink "$link")
+    if [[ "$target" == "$BEBOP_RELEASE_CACHE_ROOT"/* ]]; then
+        # New layout: absolute symlink into the cache → strip the root prefix.
+        printf '%s\n' "${target#"$BEBOP_RELEASE_CACHE_ROOT"/}"
+    elif [[ "$target" == /* ]]; then
+        # Absolute target outside the cache → best-effort basename fallback.
+        basename "$target"
+    else
+        # Legacy relative symlink: target IS the tag string as-is.
+        printf '%s\n' "$target"
     fi
 }
