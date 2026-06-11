@@ -340,6 +340,47 @@ fetch_all_releases() {
     log_debug "Latest release: $latest_release_name ($latest_release_tag)"
 }
 
+# resolve_branch_artifact <branch_name> <artifact_name>
+# Walks the latest successful workflow runs on <branch_name> and prints
+# "<run_id>\t<head_sha>\t<artifact_id>" for the first run that uploaded
+# an artifact named <artifact_name>. Dies if none is found.
+# Requires BEBOP_GITHUB_PAT (Actions:read + Contents:read on the repo).
+resolve_branch_artifact() {
+    local branch="$1" want_name="$2"
+    if [[ -z "${BEBOP_GITHUB_PAT:-}" ]]; then
+        die "branch deploys require BEBOP_GITHUB_PAT in ${SECRETS_FILE} (fine-grained PAT, Actions:read + Contents:read on ${BEBOP_GITHUB_REPO})"
+    fi
+    local gh_curl=(
+        --silent --show-error --fail --location
+        --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_DOWNLOAD_TIMEOUT"
+        -H "Authorization: Bearer ${BEBOP_GITHUB_PAT}"
+        -H "Accept: application/vnd.github+json"
+        -H "X-GitHub-Api-Version: 2022-11-28"
+    )
+    local runs_json
+    runs_json=$(curl "${gh_curl[@]}" \
+        "https://api.github.com/repos/${BEBOP_GITHUB_REPO}/actions/runs?branch=${branch}&status=success&per_page=10") \
+        || die "GitHub API: failed to list workflow runs on '${branch}'"
+    local runs_count
+    runs_count=$(echo "$runs_json" | jq '.workflow_runs | length')
+    if (( runs_count == 0 )); then
+        die "no successful workflow run found on branch '${branch}' (CI rouge ? branche jamais poussée ?)"
+    fi
+    local i rid rsha aid
+    for ((i=0; i<runs_count; i++)); do
+        rid=$(echo "$runs_json" | jq -r ".workflow_runs[$i].id")
+        rsha=$(echo "$runs_json" | jq -r ".workflow_runs[$i].head_sha")
+        aid=$(curl "${gh_curl[@]}" \
+            "https://api.github.com/repos/${BEBOP_GITHUB_REPO}/actions/runs/${rid}/artifacts" \
+            | jq -r --arg n "$want_name" '.artifacts[] | select(.name == $n) | .id' | head -1)
+        if [[ -n "$aid" ]]; then
+            printf '%s\t%s\t%s\n' "$rid" "$rsha" "$aid"
+            return 0
+        fi
+    done
+    die "no '${want_name}' artifact found in the ${runs_count} latest successful runs on '${branch}' (artifact expired, wrong name, or workflow doesn't upload it)"
+}
+
 tenant_releases_dir() {
     printf '/var/lib/be-BOP/%s/releases' "$TENANT_ID"
 }
@@ -410,12 +451,26 @@ install_release() {
         version_for_message="$(echo "$RELEASE_META" | jq -r '.[0].tag_name')"
         ;;
       branch=*)
+        # Branch deploys go through the GitHub Actions API (artifact.ci is
+        # browser-only, no programmatic download path). We look up the latest
+        # successful run on the branch that uploaded an artifact named
+        # BEBOP_BRANCH_ARTIFACT_NAME (default "be-BOP-release") and download
+        # its zip via /actions/artifacts/<id>/zip. Requires BEBOP_GITHUB_PAT.
         local branch_name="${target_version#branch=}"
-        version_for_message="branch ${branch_name}"
-        # GitHub's artifact.ci encodes '/' as '__' in branch names.
-        branch_name="${branch_name//\//__}"
-        target_url="https://www.artifact.ci/artifact/view/be-BOP-io-SA/be-BOP/branch/$branch_name/be-BOP-release/be-BOP-release.zip"
-        target_name="$branch_name"
+        local artifact_name="${BEBOP_BRANCH_ARTIFACT_NAME:-be-BOP-release}"
+        log_info "resolving CI artifact for branch '${branch_name}' (artifact name: ${artifact_name})..."
+        local resolved run_id head_sha artifact_id
+        resolved=$(resolve_branch_artifact "$branch_name" "$artifact_name")
+        run_id=$(echo "$resolved" | cut -f1)
+        head_sha=$(echo "$resolved" | cut -f2)
+        artifact_id=$(echo "$resolved" | cut -f3)
+        log_info "run=${run_id} sha=${head_sha:0:8} artifact_id=${artifact_id}"
+        target_url="https://api.github.com/repos/${BEBOP_GITHUB_REPO}/actions/artifacts/${artifact_id}/zip"
+        # Include short SHA in target_name so each branch SHA gets its own dir
+        # (re-deploying after a new push picks up the new SHA, doesn't short-
+        # circuit on .bebop_install_success of the previous SHA).
+        target_name="${branch_name//\//__}.${head_sha:0:8}"
+        version_for_message="branch ${branch_name} (${head_sha:0:8})"
         ;;
       *)
         local target_meta
@@ -459,19 +514,33 @@ install_release() {
         "--show-error"
         "--output" "${tmp}/be-BOP-update.zip"
     )
-    if ! curl "${curl_args[@]}" "$target_url"; then
-        die "failed to download be-BOP release (check internet connectivity)"
+    # Branch downloads hit api.github.com and need the PAT; tag/release
+    # downloads hit the public github.com release CDN and don't.
+    local download_headers=()
+    if [[ "$target_version" == branch=* ]]; then
+        download_headers+=(
+            -H "Authorization: Bearer ${BEBOP_GITHUB_PAT}"
+            -H "Accept: application/vnd.github+json"
+            -H "X-GitHub-Api-Version: 2022-11-28"
+        )
+    fi
+    if ! curl "${curl_args[@]}" "${download_headers[@]+"${download_headers[@]}"}" "$target_url"; then
+        die "failed to download be-BOP release"
     fi
 
+    # Extract under a fixed subdir so we can find the payload regardless of
+    # whether the zip has a 'be-BOP release X.Y.Z/' top-level (releases) or
+    # is flat (Actions artifacts).
     log_debug "extracting release archive..."
-    if ! ( cd "$tmp" && unzip -q be-BOP-update.zip ); then
+    local extract_root="${tmp}/extracted"
+    mkdir -p "$extract_root"
+    if ! ( cd "$extract_root" && unzip -q "${tmp}/be-BOP-update.zip" ); then
         die "failed to extract be-BOP release archive"
     fi
-
     local extracted_dir
-    extracted_dir=$(find "$tmp" -mindepth 1 -maxdepth 1 -type d -name "be-BOP release *" | head -1)
+    extracted_dir=$(find "$extract_root" -mindepth 1 -maxdepth 2 -name "package.json" -type f -printf '%h\n' 2>/dev/null | head -1)
     if [[ -z "$extracted_dir" ]]; then
-        die "could not find extracted directory for be-BOP release"
+        die "could not locate package.json after extracting be-BOP release archive"
     fi
 
     # Move the extracted tree into the per-tenant releases dir (privileged).
