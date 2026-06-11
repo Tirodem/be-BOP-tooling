@@ -213,7 +213,11 @@ release_cache_ensure_from_url() {
         [[ -n "$payload_dir" ]] || die "cache: could not locate package.json in ${name} archive"
 
         # Stage into a sibling temp dir, install deps, then atomic rename.
+        # Tag names like "rel/2026-05-25/1c57ad3" contain slashes → cache_dir
+        # is nested ("releases-cache/rel/2026-05-25/1c57ad3"). `install -d`
+        # creates all missing intermediate components in one go.
         local staging="${cache_dir}.staging.$$"
+        run_privileged install -d -m 0755 "$(dirname "$cache_dir")"
         run_privileged rm -rf "$staging" "$cache_dir"
         run_privileged mv "$payload_dir" "$staging"
         run_privileged chown -R root:root "$staging"

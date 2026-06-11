@@ -108,6 +108,22 @@ BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
 export RUN_NON_INTERACTIVE VERBOSE DRY_RUN
 
+# EXIT-trap notification for failures that happen OUTSIDE the per-tenant
+# iteration (e.g. pre-warm cache dies, registry load fails). The summary
+# path at the end already notifies on per-tenant failures; NOTIFIED guards
+# against double-notification.
+NOTIFIED=false
+on_upgrade_all_exit() {
+    local rc=$?
+    [[ "$NOTIFIED" == "true" ]] && return
+    (( rc == 0 )) && return
+    notify_failure \
+        "[be-BOP tooling] upgrade-all FAILED (pre-iteration)" \
+        "$(printf 'Target: %s\nMode: %s\nExit code: %s\n' \
+            "$VERSION" "$MODE" "$rc")"
+}
+trap 'on_upgrade_all_exit' EXIT
+
 # Locate the upgrade-tenant.sh helper (sibling in source tree, /usr/local/bin
 # once installed).
 locate_upgrade_tenant() {
@@ -228,6 +244,7 @@ main() {
 ==========================================================================
 EOF
 
+    NOTIFIED=true
     if (( ${#failed[@]} > 0 )); then
         notify_failure \
             "[be-BOP tooling] upgrade-all (${VERSION}) had ${#failed[@]} failure(s)" \
