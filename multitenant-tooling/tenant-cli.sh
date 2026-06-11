@@ -47,6 +47,8 @@ source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
 source "$BEBOP_TOOLING_LIB_DIR/registry.sh"
 # shellcheck source=lib/notify.sh
 source "$BEBOP_TOOLING_LIB_DIR/notify.sh"
+# shellcheck source=lib/release.sh
+source "$BEBOP_TOOLING_LIB_DIR/release.sh"
 
 # GitHub repository for be-BOP releases
 readonly BEBOP_GITHUB_REPO="${BEBOP_GITHUB_REPO:-be-BOP-io-SA/be-BOP}"
@@ -425,9 +427,9 @@ list_releases() {
 install_release() {
     local target_version="${RELEASE_VERSION:-}"
 
-    # Load notification credentials (Zulip + SMTP) from the operator secrets
-    # file. install paths run as root (main() re-execs via sudo), so the
-    # 0600 secrets.env is directly readable here.
+    # Load notification credentials (Zulip + SMTP) + BEBOP_GITHUB_PAT (used
+    # by resolve_branch_artifact and by lib/release.sh's cache layer when
+    # downloading branch artifacts from api.github.com).
     if [[ -f "$SECRETS_FILE" ]]; then
         # shellcheck disable=SC1090
         source "$SECRETS_FILE"
@@ -435,176 +437,73 @@ install_release() {
         log_warn "secrets file ${SECRETS_FILE} missing; notifications will be skipped"
     fi
 
-    # Resolve the tenant's public domain for notification bodies.
     local tenant_domain
     tenant_domain="$(registry_get_field "$TENANT_ID" domain)"
 
-    if [[ -z "${RELEASE_META:-}" ]]; then
-        fetch_all_releases
-    fi
-
-    local target_url target_name version_for_message
+    # Resolve the (target_name, download_url) pair. target_name keys the
+    # host-wide release cache (/var/lib/be-BOP-releases-cache/<name>/).
+    local target_name target_url version_for_message
     case "$target_version" in
       ""|latest)
-        target_url="$(echo "$RELEASE_META" | jq -r '.[0].asset_url')"
-        target_name="$(echo "$RELEASE_META" | jq -r '.[0].asset_name | sub("\\.zip$"; "")')"
-        version_for_message="$(echo "$RELEASE_META" | jq -r '.[0].tag_name')"
+        target_name=$(release_resolve_version "latest")
+        version_for_message="$target_name"
+        # URL is fetched lazily by release_cache_ensure if cache misses.
+        target_url=""
         ;;
       branch=*)
-        # Branch deploys go through the GitHub Actions API (artifact.ci is
-        # browser-only, no programmatic download path). We look up the latest
-        # successful run on the branch that uploaded an artifact named
-        # BEBOP_BRANCH_ARTIFACT_NAME (default "be-BOP-release") and download
-        # its zip via /actions/artifacts/<id>/zip. Requires BEBOP_GITHUB_PAT.
+        # Branch deploys go through the GitHub Actions API (artifact.ci has
+        # no programmatic surface). Walk the latest successful runs and pick
+        # the artifact named BEBOP_BRANCH_ARTIFACT_NAME (default
+        # "be-BOP-release"). The cache is keyed by "<branch>.<sha8>" so each
+        # SHA gets its own entry; re-deploys after a new push install fresh.
         local branch_name="${target_version#branch=}"
         local artifact_name="${BEBOP_BRANCH_ARTIFACT_NAME:-be-BOP-release}"
-        log_info "resolving CI artifact for branch '${branch_name}' (artifact name: ${artifact_name})..."
+        log_info "resolving CI artifact for branch '${branch_name}' (artifact: ${artifact_name})..."
         local resolved run_id head_sha artifact_id
         resolved=$(resolve_branch_artifact "$branch_name" "$artifact_name")
         run_id=$(echo "$resolved" | cut -f1)
         head_sha=$(echo "$resolved" | cut -f2)
         artifact_id=$(echo "$resolved" | cut -f3)
         log_info "run=${run_id} sha=${head_sha:0:8} artifact_id=${artifact_id}"
-        target_url="https://api.github.com/repos/${BEBOP_GITHUB_REPO}/actions/artifacts/${artifact_id}/zip"
-        # Include short SHA in target_name so each branch SHA gets its own dir
-        # (re-deploying after a new push picks up the new SHA, doesn't short-
-        # circuit on .bebop_install_success of the previous SHA).
         target_name="${branch_name//\//__}.${head_sha:0:8}"
+        target_url="https://api.github.com/repos/${BEBOP_GITHUB_REPO}/actions/artifacts/${artifact_id}/zip"
         version_for_message="branch ${branch_name} (${head_sha:0:8})"
         ;;
       *)
-        local target_meta
-        target_meta="$(echo "$RELEASE_META" | jq -r 'first(.[]|select(.tag_name == "'"$target_version"'"))')"
-        target_url="$(echo "$target_meta" | jq -r '.asset_url')"
-        target_name="$(echo "$target_meta" | jq -r '.asset_name | sub("\\.zip$"; "")')"
+        target_name="$target_version"
         version_for_message="$target_version"
+        target_url=""
         ;;
     esac
 
-    # On any error past this point, notify operators before the script exits.
+    # ERR-trap operator notification past this point.
     # shellcheck disable=SC2064
     trap "on_install_failure '${TENANT_ID}' '${version_for_message}' \$?" ERR
 
-    if [[ -z "$target_url" || "$target_url" = "null" ]]; then
-        die_unknown_release "$target_version"
+    # Populate the host cache if needed (no-op if another tenant already
+    # installed this exact release; flock-protected against concurrent calls).
+    if [[ -n "$target_url" ]]; then
+        # Branch path: URL pre-computed, skip release_get_asset_url.
+        release_cache_ensure_from_url "$target_name" "$target_url"
+    else
+        # Tag/latest path: release_cache_ensure fetches the asset URL only if
+        # the cache misses, then downloads.
+        release_cache_ensure "$target_name"
     fi
 
-    local releases_dir target_dir
-    releases_dir="$(tenant_releases_dir)"
-    target_dir="${releases_dir}/${target_name}"
-    if [[ -d "$target_dir" && -f "$target_dir/.bebop_install_success" ]]; then
-        log_info "release ${target_name} already installed for tenant '${TENANT_ID}'"
-        return 0
-    fi
+    # Tenant-side atomic symlink swap into the cache + service restart.
+    release_cache_set_current "$TENANT_ID" "$target_name"
 
-    # Download + extract in a user-owned tmp dir.
-    local tmp
-    tmp=$(mktemp -d)
-    # shellcheck disable=SC2064
-    trap "rm -rf '$tmp'" RETURN
-
-    log_info "downloading release ${target_name}..."
-    log_debug "download URL: ${target_url}"
-    local curl_args=(
-        "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
-        "--fail"
-        "--location"
-        "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
-        "--progress-bar"
-        "--show-error"
-        "--output" "${tmp}/be-BOP-update.zip"
-    )
-    # Branch downloads hit api.github.com and need the PAT; tag/release
-    # downloads hit the public github.com release CDN and don't.
-    local download_headers=()
-    if [[ "$target_version" == branch=* ]]; then
-        download_headers+=(
-            -H "Authorization: Bearer ${BEBOP_GITHUB_PAT}"
-            -H "Accept: application/vnd.github+json"
-            -H "X-GitHub-Api-Version: 2022-11-28"
-        )
-    fi
-    if ! curl "${curl_args[@]}" "${download_headers[@]+"${download_headers[@]}"}" "$target_url"; then
-        die "failed to download be-BOP release"
-    fi
-
-    # Extract under a fixed subdir so we can find the payload regardless of
-    # whether the zip has a 'be-BOP release X.Y.Z/' top-level (releases) or
-    # is flat (Actions artifacts).
-    log_debug "extracting release archive..."
-    local extract_root="${tmp}/extracted"
-    mkdir -p "$extract_root"
-    if ! ( cd "$extract_root" && unzip -q "${tmp}/be-BOP-update.zip" ); then
-        die "failed to extract be-BOP release archive"
-    fi
-    local extracted_dir
-    extracted_dir=$(find "$extract_root" -name "package.json" -type f -printf '%h\n' 2>/dev/null | head -1)
-    if [[ -z "$extracted_dir" ]]; then
-        # GitHub Actions artifacts are zip-wrapped: if the workflow uploaded
-        # a single .zip, /artifacts/<id>/zip returns a zip-of-zip. Unwrap one
-        # level and look again.
-        local inner_zip
-        inner_zip=$(find "$extract_root" -mindepth 1 -maxdepth 2 -name "*.zip" -type f | head -1)
-        if [[ -n "$inner_zip" ]]; then
-            log_debug "no package.json at top level; unwrapping inner zip ${inner_zip}"
-            local inner_root="${tmp}/inner"
-            mkdir -p "$inner_root"
-            ( cd "$inner_root" && unzip -q "$inner_zip" ) \
-                || die "failed to extract inner zip ${inner_zip}"
-            extract_root="$inner_root"
-            extracted_dir=$(find "$extract_root" -name "package.json" -type f -printf '%h\n' 2>/dev/null | head -1)
-        fi
-    fi
-    if [[ -z "$extracted_dir" ]]; then
-        die "could not locate package.json after extracting be-BOP release archive"
-    fi
-
-    # Move the extracted tree into the per-tenant releases dir (privileged).
-    run_privileged install -d -m 0755 "$releases_dir"
-    if run_privileged test -d "$target_dir"; then
-        log_debug "removing stalled installation directory ${target_dir}"
-        run_privileged rm -rf "$target_dir"
-    fi
-    run_privileged mv "$extracted_dir" "$target_dir"
-    run_privileged chown -R root:root "$target_dir"
-
-    # Install dependencies (matches lib/release.sh's pattern in add-tenant /
-    # upgrade-tenant: HOME=/tmp to avoid root HOME pollution,
-    # COREPACK_ENABLE_DOWNLOAD_PROMPT=0 to keep pnpm install non-interactive).
-    log_info "installing dependencies for ${target_name}..."
-    if ! ( cd "$target_dir" && run_privileged env \
-            HOME=/tmp COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
-            pnpm install --prod --frozen-lockfile ); then
-        die "failed to install be-BOP dependencies"
-    fi
-    run_privileged touch "$target_dir/.bebop_install_success"
-    log_info "release ${target_name} installed at ${target_dir}"
-
-    # Atomically swap the 'current' symlink (sibling temp link + mv -T).
-    local current_link tmp_link
-    current_link="$(tenant_current_symlink)"
-    tmp_link="${releases_dir}/.current.$$"
-    run_privileged ln -sfn "$target_name" "$tmp_link"
-    run_privileged mv -T "$tmp_link" "$current_link"
-    log_info "activated ${target_name} as current release for tenant '${TENANT_ID}'"
-
-    # Restart the per-tenant bebop service (unless disabled).
     local service="bebop@${TENANT_ID}.service"
     if [[ "$NO_RESTART_AFTER_INSTALL" = false ]]; then
         if run_privileged systemctl is-active --quiet "$service" 2>/dev/null; then
             log_info "restarting ${service}..."
-            if ! run_privileged systemctl restart "$service"; then
-                log_warn "failed to restart ${service}; restart manually if needed"
-            else
-                log_info "${service} restarted"
-            fi
+            run_privileged systemctl restart "$service" \
+                || log_warn "failed to restart ${service}; restart manually if needed"
         elif run_privileged systemctl is-enabled --quiet "$service" 2>/dev/null; then
             log_info "starting ${service}..."
-            if ! run_privileged systemctl start "$service"; then
-                log_warn "failed to start ${service}; start manually if needed"
-            else
-                log_info "${service} started"
-            fi
+            run_privileged systemctl start "$service" \
+                || log_warn "failed to start ${service}; start manually if needed"
         else
             log_debug "${service} not configured; skipping restart"
         fi
@@ -641,9 +540,13 @@ show_status() {
     echo ""
 
     if [[ -L "$current_link" ]]; then
-        current_installed=$(basename "$(readlink -f "$current_link")")
+        local current_target
+        current_target=$(readlink -f "$current_link")
+        current_installed=$(basename "$current_target")
         echo "Installed release: $current_installed"
-        if [[ -f "$(tenant_releases_dir)/$current_installed/.bebop_install_success" ]]; then
+        # Marker lives next to the release files — whether they're in the
+        # host cache (new layout) or in the per-tenant releases dir (legacy).
+        if [[ -f "$current_target/.bebop_install_success" ]]; then
             echo "Installation status: ✓ Complete"
         else
             echo "Installation status: ⚠ Incomplete"

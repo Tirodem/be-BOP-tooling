@@ -131,7 +131,15 @@ main() {
     if [[ -z "$old_tag" ]]; then
         die "tenant '${TENANT_ID}' has no current release symlink; run add-tenant.sh first"
     fi
-    new_tag=$(release_resolve_version "$VERSION")
+    # Skip GitHub API entirely when the cache already holds the requested
+    # version (e.g. when upgrade-all has pre-warmed it). Otherwise resolve
+    # "latest" / validate the tag the normal way.
+    if [[ "$VERSION" != "latest" ]] && release_cache_has "$VERSION"; then
+        new_tag="$VERSION"
+        log_debug "cache hit for ${VERSION}; skipping GitHub API resolve"
+    else
+        new_tag=$(release_resolve_version "$VERSION")
+    fi
     if [[ "$new_tag" == "$old_tag" ]]; then
         log_info "tenant '${TENANT_ID}' already on ${new_tag} — nothing to do"
         exit 0
@@ -140,13 +148,12 @@ main() {
     log_info "upgrade: ${TENANT_ID}: ${old_tag} → ${new_tag}"
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[dry-run] would download ${new_tag}, swap symlink, restart bebop@${TENANT_ID}, healthcheck"
+        log_info "[dry-run] would ensure cache for ${new_tag}, swap symlink, restart bebop@${TENANT_ID}, healthcheck"
         exit 0
     fi
 
-    release_download_and_extract "$TENANT_ID" "$new_tag"
-    release_install_deps "$TENANT_ID" "$new_tag"
-    release_activate "$TENANT_ID" "$new_tag"
+    release_cache_ensure "$new_tag"
+    release_cache_set_current "$TENANT_ID" "$new_tag"
 
     log_info "restarting bebop@${TENANT_ID}.service..."
     run_privileged systemctl restart "bebop@${TENANT_ID}.service"
@@ -167,7 +174,11 @@ main() {
     log_error "healthcheck failed for ${TENANT_ID} after upgrade to ${new_tag}"
     if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
         log_warn "rolling back to ${old_tag}..."
-        release_activate "$TENANT_ID" "$old_tag"
+        # If the old tag was a legacy per-tenant install (pre-cache refactor)
+        # its dir may still exist outside the cache. release_cache_ensure
+        # populates it now if missing; release_cache_set_current then swaps.
+        release_cache_ensure "$old_tag"
+        release_cache_set_current "$TENANT_ID" "$old_tag"
         run_privileged systemctl restart "bebop@${TENANT_ID}.service"
         if http_wait_ok "https://${domain}/" "$HEALTHCHECK_RETRIES" "$HEALTHCHECK_INTERVAL"; then
             log_info "rollback to ${old_tag} succeeded"

@@ -45,6 +45,8 @@ source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
 source "$BEBOP_TOOLING_LIB_DIR/registry.sh"
 # shellcheck source=lib/notify.sh
 source "$BEBOP_TOOLING_LIB_DIR/notify.sh"
+# shellcheck source=lib/release.sh
+source "$BEBOP_TOOLING_LIB_DIR/release.sh"
 
 # === CLI ================================================================
 SECRETS_FILE=/etc/be-BOP-tooling/secrets.env
@@ -140,6 +142,21 @@ main() {
     source "$SECRETS_FILE"
 
     registry_init
+
+    # Pre-resolve the target version + pre-warm the host-wide cache ONCE,
+    # so each child upgrade-tenant.sh runs zero GitHub API calls and reuses
+    # the single download. Without this, 15 tenants × 2 API calls each was
+    # blowing the 60 req/h unauthenticated quota midway through the run.
+    local resolved
+    resolved=$(release_resolve_version "$VERSION")
+    if [[ "$VERSION" != "$resolved" ]]; then
+        log_info "upgrade-all: ${VERSION} resolved to ${resolved}"
+    fi
+    if [[ "$DRY_RUN" != "true" ]]; then
+        log_info "upgrade-all: pre-warming host cache for ${resolved}..."
+        release_cache_ensure "$resolved"
+    fi
+    VERSION="$resolved"
 
     local upgrade_tenant_path
     upgrade_tenant_path=$(locate_upgrade_tenant)

@@ -448,16 +448,18 @@ phase_directories() {
         "run_privileged rm -rf '/var/lib/be-BOP/${TENANT_ID}' '/etc/be-BOP/${TENANT_ID}' '/etc/phoenixd/${TENANT_ID}' '/var/lib/phoenixd/${TENANT_ID}'"
 }
 
-# Phase 7: download + extract + pnpm install + activate symlink
+# Phase 7: ensure host-shared release cache, then symlink tenant→cache.
+# We DO NOT register an undo for the cache entry: it's shared across tenants
+# and another tenant may already point to it. B2 (purge) handles orphan
+# cache entries separately. The tenant-side symlink IS undoable.
 phase_release() {
     log_info "phase 7: be-BOP release ${BEBOP_VERSION}..."
     RESOLVED_VERSION=$(release_resolve_version "$BEBOP_VERSION")
     log_info "resolved version: ${RESOLVED_VERSION}"
-    release_download_and_extract "$TENANT_ID" "$RESOLVED_VERSION"
-    txn_register_undo "release ${RESOLVED_VERSION}" \
-        "run_privileged rm -rf '/var/lib/be-BOP/${TENANT_ID}/releases/${RESOLVED_VERSION}'"
-    release_install_deps "$TENANT_ID" "$RESOLVED_VERSION"
-    release_activate "$TENANT_ID" "$RESOLVED_VERSION"
+    release_cache_ensure "$RESOLVED_VERSION"
+    release_cache_set_current "$TENANT_ID" "$RESOLVED_VERSION"
+    txn_register_undo "tenant current symlink" \
+        "run_privileged rm -f '/var/lib/be-BOP/${TENANT_ID}/releases/current'"
 }
 
 # Phase 8: phoenixd port.env + start phoenixd + read http-password
