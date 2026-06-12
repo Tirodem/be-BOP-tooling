@@ -47,6 +47,8 @@ source "$BEBOP_TOOLING_LIB_DIR/registry.sh"
 source "$BEBOP_TOOLING_LIB_DIR/notify.sh"
 # shellcheck source=lib/release.sh
 source "$BEBOP_TOOLING_LIB_DIR/release.sh"
+# shellcheck source=lib/freeze.sh
+source "$BEBOP_TOOLING_LIB_DIR/freeze.sh"
 
 # === CLI ================================================================
 SECRETS_FILE=/etc/be-BOP-tooling/secrets.env
@@ -178,17 +180,28 @@ main() {
     upgrade_tenant_path=$(locate_upgrade_tenant)
 
     # Build the tenant list.
-    local all_active=() filtered=()
+    local all_active=() filtered=() frozen_skipped=()
     while IFS= read -r t; do
         [[ -z "$t" ]] && continue
         all_active+=("$t")
-        if [[ -z "$FILTER" ]] || printf '%s\n' "$t" | grep -qE "$FILTER"; then
-            filtered+=("$t")
+        if [[ -n "$FILTER" ]] && ! printf '%s\n' "$t" | grep -qE "$FILTER"; then
+            continue
         fi
+        # freeze-tenant.sh add <id> → SKIPPED by upgrade-all (manual + nightly).
+        # Single-tenant upgrade-tenant.sh <id> runs ignore this list.
+        if freeze_is_frozen "$t"; then
+            frozen_skipped+=("$t")
+            continue
+        fi
+        filtered+=("$t")
     done < <(registry_list_by_status active)
 
+    if (( ${#frozen_skipped[@]} > 0 )); then
+        log_info "upgrade-all: ${#frozen_skipped[@]} tenant(s) frozen (skipped, see $(freeze_list_path)): ${frozen_skipped[*]}"
+    fi
+
     if (( ${#filtered[@]} == 0 )); then
-        log_info "no active tenants to upgrade (registry has ${#all_active[@]} active in total; filter='${FILTER}')"
+        log_info "no active tenants to upgrade (registry has ${#all_active[@]} active in total; filter='${FILTER}', frozen=${#frozen_skipped[@]})"
         exit 0
     fi
     log_info "upgrade-all: target=${VERSION}, mode=${MODE}, filter='${FILTER:-(none)}', tenants=${#filtered[@]}: ${filtered[*]}"
@@ -258,6 +271,7 @@ main() {
   upgrade-all summary  (target: ${VERSION}, mode: ${MODE})
 ==========================================================================
   Selected:   ${#filtered[@]}  (${filtered[*]})
+  Frozen:     ${#frozen_skipped[@]}  ${frozen_skipped[*]:-}    (skipped — freeze-tenant.sh)
   Bypassed:   ${#bypassed[@]}  ${bypassed[*]:-}    (already on target)
   Upgraded:   ${#succeeded[@]} ${succeeded[*]:-}
   Failed:     ${#failed[@]}    ${failed[*]:-}
