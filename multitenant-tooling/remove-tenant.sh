@@ -154,15 +154,27 @@ stop_disable_unit() {
 }
 
 # Remove tenant DNS records (looked up by subdomain since registry doesn't
-# store record IDs).
+# store record IDs). For external-domain tenants, skip the main FQDN — it
+# lives on the operator's DNS provider, not in our OVH zone — and only
+# clean the S3 record which always stays in the OVH zone.
 delete_dns_records() {
-    log_info "deleting DNS records ${DOMAIN} and ${S3_DOMAIN}..."
     local id
-    id=$(ovh_dns_record_find "$TENANT_ID" A 2>/dev/null || true)
-    [[ -n "$id" ]] && ovh_dns_record_delete "$id"
+    if is_external_tenant; then
+        log_info "deleting DNS record ${S3_DOMAIN} (main domain ${DOMAIN} is external — operator-managed, skipped)"
+    else
+        log_info "deleting DNS records ${DOMAIN} and ${S3_DOMAIN}..."
+        id=$(ovh_dns_record_find "$TENANT_ID" A 2>/dev/null || true)
+        [[ -n "$id" ]] && ovh_dns_record_delete "$id"
+    fi
     id=$(ovh_dns_record_find "s3.${TENANT_ID}" A 2>/dev/null || true)
     [[ -n "$id" ]] && ovh_dns_record_delete "$id"
     ovh_dns_zone_refresh
+}
+
+# is_external_tenant — true iff the tenant's domain isn't <tenant>.<zone>.
+# Requires load_tenant_from_registry to have populated DOMAIN + ZONE.
+is_external_tenant() {
+    [[ -n "$DOMAIN" && "$DOMAIN" != "${TENANT_ID}.${ZONE}" ]]
 }
 
 # Stop and remove the per-tenant mongod instance + its data dir.
@@ -210,13 +222,18 @@ delete_nginx_vhost() {
     log_info "nginx: deleted vhost bebop-${TENANT_ID}"
 }
 
-# Delete Let's Encrypt cert (per-tenant SAN cert).
+# Delete Let's Encrypt cert(s). Internal tenants have one SAN cert
+# (bebop-<id>); external-domain tenants have two distinct certs
+# (bebop-<id> for the main, bebop-<id>-s3 for the S3 endpoint). Try
+# both names — the second is a no-op for internal tenants.
 delete_certificate() {
-    local cert_name="bebop-${TENANT_ID}"
-    if run_privileged test -d "/etc/letsencrypt/live/${cert_name}"; then
-        run_privileged certbot delete --non-interactive --cert-name "$cert_name" 2>/dev/null \
-            || log_warn "certbot delete returned non-zero for ${cert_name}"
-    fi
+    local _c
+    for _c in "bebop-${TENANT_ID}" "bebop-${TENANT_ID}-s3"; do
+        if run_privileged test -d "/etc/letsencrypt/live/${_c}"; then
+            run_privileged certbot delete --non-interactive --cert-name "$_c" 2>/dev/null \
+                || log_warn "certbot delete returned non-zero for ${_c}"
+        fi
+    done
 }
 
 # Remove tenant filesystem trees.

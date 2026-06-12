@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# bebop-certbot-renew-check.service — runs `certbot renew --dry-run` and
+# notifies operators (Zulip + SMTP) on failure. Triggered weekly by
+# bebop-certbot-renew-check.timer; can also be invoked manually:
+#   sudo systemctl start bebop-certbot-renew-check.service
+#
+# Catches silent renewal failures for BOTH DNS-01 (internal tenants via the
+# OVH hook) AND HTTP-01 (external-domain tenants via the default vhost's
+# ACME webroot). Without this, a broken renewal flow surfaces only when
+# the cert actually expires and the tenant goes down with a TLS error.
+
+[Unit]
+Description=be-BOP weekly certbot renewal dry-run + notification
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/certbot-renew-check.sh
+SyslogIdentifier=bebop-tooling-cert-renew-check

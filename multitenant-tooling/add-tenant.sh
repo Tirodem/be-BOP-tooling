@@ -56,6 +56,8 @@ source "$BEBOP_TOOLING_LIB_DIR/uptime-kuma.sh"
 source "$BEBOP_TOOLING_LIB_DIR/healthcheck.sh"
 # shellcheck source=lib/release.sh
 source "$BEBOP_TOOLING_LIB_DIR/release.sh"
+# shellcheck source=lib/dns.sh
+source "$BEBOP_TOOLING_LIB_DIR/dns.sh"
 
 # === Constants ==========================================================
 readonly TENANT_REGEX='^[a-z0-9][a-z0-9-]*$'
@@ -81,6 +83,7 @@ readonly PHOENIXD_PASSWORD_INTERVAL=2
 SECRETS_FILE=/etc/be-BOP-tooling/secrets.env
 TENANT_ID=""
 ADMIN_EMAIL=""
+EXTERNAL_DOMAIN=""    # set by --external-domain <fqdn>; empty = internal tenant
 ENABLE_PHOENIXD=true
 BEBOP_VERSION="latest"
 REACTIVATE=false
@@ -102,6 +105,15 @@ Required:
 Optional:
   --no-phoenixd           skip the per-tenant phoenixd daemon (default: enabled)
   --bebop-version <tag>   GitHub release tag of be-BOP, or "latest" (default)
+  --external-domain <fqdn>
+                          deploy under <fqdn> instead of the default
+                          <tenant_id>.<OVH_DNS_ZONE>. The operator MUST
+                          configure both A and AAAA records on their DNS
+                          provider pointing to this VDS before running.
+                          The S3 endpoint stays internal at
+                          s3.<tenant_id>.<OVH_DNS_ZONE>. The main cert is
+                          issued via HTTP-01 (separate from the S3 DNS-01
+                          cert). Requires public IPv6 on the VDS.
   --reactivate            restore a soft-deleted tenant (preserves data)
   --secrets-file <path>   override default ${SECRETS_FILE}
   --non-interactive       no prompts; fail if input would be required
@@ -124,6 +136,7 @@ while (( $# )); do
         --phoenixd)        ENABLE_PHOENIXD=true; shift ;;
         --no-phoenixd)     ENABLE_PHOENIXD=false; shift ;;
         --bebop-version)   BEBOP_VERSION="$2"; shift 2 ;;
+        --external-domain) EXTERNAL_DOMAIN="$2"; shift 2 ;;
         --reactivate)      REACTIVATE=true; shift ;;
         --secrets-file)    SECRETS_FILE="$2"; shift 2 ;;
         --non-interactive) RUN_NON_INTERACTIVE=true; shift ;;
@@ -161,6 +174,16 @@ for _reserved in "${RESERVED_TENANT_IDS[@]}"; do
 done
 unset _reserved
 
+# --external-domain: validate FQDN syntax + refuse a domain that's actually
+# under OVH_DNS_ZONE (= would be an internal tenant misusing the flag).
+if [[ -n "$EXTERNAL_DOMAIN" ]]; then
+    if [[ ! "$EXTERNAL_DOMAIN" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
+        die "invalid --external-domain '${EXTERNAL_DOMAIN}' (expected an FQDN like bebop.example.com)"
+    fi
+fi
+
+is_external_mode() { [[ -n "$EXTERNAL_DOMAIN" ]]; }
+
 # Tag log lines with the tenant id from now on.
 BEBOP_TOOLING_TENANT_ID="$TENANT_ID"
 BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
@@ -168,10 +191,11 @@ export BEBOP_TOOLING_TENANT_ID BEBOP_TOOLING_SYSLOG_IDENT
 export RUN_NON_INTERACTIVE VERBOSE DRY_RUN
 
 # === Globals (set during phases) ========================================
-DOMAIN=""              # <tenant>.<zone>
-S3_DOMAIN=""           # s3.<tenant>.<zone>
+DOMAIN=""              # <tenant>.<zone> for internal; --external-domain value otherwise
+S3_DOMAIN=""           # s3.<tenant>.<zone>  (always internal — even for --external-domain tenants)
 ZONE=""                # <zone> from secrets.env
 HOST_IP=""
+HOST_IPV6=""           # only populated in external-domain mode (used for DNS pre-flight)
 BEBOP_PORT=""
 PHOENIXD_PORT=""
 MONGO_PORT=""
@@ -186,7 +210,8 @@ PHOENIXD_SEED_HEX=""
 DNS_RECORD_BEBOP_ID=""
 DNS_RECORD_S3_ID=""
 RESOLVED_VERSION=""
-CERT_NAME=""
+CERT_NAME=""           # main cert: covers DOMAIN
+S3_CERT_NAME=""        # internal: == CERT_NAME (one SAN cert); external: distinct, DNS-01 only for S3
 
 # === Helpers ============================================================
 detect_host_ip() {
@@ -198,7 +223,22 @@ detect_host_ip() {
     if [[ -z "$HOST_IP" || ! "$HOST_IP" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
         die "could not detect host public IP — set BEBOP_HOST_IP env var explicitly"
     fi
-    log_info "host public IP: ${HOST_IP}"
+    log_info "host public IPv4: ${HOST_IP}"
+}
+
+# Required only for --external-domain mode: the external FQDN's AAAA must
+# match BEBOP_HOST_IPV6. We expose this even on IPv4-only operations to keep
+# the failure mode clear ("VDS has no IPv6 → external mode not usable").
+detect_host_ipv6() {
+    if [[ -n "${BEBOP_HOST_IPV6:-}" ]]; then
+        HOST_IPV6="$BEBOP_HOST_IPV6"
+    else
+        HOST_IPV6=$(curl -sS --max-time 10 https://api6.ipify.org 2>/dev/null || true)
+    fi
+    if [[ -z "$HOST_IPV6" || ! "$HOST_IPV6" =~ ^[0-9a-fA-F:]+$ ]]; then
+        die "could not detect host public IPv6 — external-domain mode requires IPv6 on the VDS. Either set BEBOP_HOST_IPV6 in ${SECRETS_FILE} OR drop --external-domain."
+    fi
+    log_info "host public IPv6: ${HOST_IPV6}"
 }
 
 # Generate a 32-char URL-safe random password.
@@ -258,9 +298,38 @@ phase_status_decision() {
 phase_derive_identifiers() {
     log_info "phase 2: deriving identifiers..."
     ZONE="${OVH_DNS_ZONE:?OVH_DNS_ZONE missing in secrets.env}"
-    DOMAIN="${TENANT_ID}.${ZONE}"
-    S3_DOMAIN="s3.${TENANT_ID}.${ZONE}"
-    CERT_NAME="bebop-${TENANT_ID}"
+
+    # On reapply / reactivate, recover the external-domain mode from the
+    # registry if the caller didn't pass --external-domain. Saves the
+    # operator from having to remember the flag for routine re-applies.
+    if [[ "${DECISION_PATH:-fresh}" != "fresh" && -z "$EXTERNAL_DOMAIN" ]]; then
+        local existing_domain
+        existing_domain=$(registry_get_field "$TENANT_ID" domain)
+        if [[ -n "$existing_domain" && "$existing_domain" != "${TENANT_ID}.${ZONE}" ]]; then
+            EXTERNAL_DOMAIN="$existing_domain"
+            log_info "detected external-domain tenant from registry: ${EXTERNAL_DOMAIN}"
+        fi
+    fi
+
+    if is_external_mode; then
+        # External public FQDN; reject if it happens to land back inside our zone.
+        DOMAIN="$EXTERNAL_DOMAIN"
+        if [[ "$DOMAIN" == *".${ZONE}" ]]; then
+            die "--external-domain '${DOMAIN}' is under OVH_DNS_ZONE='${ZONE}'; drop the flag to use the standard internal path"
+        fi
+        # S3 stays internal regardless — Garage runs on the VDS and its DNS
+        # is managed by us via OVH.
+        S3_DOMAIN="s3.${TENANT_ID}.${ZONE}"
+        # Two certs: main via HTTP-01 webroot, s3 via DNS-01 OVH hook.
+        CERT_NAME="bebop-${TENANT_ID}"
+        S3_CERT_NAME="bebop-${TENANT_ID}-s3"
+    else
+        DOMAIN="${TENANT_ID}.${ZONE}"
+        S3_DOMAIN="s3.${TENANT_ID}.${ZONE}"
+        # Single SAN cert covers both names (unchanged from pre-B1 behaviour).
+        CERT_NAME="bebop-${TENANT_ID}"
+        S3_CERT_NAME="bebop-${TENANT_ID}"
+    fi
     GARAGE_BUCKET="bebop-${TENANT_ID}"
     GARAGE_KEY_NAME="bebop-${TENANT_ID}-key"
     MONGO_DB_NAME="bebop_${TENANT_ID//-/_}"
@@ -294,13 +363,16 @@ phase_derive_identifiers() {
 phase_clean_orphans() {
     log_info "phase 2.5: scanning for orphan resources from prior failed runs..."
     local cleaned=0
-    # OVH DNS records
+    # OVH DNS records. In external-domain mode the main DOMAIN isn't in our
+    # zone at all (operator manages it), so we only look at the S3 record.
     local id
-    id=$(ovh_dns_record_find "$TENANT_ID" A 2>/dev/null || true)
-    if [[ -n "$id" ]]; then
-        log_warn "orphan: DNS A ${DOMAIN} (id=${id}); deleting"
-        ovh_dns_record_delete "$id" || log_warn "orphan: DNS delete failed for ${id} — continuing"
-        cleaned=1
+    if ! is_external_mode; then
+        id=$(ovh_dns_record_find "$TENANT_ID" A 2>/dev/null || true)
+        if [[ -n "$id" ]]; then
+            log_warn "orphan: DNS A ${DOMAIN} (id=${id}); deleting"
+            ovh_dns_record_delete "$id" || log_warn "orphan: DNS delete failed for ${id} — continuing"
+            cleaned=1
+        fi
     fi
     id=$(ovh_dns_record_find "s3.${TENANT_ID}" A 2>/dev/null || true)
     if [[ -n "$id" ]]; then
@@ -356,12 +428,19 @@ phase_clean_orphans() {
         run_privileged systemctl reload nginx 2>/dev/null || true
     fi
 
-    # Let's Encrypt cert directory.
-    if run_privileged test -d "/etc/letsencrypt/live/${CERT_NAME}"; then
-        log_warn "orphan: Let's Encrypt cert ${CERT_NAME}; deleting"
-        run_privileged certbot delete --non-interactive --cert-name "${CERT_NAME}" 2>/dev/null \
-            || log_warn "orphan: certbot delete failed; continuing"
-    fi
+    # Let's Encrypt cert directories. In external-domain mode the main and
+    # S3 are two distinct certs (CERT_NAME and S3_CERT_NAME), so we clean
+    # both. In internal mode S3_CERT_NAME == CERT_NAME so the second pass
+    # is a no-op.
+    local _c
+    for _c in "$CERT_NAME" "$S3_CERT_NAME"; do
+        if [[ -n "$_c" ]] && run_privileged test -d "/etc/letsencrypt/live/${_c}"; then
+            log_warn "orphan: Let's Encrypt cert ${_c}; deleting"
+            run_privileged certbot delete --non-interactive --cert-name "${_c}" 2>/dev/null \
+                || log_warn "orphan: certbot delete failed for ${_c}; continuing"
+        fi
+    done
+    unset _c
 
     # Kuma monitor (best-effort; helper warns if creds/URL missing).
     kuma_unregister_tenant "$TENANT_ID" 2>/dev/null || true
@@ -369,12 +448,28 @@ phase_clean_orphans() {
     log_info "phase 2.5: orphan cleanup complete"
 }
 
-# Phase 3: DNS A records (both <tenant>.<zone> and s3.<tenant>.<zone>)
+# Phase 3: DNS records.
+# - Internal mode: create A records via OVH for both <tenant>.<zone> and
+#   s3.<tenant>.<zone>.
+# - External mode: skip the main domain (operator manages it on their own
+#   provider); pre-flight check that A AND AAAA on <external_domain> match
+#   the VDS's IPs (abort with actionable message otherwise). Still create
+#   the S3 OVH record since S3 stays on our zone.
 phase_dns() {
-    log_info "phase 3: DNS A records via OVH..."
-    DNS_RECORD_BEBOP_ID=$(ovh_dns_record_create "$TENANT_ID" A "$HOST_IP")
-    txn_register_undo "DNS A record ${DOMAIN}" \
-        "ovh_dns_record_delete '${DNS_RECORD_BEBOP_ID}' && ovh_dns_zone_refresh"
+    if is_external_mode; then
+        log_info "phase 3: pre-flight DNS check on external domain ${DOMAIN}..."
+        # IPv6 is mandatory in external mode (decided in B1) — detect now so the
+        # pre-flight has both expected values to compare against.
+        detect_host_ipv6
+        dns_check_external_fqdn "$DOMAIN" "$HOST_IP" "$HOST_IPV6"
+        log_info "phase 3: external DNS OK; creating only the S3 OVH record (main is operator-managed)"
+        DNS_RECORD_BEBOP_ID=""  # nothing to undo on the main side
+    else
+        log_info "phase 3: DNS A records via OVH (main + s3)..."
+        DNS_RECORD_BEBOP_ID=$(ovh_dns_record_create "$TENANT_ID" A "$HOST_IP")
+        txn_register_undo "DNS A record ${DOMAIN}" \
+            "ovh_dns_record_delete '${DNS_RECORD_BEBOP_ID}' && ovh_dns_zone_refresh"
+    fi
     DNS_RECORD_S3_ID=$(ovh_dns_record_create "s3.${TENANT_ID}" A "$HOST_IP")
     txn_register_undo "DNS A record ${S3_DOMAIN}" \
         "ovh_dns_record_delete '${DNS_RECORD_S3_ID}' && ovh_dns_zone_refresh"
@@ -555,22 +650,57 @@ phase_config_env() {
 # the zone from secrets.env and only need GET/POST/DELETE under
 # /domain/zone/<OVH_DNS_ZONE>/* — strictly tenant-scoped.
 phase_certificate() {
-    log_info "phase 10: Let's Encrypt cert (DNS-01 via custom OVH hook)..."
-    if run_privileged test -d "/etc/letsencrypt/live/${CERT_NAME}"; then
-        log_info "cert ${CERT_NAME} already issued — skipping certbot"
-        return 0
-    fi
     local hooks_dir="/usr/local/share/be-BOP-tooling/hooks"
     if [[ -d "${SCRIPT_DIR}/hooks" ]]; then
-        # source-tree layout (running from a checkout)
         hooks_dir="${SCRIPT_DIR}/hooks"
     fi
-    # Prefer the fleet-wide LE_OPERATOR_EMAIL so every cert lives under
-    # one Let's Encrypt account; fall back to the per-tenant ADMIN_EMAIL
-    # for backward compat. Using ADMIN_EMAIL means a new LE account per
-    # tenant, which trips LE's "10 accounts / IP / 3h" limit on bulk
-    # onboarding — see secrets.env.example for the recommended setup.
     local acme_email="${LE_OPERATOR_EMAIL:-$ADMIN_EMAIL}"
+
+    if is_external_mode; then
+        log_info "phase 10: Let's Encrypt certs (external mode = main HTTP-01 + s3 DNS-01)..."
+        _issue_cert_http01 "$CERT_NAME"     "$DOMAIN"    "$acme_email"
+        _issue_cert_dns01  "$S3_CERT_NAME"  "$S3_DOMAIN" "$acme_email" "$hooks_dir"
+    else
+        log_info "phase 10: Let's Encrypt cert (DNS-01 SAN via custom OVH hook)..."
+        _issue_cert_dns01_san "$CERT_NAME" "$DOMAIN" "$S3_DOMAIN" "$acme_email" "$hooks_dir"
+    fi
+}
+
+# _issue_cert_http01 <cert_name> <domain> <acme_email>
+# Single-domain HTTP-01 webroot. Depends on the default nginx vhost
+# installed by host-bootstrap.sh serving /.well-known/acme-challenge/
+# from /var/lib/letsencrypt/.
+_issue_cert_http01() {
+    local cert_name="$1" domain="$2" email="$3"
+    if run_privileged test -d "/etc/letsencrypt/live/${cert_name}"; then
+        log_info "cert ${cert_name} already issued — skipping certbot"
+        return 0
+    fi
+    local certbot_args=(
+        certonly
+        --webroot --webroot-path /var/lib/letsencrypt
+        --non-interactive --agree-tos
+        --email "$email"
+        --cert-name "$cert_name"
+        -d "$domain"
+    )
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[dry-run] would run: certbot ${certbot_args[*]}"
+    else
+        run_privileged certbot "${certbot_args[@]}"
+    fi
+    txn_register_undo "Let's Encrypt cert ${cert_name}" \
+        "run_privileged certbot delete --non-interactive --cert-name '${cert_name}' 2>/dev/null || true"
+}
+
+# _issue_cert_dns01 <cert_name> <domain> <acme_email> <hooks_dir>
+# Single-domain DNS-01 via custom OVH hook (the same hook the SAN cert uses).
+_issue_cert_dns01() {
+    local cert_name="$1" domain="$2" email="$3" hooks_dir="$4"
+    if run_privileged test -d "/etc/letsencrypt/live/${cert_name}"; then
+        log_info "cert ${cert_name} already issued — skipping certbot"
+        return 0
+    fi
     local certbot_args=(
         certonly
         --manual
@@ -578,18 +708,46 @@ phase_certificate() {
         --manual-auth-hook "${hooks_dir}/certbot-ovh-auth.sh"
         --manual-cleanup-hook "${hooks_dir}/certbot-ovh-cleanup.sh"
         --non-interactive --agree-tos
-        --email "$acme_email"
-        --cert-name "$CERT_NAME"
-        -d "$DOMAIN"
-        -d "$S3_DOMAIN"
+        --email "$email"
+        --cert-name "$cert_name"
+        -d "$domain"
     )
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[dry-run] would run: certbot ${certbot_args[*]}"
     else
         run_privileged certbot "${certbot_args[@]}"
     fi
-    txn_register_undo "Let's Encrypt cert ${CERT_NAME}" \
-        "run_privileged certbot delete --non-interactive --cert-name '${CERT_NAME}' 2>/dev/null || true"
+    txn_register_undo "Let's Encrypt cert ${cert_name}" \
+        "run_privileged certbot delete --non-interactive --cert-name '${cert_name}' 2>/dev/null || true"
+}
+
+# _issue_cert_dns01_san <cert_name> <domain> <s3_domain> <acme_email> <hooks_dir>
+# SAN cert covering both main and s3 — the historical internal-tenant flow.
+_issue_cert_dns01_san() {
+    local cert_name="$1" domain="$2" s3_domain="$3" email="$4" hooks_dir="$5"
+    if run_privileged test -d "/etc/letsencrypt/live/${cert_name}"; then
+        log_info "cert ${cert_name} already issued — skipping certbot"
+        return 0
+    fi
+    local certbot_args=(
+        certonly
+        --manual
+        --preferred-challenges dns-01
+        --manual-auth-hook "${hooks_dir}/certbot-ovh-auth.sh"
+        --manual-cleanup-hook "${hooks_dir}/certbot-ovh-cleanup.sh"
+        --non-interactive --agree-tos
+        --email "$email"
+        --cert-name "$cert_name"
+        -d "$domain"
+        -d "$s3_domain"
+    )
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[dry-run] would run: certbot ${certbot_args[*]}"
+    else
+        run_privileged certbot "${certbot_args[@]}"
+    fi
+    txn_register_undo "Let's Encrypt cert ${cert_name}" \
+        "run_privileged certbot delete --non-interactive --cert-name '${cert_name}' 2>/dev/null || true"
 }
 
 # Phase 11: nginx vhost
@@ -603,6 +761,8 @@ phase_nginx() {
         tenant_id          "$TENANT_ID" \
         domain             "$DOMAIN" \
         s3_domain          "$S3_DOMAIN" \
+        main_cert_name     "$CERT_NAME" \
+        s3_cert_name       "$S3_CERT_NAME" \
         bebop_port         "$BEBOP_PORT" \
         template_revision  "$TEMPLATE_REVISION" \
         > "$tmp"

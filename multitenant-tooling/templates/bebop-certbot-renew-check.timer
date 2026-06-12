@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# bebop-certbot-renew-check.timer — weekly trigger for the cert renewal
+# health check. Sunday early morning (low traffic), 30 min jitter to
+# spread across the fleet. Persistent=true so a missed run catches up
+# on next boot.
+
+[Unit]
+Description=Weekly be-BOP certbot renewal health check
+
+[Timer]
+OnCalendar=Sun 03:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

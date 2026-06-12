@@ -541,19 +541,46 @@ step_provision_garage_layout() {
     fi
 }
 
-# === nginx default catch-all ============================================
+# === nginx default catch-all + ACME HTTP-01 webroot =====================
+# The default vhost has TWO responsibilities, both load-bearing:
+#   1. Serve the ACME HTTP-01 challenge tokens for ANY hostname on port 80
+#      so certbot can issue/renew certs for tenants in external-domain mode
+#      (add-tenant.sh --external-domain, B1). All HTTP-01 renewals depend
+#      on the /.well-known/acme-challenge/ location being intact — touching
+#      it breaks every external-domain tenant's cert renewal silently.
+#   2. Drop connections to unknown hosts (return 444) for everything else,
+#      so port scans / random Host: headers don't reveal which sites we host.
 step_write_nginx_default_vhost() {
-    log_info "Writing nginx catch-all vhost..."
+    log_info "Writing nginx catch-all + ACME webroot vhost..."
+    # Webroot dir certbot writes challenge tokens into. Created world-readable
+    # so nginx (running as www-data) can serve them, while certbot (running
+    # as root) writes them. The dir itself stays empty between renewals.
+    maybe_run run_privileged install -d -m 0755 /var/lib/letsencrypt
+    maybe_run run_privileged install -d -m 0755 /var/lib/letsencrypt/.well-known
+    maybe_run run_privileged install -d -m 0755 /var/lib/letsencrypt/.well-known/acme-challenge
     local tmp
     tmp=$(mktemp)
     cat > "$tmp" <<'EOF'
-# Catch-all default — drops connections to unknown hosts. Per-tenant vhosts
-# are added under sites-enabled by add-tenant.sh.
+# Catch-all default vhost. Two roles:
+#   1. Serve ACME HTTP-01 challenge tokens for ANY hostname (load-bearing —
+#      external-domain tenants' cert renewals depend on this location).
+#   2. Return 444 for any other request to an unknown host.
+# Per-tenant vhosts are added under sites-enabled by add-tenant.sh.
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
     server_name _;
-    return 444;
+
+    # DO NOT TOUCH: HTTP-01 webroot for certbot. Every external-domain
+    # tenant's cert renewal hits this location.
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/lib/letsencrypt;
+        default_type "text/plain";
+    }
+
+    location / {
+        return 444;
+    }
 }
 EOF
     maybe_run run_privileged install -m 0644 "$tmp" /etc/nginx/sites-available/default
@@ -561,7 +588,54 @@ EOF
     rm -f "$tmp"
     if [[ "$DRY_RUN" != "true" ]]; then
         run_privileged nginx -t
+        # On a re-run of host-bootstrap (after updating the tooling), nginx
+        # is already active and step_start_nginx's `enable --now` is a
+        # no-op — without an explicit reload, an updated default vhost
+        # template would not take effect until the next reboot. Reload here
+        # so the ACME webroot block is live as soon as host-bootstrap
+        # finishes.
+        if run_privileged systemctl is-active --quiet nginx 2>/dev/null; then
+            run_privileged systemctl reload nginx
+        fi
     fi
+}
+
+# === certbot post-renewal nginx reload hook =============================
+# Certbot auto-renews via its daily timer (Debian package). When a cert
+# is renewed, nginx must be told to reload — otherwise it keeps serving
+# the OLD cert (read at startup) until manual intervention, and the cert
+# eventually expires. We install a post-renewal hook so every renewal
+# triggers a reload across the entire fleet.
+step_install_certbot_nginx_reload_hook() {
+    log_info "Installing certbot post-renewal nginx reload hook..."
+    maybe_run run_privileged install -d -m 0755 /etc/letsencrypt/renewal-hooks/post
+    local tmp
+    tmp=$(mktemp)
+    cat > "$tmp" <<'EOF'
+#!/usr/bin/env bash
+# be-BOP tooling — reload nginx after any cert renews so the new cert is
+# picked up immediately. Installed by host-bootstrap.sh.
+exec systemctl reload nginx
+EOF
+    maybe_run run_privileged install -m 0755 "$tmp" /etc/letsencrypt/renewal-hooks/post/01-reload-nginx.sh
+    rm -f "$tmp"
+}
+
+# === certbot renewal monitoring =========================================
+# Runs `certbot renew --dry-run` weekly and notifies operators (Zulip +
+# SMTP) on failure. Active by default for all installs — the cost is
+# zero (a few seconds of dry-run per week, no LE quota consumed) and it
+# catches silent renewal failures for BOTH DNS-01 (internal tenants) and
+# HTTP-01 (external-domain tenants). See B1 in BACKLOG.
+step_setup_cert_renewal_monitoring() {
+    log_info "Installing bebop-certbot-renew-check.{service,timer}..."
+    local u
+    for u in bebop-certbot-renew-check.service bebop-certbot-renew-check.timer; do
+        maybe_run run_privileged install -m 0644 \
+            "${BEBOP_TOOLING_TEMPLATE_DIR}/${u}" "/etc/systemd/system/${u}"
+    done
+    maybe_run run_privileged systemctl daemon-reload
+    maybe_run run_privileged systemctl enable --now bebop-certbot-renew-check.timer
 }
 
 step_start_nginx() {
@@ -620,7 +694,7 @@ step_install_tooling_libs_and_scripts() {
     fi
     log_info "Installing per-tenant scripts to /usr/local/bin/..."
     local script
-    for script in add-tenant.sh remove-tenant.sh upgrade-tenant.sh upgrade-all.sh list-tenants.sh tenant-cli.sh gh-rate-limit.sh; do
+    for script in add-tenant.sh remove-tenant.sh upgrade-tenant.sh upgrade-all.sh list-tenants.sh tenant-cli.sh gh-rate-limit.sh certbot-renew-check.sh; do
         if [[ -f "${SCRIPT_DIR}/${script}" ]]; then
             maybe_run run_privileged install -m 0755 "${SCRIPT_DIR}/${script}" "/usr/local/bin/${script}"
         else
@@ -1116,6 +1190,8 @@ main() {
     step_setup_netdata_public_access
     step_setup_kuma_public_access
 
+    step_install_certbot_nginx_reload_hook
+    step_setup_cert_renewal_monitoring
     step_setup_nightly_upgrade
 
     step_print_summary

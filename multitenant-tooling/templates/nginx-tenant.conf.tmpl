@@ -5,13 +5,20 @@
 # tooling-fingerprint: @template_revision@
 #
 # Materialised at /etc/nginx/sites-available/bebop-@tenant_id@.conf by
-# add-tenant.sh after the per-tenant Let's Encrypt cert (named bebop-@tenant_id@,
-# covering both @domain@ and @s3_domain@) has been issued.
+# add-tenant.sh. The cert names differ between deployment modes:
+#   - internal tenants (default): one SAN cert covers main + s3 →
+#       @main_cert_name@ == @s3_cert_name@ == bebop-<tenant_id>
+#   - external-domain tenants (--external-domain): main goes through
+#     HTTP-01, s3 through DNS-01 → two distinct certs →
+#       @main_cert_name@ == bebop-<tenant_id>
+#       @s3_cert_name@   == bebop-<tenant_id>-s3
 #
 # Substitution placeholders (all replaced by add-tenant.sh):
 #   @tenant_id@         tenant slug
-#   @domain@            <tenant>.<zone>           (be-BOP frontend)
-#   @s3_domain@         s3.<tenant>.<zone>        (Garage S3 endpoint)
+#   @domain@            public FQDN (internal: <tenant>.<zone>; external: --external-domain value)
+#   @s3_domain@         s3.<tenant>.<zone>        (Garage S3 endpoint, always internal)
+#   @main_cert_name@    Let's Encrypt cert name for @domain@
+#   @s3_cert_name@      Let's Encrypt cert name for @s3_domain@
 #   @bebop_port@        local be-BOP port
 #   @template_revision@ template fingerprint
 
@@ -32,8 +39,8 @@ server {
     listen [::]:443 ssl http2;
     server_name @domain@;
 
-    ssl_certificate     /etc/letsencrypt/live/bebop-@tenant_id@/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/bebop-@tenant_id@/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/@main_cert_name@/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/@main_cert_name@/privkey.pem;
 
     # Mozilla "Intermediate" SSL configuration
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -85,8 +92,8 @@ server {
     listen [::]:443 ssl http2;
     server_name @s3_domain@;
 
-    ssl_certificate     /etc/letsencrypt/live/bebop-@tenant_id@/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/bebop-@tenant_id@/privkey.pem;
+    ssl_certificate     /etc/letsencrypt/live/@s3_cert_name@/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/@s3_cert_name@/privkey.pem;
 
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ecdh_curve X25519:prime256v1:secp384r1;
