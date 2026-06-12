@@ -102,3 +102,21 @@ mongo_dump_db() {
     log_info "mongo: mongodump db='${db}' port=${port} → ${out}"
     mongodump --quiet --port "$port" --db "$db" --out "$out"
 }
+
+# mongo_restore_db <port> <db_name> <dump_dir>
+# Restores a single DB from a mongodump output dir. The caller is responsible
+# for having dropped the target DB first if a clean restore is wanted.
+# Looks for <dump_dir>/<db_name>/ (mongodump's default layout) — that's the
+# --db arg of the restore.
+mongo_restore_db() {
+    local port="$1" db="$2" dump_dir="$3"
+    if ! command -v mongorestore >/dev/null 2>&1; then
+        die "mongo_restore_db: mongorestore not installed (apt install mongodb-database-tools)"
+    fi
+    local db_subdir="${dump_dir}/${db}"
+    if [[ ! -d "$db_subdir" ]]; then
+        die "mongo_restore_db: dump dir for '${db}' not found at ${db_subdir}"
+    fi
+    log_info "mongo: mongorestore db='${db}' port=${port} ← ${db_subdir}"
+    mongorestore --quiet --port "$port" --db "$db" "$db_subdir"
+}

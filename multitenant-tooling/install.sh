@@ -113,6 +113,7 @@ chmod 0755 \
     "${INSTALL_DIR}/gh-rate-limit.sh" \
     "${INSTALL_DIR}/certbot-renew-check.sh" \
     "${INSTALL_DIR}/backup-tenants.sh" \
+    "${INSTALL_DIR}/restore-tenant.sh" \
     "${INSTALL_DIR}/install.sh" 2>/dev/null || true
 # Hooks must be executable for certbot --manual-{auth,cleanup}-hook
 # to invoke them; safety net if the tarball didn't preserve +x.
