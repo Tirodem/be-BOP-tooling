@@ -49,10 +49,14 @@ server {
     ssl_session_cache shared:SSL-bebop-@tenant_id@:10m;
     ssl_session_tickets off;
     ssl_prefer_server_ciphers off;
-    # OCSP stapling intentionally disabled: Let's Encrypt stopped including
-    # OCSP responder URLs in their certs in 2025; ssl_stapling on; would
-    # log a benign-but-noisy warning per nginx reload. Modern PKI is
-    # moving to CRLite / browser-side checks anyway.
+    # OCSP stapling explicitly disabled. Let's Encrypt stopped including
+    # OCSP responder URLs in 2025; browsers moved to CRLite. Leaving
+    # stapling enabled (whether by Debian's default nginx.conf or any
+    # http-level inheritance) emits a benign-but-noisy warning per cert
+    # per reload — multiplied across N tenants it pollutes the journal.
+    # `off` here overrides any http-level value.
+    ssl_stapling off;
+    ssl_stapling_verify off;
 
     add_header Strict-Transport-Security "max-age=31536000" always;
 

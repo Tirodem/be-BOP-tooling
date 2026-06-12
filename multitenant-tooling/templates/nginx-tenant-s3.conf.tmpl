@@ -35,6 +35,10 @@ server {
     ssl_session_cache shared:SSL-bebop-@tenant_id@-s3:10m;
     ssl_session_tickets off;
     ssl_prefer_server_ciphers off;
+    # OCSP stapling explicitly disabled — see rationale in
+    # nginx-tenant-main.conf.tmpl.
+    ssl_stapling off;
+    ssl_stapling_verify off;
 
     add_header Strict-Transport-Security "max-age=31536000" always;
 
