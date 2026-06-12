@@ -252,6 +252,45 @@ release_cache_ensure() {
     release_cache_ensure_from_url "$tag" "$url"
 }
 
+# release_resolve_nth_before <reference_tag> <k>
+# Echo the k-th release older than <reference_tag> in the GitHub list of
+# releases-with-matching-asset (newest-first ordering as returned by the API).
+# Used by the exit-code handler for rollback (codes 110-119, k ∈ [1,10]).
+#
+# Renumbering happens naturally as releases get retired: each call is a live
+# query, so a retired release between two rollbacks simply doesn't appear in
+# the list and indices shift accordingly.
+#
+# Returns 1 (and prints nothing on stdout) if:
+#   - <reference_tag> not present in the matching-asset list (e.g. manual
+#     deploy, or that release got retired);
+#   - <k> goes past the oldest available release (k > history);
+#   - the GitHub API call fails (rate-limited, auth error, network).
+#
+# per_page=100 is the GitHub max; k is bounded to [1,10] so a single page
+# covers any plausible rollback as long as the reference is in the most
+# recent 100 matching releases. Paginate later if be-BOP ever ships >100.
+release_resolve_nth_before() {
+    local reference_tag="$1" k="$2"
+    [[ "$k" =~ ^[1-9][0-9]*$ ]] || return 1
+    local resp
+    if ! resp=$(_release_gh_get "https://api.github.com/repos/${BEBOP_GITHUB_REPO}/releases?per_page=100"); then
+        return 1
+    fi
+    local target
+    target=$(printf '%s' "$resp" \
+        | jq -r --arg re "$_BEBOP_RELEASE_ASSET_RE" --arg ref "$reference_tag" --argjson k "$k" '
+            [.[] | select(.assets[]?.name | test($re)) | .tag_name]
+            | (index($ref)) as $i
+            | if $i == null then ""
+              elif $i + $k >= length then ""
+              else .[$i + $k]
+              end
+        ')
+    [[ -n "$target" ]] || return 1
+    printf '%s\n' "$target"
+}
+
 # release_cache_set_current <tenant> <name>
 # Atomically swap /var/lib/be-BOP/<tenant>/releases/current to point to the
 # cache entry for <name>. Caller must have ensured the entry exists.

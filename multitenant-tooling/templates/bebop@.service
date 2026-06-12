@@ -29,8 +29,22 @@ WorkingDirectory=/var/lib/be-BOP/%i/releases/current
 Environment=HOME=/var/lib/be-BOP/%i/state
 Environment=NODE_ENV=production
 EnvironmentFile=/etc/be-BOP/%i/config.env
-ExecStart=/usr/bin/pnpm run-production
-Restart=always
+ExecStart=/usr/bin/node build/index.js
+# Exit-code protocol v1 (contract be-BOP ↔ orchestrator validated 2026-06-12).
+# be-BOP signals intent to the orchestrator via specific exit codes:
+#   0        permanent shutdown (do NOT restart)
+#   100      restart on same version
+#   101      update to latest GitHub release
+#   110-119  rollback to N-k (k = code - 109)
+# Restart=on-failure honors "0 = stop permanently" by default; the protocol
+# codes are then explicitly forced via RestartForceExitStatus= AND marked as
+# success via SuccessExitStatus= so they don't pollute the journal as failed.
+# ExecStopPost= runs as root (the '+' prefix overrides DynamicUser=) to let
+# the handler swap the releases/current symlink BEFORE systemd relaunches.
+Restart=on-failure
+SuccessExitStatus=100 101 110 111 112 113 114 115 116 117 118 119
+RestartForceExitStatus=100 101 110 111 112 113 114 115 116 117 118 119
+ExecStopPost=+/usr/local/bin/bebop-exit-handler.sh %i
 RestartSec=5
 TimeoutStartSec=60
 TimeoutStopSec=30
