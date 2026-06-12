@@ -160,14 +160,19 @@ stop_disable_unit() {
 delete_dns_records() {
     local id
     if is_external_tenant; then
-        log_info "deleting DNS record ${S3_DOMAIN} (main domain ${DOMAIN} is external — operator-managed, skipped)"
+        log_info "main domain ${DOMAIN} is operator-managed (external) — skipping OVH lookup"
     else
-        log_info "deleting DNS records ${DOMAIN} and ${S3_DOMAIN}..."
+        log_info "deleting OVH DNS A record for ${DOMAIN}..."
         id=$(ovh_dns_record_find "$TENANT_ID" A 2>/dev/null || true)
         [[ -n "$id" ]] && ovh_dns_record_delete "$id"
     fi
-    id=$(ovh_dns_record_find "s3.${TENANT_ID}" A 2>/dev/null || true)
-    [[ -n "$id" ]] && ovh_dns_record_delete "$id"
+    if has_local_s3_tenant; then
+        log_info "deleting OVH DNS A record for ${S3_DOMAIN}..."
+        id=$(ovh_dns_record_find "s3.${TENANT_ID}" A 2>/dev/null || true)
+        [[ -n "$id" ]] && ovh_dns_record_delete "$id"
+    else
+        log_info "tenant has no local S3 (--no-local-s3 at create time) — skipping S3 OVH record"
+    fi
     ovh_dns_zone_refresh
 }
 
@@ -175,6 +180,13 @@ delete_dns_records() {
 # Requires load_tenant_from_registry to have populated DOMAIN + ZONE.
 is_external_tenant() {
     [[ -n "$DOMAIN" && "$DOMAIN" != "${TENANT_ID}.${ZONE}" ]]
+}
+
+# has_local_s3_tenant — true iff this tenant was provisioned WITH a local
+# Garage bucket. Derived from the registry: --no-local-s3 leaves the
+# garage_bucket field empty.
+has_local_s3_tenant() {
+    [[ -n "$GARAGE_BUCKET" ]]
 }
 
 # Stop and remove the per-tenant mongod instance + its data dir.
@@ -190,8 +202,13 @@ drop_mongo_resources() {
     log_info "mongod state purged for ${TENANT_ID}"
 }
 
-# Drop Garage bucket + key.
+# Drop Garage bucket + key. No-op for --no-local-s3 tenants (registry
+# has empty garage_bucket / garage_key, so there's nothing to drop).
 drop_garage_resources() {
+    if ! has_local_s3_tenant; then
+        log_info "tenant has no local Garage resources to drop (--no-local-s3)"
+        return 0
+    fi
     log_info "dropping Garage bucket=${GARAGE_BUCKET} key=${GARAGE_KEY_NAME}..."
     garage_bucket_revoke "$GARAGE_BUCKET" "$GARAGE_KEY_NAME" 2>/dev/null || true
     garage_bucket_delete "$GARAGE_BUCKET"

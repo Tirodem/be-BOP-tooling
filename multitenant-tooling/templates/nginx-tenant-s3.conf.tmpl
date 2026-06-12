@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# Per-tenant nginx vhost template (S3 fragment) — managed by be-BOP
+# multi-tenant tooling. Concatenated AFTER nginx-tenant-main.conf.tmpl by
+# add-tenant.sh ONLY when the tenant has a local Garage bucket (default
+# behaviour; this fragment is omitted entirely when --no-local-s3 is used,
+# in which case the tenant's S3 endpoint is whatever they configure via the
+# be-BOP UI and isn't fronted by our nginx).
+#
+# tooling-fingerprint: @template_revision@
+#
+# Substitution placeholders (replaced by add-tenant.sh):
+#   @tenant_id@         tenant slug
+#   @s3_domain@         s3.<tenant>.<zone>        (Garage S3 endpoint, always internal)
+#   @s3_cert_name@      Let's Encrypt cert name for @s3_domain@
+#   @template_revision@ template fingerprint
+
+# --- Garage S3 endpoint for this tenant --------------------------------------
+# Garage itself binds 127.0.0.1:3900 and never exposes a public socket; nginx
+# is the only public face. Cross-tenant isolation is enforced by per-tenant
+# Garage access keys (each key only has read/write/owner on its own bucket).
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name @s3_domain@;
+
+    ssl_certificate     /etc/letsencrypt/live/@s3_cert_name@/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/@s3_cert_name@/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ecdh_curve X25519:prime256v1:secp384r1;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL-bebop-@tenant_id@-s3:10m;
+    ssl_session_tickets off;
+    ssl_prefer_server_ciphers off;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    client_max_body_size 1000M;
+    proxy_set_header "Connection" "";
+
+    location / {
+        proxy_pass http://127.0.0.1:3900;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $server_name;
+        proxy_redirect off;
+        proxy_connect_timeout 300;
+        proxy_http_version 1.1;
+        chunked_transfer_encoding off;
+    }
+}

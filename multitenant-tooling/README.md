@@ -180,8 +180,10 @@ multitenant-tooling/
 │   ├── bebop@.service              systemd template unit (per tenant)
 │   ├── phoenixd@.service           systemd template unit (per tenant)
 │   ├── mongod@.service             systemd template unit (per tenant)
-│   ├── nginx-tenant.conf.tmpl      per-tenant vhost (HTTPS + s3 vhost)
-│   ├── config.env.tmpl             per-tenant be-BOP env file
+│   ├── nginx-tenant-main.conf.tmpl per-tenant main vhost (always rendered)
+│   ├── nginx-tenant-s3.conf.tmpl   per-tenant S3 vhost (skipped under --no-local-s3)
+│   ├── config.env-main.tmpl        per-tenant be-BOP env (always rendered)
+│   ├── config.env-s3.tmpl          per-tenant S3 env vars (skipped under --no-local-s3)
 │   └── secrets.env.example         shared secrets template
 ├── host-bootstrap.sh               run ONCE on a fresh host
 ├── add-tenant.sh                   onboard a tenant

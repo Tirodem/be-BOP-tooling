@@ -119,6 +119,7 @@ SECRETS_FILE=/etc/be-BOP-tooling/secrets.env
 TENANT_ID=""
 ADMIN_EMAIL=""
 EXTERNAL_DOMAIN=""    # set by --external-domain <fqdn>; empty = internal tenant
+NO_LOCAL_S3=false     # set by --no-local-s3; true = skip Garage/S3 plumbing
 ENABLE_PHOENIXD=true
 BEBOP_VERSION="latest"
 REACTIVATE=false
@@ -149,6 +150,11 @@ Optional:
                           s3.<tenant_id>.<OVH_DNS_ZONE>. The main cert is
                           issued via HTTP-01 (separate from the S3 DNS-01
                           cert). Requires public IPv6 on the VDS.
+  --no-local-s3           do NOT provision a local Garage bucket + key for
+                          this tenant. be-BOP starts with empty S3 env vars
+                          so the merchant configures their own external S3
+                          via the be-BOP UI. Implies: no s3.<tenant>.<zone>
+                          DNS record, no S3 cert, no S3 nginx server block.
   --reactivate            restore a soft-deleted tenant (preserves data)
   --secrets-file <path>   override default ${SECRETS_FILE}
   --non-interactive       no prompts; fail if input would be required
@@ -172,6 +178,7 @@ while (( $# )); do
         --no-phoenixd)     ENABLE_PHOENIXD=false; shift ;;
         --bebop-version)   BEBOP_VERSION="$2"; shift 2 ;;
         --external-domain) EXTERNAL_DOMAIN="$2"; shift 2 ;;
+        --no-local-s3)     NO_LOCAL_S3=true; shift ;;
         --reactivate)      REACTIVATE=true; shift ;;
         --secrets-file)    SECRETS_FILE="$2"; shift 2 ;;
         --non-interactive) RUN_NON_INTERACTIVE=true; shift ;;
@@ -218,6 +225,7 @@ if [[ -n "$EXTERNAL_DOMAIN" ]]; then
 fi
 
 is_external_mode() { [[ -n "$EXTERNAL_DOMAIN" ]]; }
+has_local_s3()    { [[ "$NO_LOCAL_S3" != "true" ]]; }
 
 # Tag log lines with the tenant id from now on.
 BEBOP_TOOLING_TENANT_ID="$TENANT_ID"
@@ -347,6 +355,17 @@ phase_derive_identifiers() {
             log_info "detected external-domain tenant from registry: ${EXTERNAL_DOMAIN}"
         fi
     fi
+    # Same for --no-local-s3: derive from the registry on reapply/reactivate
+    # by checking if garage_bucket is empty (= was provisioned without a
+    # local Garage bucket). Operator doesn't have to remember the flag.
+    if [[ "${DECISION_PATH:-fresh}" != "fresh" && "$NO_LOCAL_S3" != "true" ]]; then
+        local existing_bucket
+        existing_bucket=$(registry_get_field "$TENANT_ID" garage_bucket)
+        if [[ -z "$existing_bucket" ]]; then
+            NO_LOCAL_S3=true
+            log_info "detected --no-local-s3 tenant from registry (empty garage_bucket)"
+        fi
+    fi
 
     if is_external_mode; then
         # External public FQDN; reject if it happens to land back inside our zone.
@@ -354,21 +373,30 @@ phase_derive_identifiers() {
         if [[ "$DOMAIN" == *".${ZONE}" ]]; then
             die "--external-domain '${DOMAIN}' is under OVH_DNS_ZONE='${ZONE}'; drop the flag to use the standard internal path"
         fi
-        # S3 stays internal regardless — Garage runs on the VDS and its DNS
-        # is managed by us via OVH.
-        S3_DOMAIN="s3.${TENANT_ID}.${ZONE}"
-        # Two certs: main via HTTP-01 webroot, s3 via DNS-01 OVH hook.
         CERT_NAME="bebop-${TENANT_ID}"
-        S3_CERT_NAME="bebop-${TENANT_ID}-s3"
     else
         DOMAIN="${TENANT_ID}.${ZONE}"
-        S3_DOMAIN="s3.${TENANT_ID}.${ZONE}"
-        # Single SAN cert covers both names (unchanged from pre-B1 behaviour).
         CERT_NAME="bebop-${TENANT_ID}"
-        S3_CERT_NAME="bebop-${TENANT_ID}"
     fi
-    GARAGE_BUCKET="bebop-${TENANT_ID}"
-    GARAGE_KEY_NAME="bebop-${TENANT_ID}-key"
+    # S3 plumbing: only when has_local_s3. Otherwise S3_* stays empty and
+    # nothing s3-related (cert, vhost block, DNS, Garage) is created.
+    if has_local_s3; then
+        S3_DOMAIN="s3.${TENANT_ID}.${ZONE}"
+        GARAGE_BUCKET="bebop-${TENANT_ID}"
+        GARAGE_KEY_NAME="bebop-${TENANT_ID}-key"
+        if is_external_mode; then
+            # External main (HTTP-01) + internal S3 (DNS-01) = 2 distinct certs.
+            S3_CERT_NAME="bebop-${TENANT_ID}-s3"
+        else
+            # Single SAN cert covers main + s3 (pre-B1 behaviour).
+            S3_CERT_NAME="bebop-${TENANT_ID}"
+        fi
+    else
+        S3_DOMAIN=""
+        S3_CERT_NAME=""
+        GARAGE_BUCKET=""
+        GARAGE_KEY_NAME=""
+    fi
     MONGO_DB_NAME="bebop_${TENANT_ID//-/_}"
 
     if [[ "${DECISION_PATH:-fresh}" == "fresh" ]]; then
@@ -400,8 +428,9 @@ phase_derive_identifiers() {
 phase_clean_orphans() {
     log_info "phase 2.5: scanning for orphan resources from prior failed runs..."
     local cleaned=0
-    # OVH DNS records. In external-domain mode the main DOMAIN isn't in our
-    # zone at all (operator manages it), so we only look at the S3 record.
+    # OVH DNS records:
+    #   - main: only checked when NOT external (otherwise it's in another zone).
+    #   - s3:   only checked when has_local_s3 (otherwise we never created one).
     local id
     if ! is_external_mode; then
         id=$(ovh_dns_record_find "$TENANT_ID" A 2>/dev/null || true)
@@ -411,11 +440,13 @@ phase_clean_orphans() {
             cleaned=1
         fi
     fi
-    id=$(ovh_dns_record_find "s3.${TENANT_ID}" A 2>/dev/null || true)
-    if [[ -n "$id" ]]; then
-        log_warn "orphan: DNS A ${S3_DOMAIN} (id=${id}); deleting"
-        ovh_dns_record_delete "$id" || log_warn "orphan: DNS delete failed for ${id} — continuing"
-        cleaned=1
+    if has_local_s3; then
+        id=$(ovh_dns_record_find "s3.${TENANT_ID}" A 2>/dev/null || true)
+        if [[ -n "$id" ]]; then
+            log_warn "orphan: DNS A ${S3_DOMAIN} (id=${id}); deleting"
+            ovh_dns_record_delete "$id" || log_warn "orphan: DNS delete failed for ${id} — continuing"
+            cleaned=1
+        fi
     fi
     [[ "$cleaned" == 1 ]] && ovh_dns_zone_refresh
 
@@ -446,14 +477,17 @@ phase_clean_orphans() {
         fi
     done
 
-    # Garage bucket + key.
-    if garage_key_exists "$GARAGE_KEY_NAME"; then
-        log_warn "orphan: garage key '${GARAGE_KEY_NAME}'; deleting"
-        garage_key_delete "$GARAGE_KEY_NAME"
-    fi
-    if garage_bucket_exists "$GARAGE_BUCKET"; then
-        log_warn "orphan: garage bucket '${GARAGE_BUCKET}'; deleting"
-        garage_bucket_delete "$GARAGE_BUCKET"
+    # Garage bucket + key. Only relevant when has_local_s3 — without it,
+    # GARAGE_KEY_NAME / GARAGE_BUCKET are empty and there's nothing to clean.
+    if has_local_s3; then
+        if garage_key_exists "$GARAGE_KEY_NAME"; then
+            log_warn "orphan: garage key '${GARAGE_KEY_NAME}'; deleting"
+            garage_key_delete "$GARAGE_KEY_NAME"
+        fi
+        if garage_bucket_exists "$GARAGE_BUCKET"; then
+            log_warn "orphan: garage bucket '${GARAGE_BUCKET}'; deleting"
+            garage_bucket_delete "$GARAGE_BUCKET"
+        fi
     fi
 
     # nginx vhost (sites-available + sites-enabled symlink).
@@ -465,19 +499,24 @@ phase_clean_orphans() {
         run_privileged systemctl reload nginx 2>/dev/null || true
     fi
 
-    # Let's Encrypt cert directories. In external-domain mode the main and
-    # S3 are two distinct certs (CERT_NAME and S3_CERT_NAME), so we clean
-    # both. In internal mode S3_CERT_NAME == CERT_NAME so the second pass
-    # is a no-op.
+    # Let's Encrypt cert directories. Walks all possible cert names:
+    #   - main: bebop-<id>                  (always)
+    #   - s3:   bebop-<id>-s3               (only when external + has_local_s3)
+    # In internal+has_local_s3 mode the cert is a SAN under bebop-<id> only,
+    # so the second name is empty / skipped. In --no-local-s3 mode there's
+    # no S3 cert at all.
     local _c
     for _c in "$CERT_NAME" "$S3_CERT_NAME"; do
-        if [[ -n "$_c" ]] && run_privileged test -d "/etc/letsencrypt/live/${_c}"; then
+        if [[ -n "$_c" && "$_c" != "$CERT_NAME-DUMMY" ]] && \
+           [[ "$_c" != "$CERT_NAME" || "${_seen_main:-}" != "1" ]] && \
+           run_privileged test -d "/etc/letsencrypt/live/${_c}"; then
             log_warn "orphan: Let's Encrypt cert ${_c}; deleting"
             run_privileged certbot delete --non-interactive --cert-name "${_c}" 2>/dev/null \
                 || log_warn "orphan: certbot delete failed for ${_c}; continuing"
         fi
+        [[ "$_c" == "$CERT_NAME" ]] && _seen_main=1
     done
-    unset _c
+    unset _c _seen_main
 
     # Kuma monitor (best-effort; helper warns if creds/URL missing).
     kuma_unregister_tenant "$TENANT_ID" 2>/dev/null || true
@@ -495,21 +534,26 @@ phase_clean_orphans() {
 phase_dns() {
     if is_external_mode; then
         log_info "phase 3: pre-flight DNS check on external domain ${DOMAIN}..."
-        # IPv6 is mandatory in external mode (decided in B1) — detect now so the
-        # pre-flight has both expected values to compare against.
         detect_host_ipv6
         dns_check_external_fqdn "$DOMAIN" "$HOST_IP" "$HOST_IPV6"
-        log_info "phase 3: external DNS OK; creating only the S3 OVH record (main is operator-managed)"
-        DNS_RECORD_BEBOP_ID=""  # nothing to undo on the main side
+        log_info "phase 3: external DNS OK (main is operator-managed)"
+        DNS_RECORD_BEBOP_ID=""
     else
-        log_info "phase 3: DNS A records via OVH (main + s3)..."
+        log_info "phase 3: DNS A record via OVH (main)..."
         DNS_RECORD_BEBOP_ID=$(ovh_dns_record_create "$TENANT_ID" A "$HOST_IP")
         txn_register_undo "DNS A record ${DOMAIN}" \
             "ovh_dns_record_delete '${DNS_RECORD_BEBOP_ID}' && ovh_dns_zone_refresh"
     fi
-    DNS_RECORD_S3_ID=$(ovh_dns_record_create "s3.${TENANT_ID}" A "$HOST_IP")
-    txn_register_undo "DNS A record ${S3_DOMAIN}" \
-        "ovh_dns_record_delete '${DNS_RECORD_S3_ID}' && ovh_dns_zone_refresh"
+    # S3 OVH record: only when has_local_s3 (the s3.<tenant>.<zone> hostname
+    # points at our Garage; with --no-local-s3 there's no Garage to point at).
+    if has_local_s3; then
+        DNS_RECORD_S3_ID=$(ovh_dns_record_create "s3.${TENANT_ID}" A "$HOST_IP")
+        txn_register_undo "DNS A record ${S3_DOMAIN}" \
+            "ovh_dns_record_delete '${DNS_RECORD_S3_ID}' && ovh_dns_zone_refresh"
+    else
+        DNS_RECORD_S3_ID=""
+        log_info "phase 3: --no-local-s3 → skipping S3 OVH record creation"
+    fi
     ovh_dns_zone_refresh
     log_info "DNS records pushed; OVH propagates them to authoritative NS within ~30s"
 }
@@ -542,6 +586,10 @@ phase_mongo() {
 
 # Phase 5: Garage bucket + key + grant + quota
 phase_garage() {
+    if ! has_local_s3; then
+        log_info "phase 5: --no-local-s3 → skipping local Garage provisioning"
+        return 0
+    fi
     log_info "phase 5: Garage bucket + key + quota..."
     garage_bucket_create "$GARAGE_BUCKET"
     txn_register_undo "Garage bucket ${GARAGE_BUCKET}" \
@@ -640,36 +688,44 @@ phase_phoenixd() {
 }
 
 # Phase 9: per-tenant config.env
+# Render assembly: main fragment + optionally s3 fragment + scissor marker
+# + preserved operator custom block (if any). The marker isn't in any
+# template — it's added literally so we can keep main / s3 as standalone
+# auditable env-file fragments. has_local_s3 toggles the s3 fragment.
 phase_config_env() {
     log_info "phase 9: writing /etc/be-BOP/${TENANT_ID}/config.env..."
     local tmp existing_custom=""
     tmp=$(mktemp)
     local target="/etc/be-BOP/${TENANT_ID}/config.env"
-    # Preserve user customisations below the scissor marker.
     local marker='# ------------------------ >8 ------------------------'
     if run_privileged test -f "$target"; then
         existing_custom=$(run_privileged sed -n "/^${marker}\$/,\$p" "$target" 2>/dev/null || true)
     fi
-    render_template "${BEBOP_TOOLING_TEMPLATE_DIR}/config.env.tmpl" \
+    # 1. Main fragment.
+    render_template "${BEBOP_TOOLING_TEMPLATE_DIR}/config.env-main.tmpl" \
         bebop_port              "$BEBOP_PORT" \
         domain                  "$DOMAIN" \
-        s3_domain               "$S3_DOMAIN" \
         mongodb_url             "$MONGO_URL" \
         mongodb_database        "$MONGO_DB_NAME" \
-        garage_bucket           "$GARAGE_BUCKET" \
-        garage_key_id           "$GARAGE_KEY_ID" \
-        garage_key_secret       "$GARAGE_KEY_SECRET" \
         phoenixd_port           "$PHOENIXD_PORT" \
         phoenixd_http_password  "$PHOENIXD_HTTP_PASSWORD" \
         template_revision       "$TEMPLATE_REVISION" \
         > "$tmp"
+    # 2. S3 fragment, only when has_local_s3.
+    if has_local_s3; then
+        render_template "${BEBOP_TOOLING_TEMPLATE_DIR}/config.env-s3.tmpl" \
+            s3_domain          "$S3_DOMAIN" \
+            garage_bucket      "$GARAGE_BUCKET" \
+            garage_key_id      "$GARAGE_KEY_ID" \
+            garage_key_secret  "$GARAGE_KEY_SECRET" \
+            >> "$tmp"
+    fi
+    # 3. Scissor marker + preserved operator customs.
     if [[ -n "$existing_custom" ]]; then
-        # The template already includes the marker in its tail; replace it.
-        local final
-        final=$(mktemp)
-        sed "/^${marker}\$/,\$d" "$tmp" > "$final"
-        printf '%s\n' "$existing_custom" >> "$final"
-        mv "$final" "$tmp"
+        printf '\n%s\n' "$existing_custom" >> "$tmp"
+    else
+        printf '\n%s\n# Put your custom configuration (even new environment variables) after this line.\n# Anything ABOVE this marker is overwritten on every re-run of add-tenant.sh\n# or upgrade-tenant.sh; everything BELOW is preserved.\n' \
+            "$marker" >> "$tmp"
     fi
     run_privileged install -d -m 0755 "/etc/be-BOP/${TENANT_ID}"
     run_privileged install -m 0640 "$tmp" "$target"
@@ -693,13 +749,28 @@ phase_certificate() {
     fi
     local acme_email="${LE_OPERATOR_EMAIL:-$ADMIN_EMAIL}"
 
+    # Four combinations:
+    #   external + has_local_s3 : main HTTP-01  + s3 DNS-01  (two certs)
+    #   external + no_local_s3  : main HTTP-01  only         (one cert)
+    #   internal + has_local_s3 : SAN DNS-01    main+s3      (one cert)
+    #   internal + no_local_s3  : main DNS-01   only         (one cert)
     if is_external_mode; then
-        log_info "phase 10: Let's Encrypt certs (external mode = main HTTP-01 + s3 DNS-01)..."
-        _issue_cert_http01 "$CERT_NAME"     "$DOMAIN"    "$acme_email"
-        _issue_cert_dns01  "$S3_CERT_NAME"  "$S3_DOMAIN" "$acme_email" "$hooks_dir"
+        if has_local_s3; then
+            log_info "phase 10: Let's Encrypt certs (external + s3 = HTTP-01 main + DNS-01 s3)..."
+            _issue_cert_http01 "$CERT_NAME"    "$DOMAIN"    "$acme_email"
+            _issue_cert_dns01  "$S3_CERT_NAME" "$S3_DOMAIN" "$acme_email" "$hooks_dir"
+        else
+            log_info "phase 10: Let's Encrypt cert (external, no-s3 = HTTP-01 main only)..."
+            _issue_cert_http01 "$CERT_NAME" "$DOMAIN" "$acme_email"
+        fi
     else
-        log_info "phase 10: Let's Encrypt cert (DNS-01 SAN via custom OVH hook)..."
-        _issue_cert_dns01_san "$CERT_NAME" "$DOMAIN" "$S3_DOMAIN" "$acme_email" "$hooks_dir"
+        if has_local_s3; then
+            log_info "phase 10: Let's Encrypt cert (internal SAN DNS-01 main+s3)..."
+            _issue_cert_dns01_san "$CERT_NAME" "$DOMAIN" "$S3_DOMAIN" "$acme_email" "$hooks_dir"
+        else
+            log_info "phase 10: Let's Encrypt cert (internal, no-s3 = DNS-01 main only)..."
+            _issue_cert_dns01 "$CERT_NAME" "$DOMAIN" "$acme_email" "$hooks_dir"
+        fi
     fi
 }
 
@@ -788,21 +859,38 @@ _issue_cert_dns01_san() {
 }
 
 # Phase 11: nginx vhost
+# Always render the main fragment. When has_local_s3, also append the s3
+# fragment. http_redirect_names = "@domain@ @s3_domain@" with S3, just
+# "@domain@" without — so the HTTP→HTTPS redirect block covers both
+# server_names in one shot when applicable.
 phase_nginx() {
     log_info "phase 11: nginx vhost..."
     local available="/etc/nginx/sites-available/bebop-${TENANT_ID}.conf"
     local enabled="/etc/nginx/sites-enabled/bebop-${TENANT_ID}.conf"
-    local tmp
+    local tmp http_redirect_names
     tmp=$(mktemp)
-    render_template "${BEBOP_TOOLING_TEMPLATE_DIR}/nginx-tenant.conf.tmpl" \
-        tenant_id          "$TENANT_ID" \
-        domain             "$DOMAIN" \
-        s3_domain          "$S3_DOMAIN" \
-        main_cert_name     "$CERT_NAME" \
-        s3_cert_name       "$S3_CERT_NAME" \
-        bebop_port         "$BEBOP_PORT" \
-        template_revision  "$TEMPLATE_REVISION" \
+    if has_local_s3; then
+        http_redirect_names="${DOMAIN} ${S3_DOMAIN}"
+    else
+        http_redirect_names="${DOMAIN}"
+    fi
+    render_template "${BEBOP_TOOLING_TEMPLATE_DIR}/nginx-tenant-main.conf.tmpl" \
+        tenant_id            "$TENANT_ID" \
+        domain               "$DOMAIN" \
+        s3_domain            "${S3_DOMAIN:-}" \
+        main_cert_name       "$CERT_NAME" \
+        bebop_port           "$BEBOP_PORT" \
+        http_redirect_names  "$http_redirect_names" \
+        template_revision    "$TEMPLATE_REVISION" \
         > "$tmp"
+    if has_local_s3; then
+        render_template "${BEBOP_TOOLING_TEMPLATE_DIR}/nginx-tenant-s3.conf.tmpl" \
+            tenant_id          "$TENANT_ID" \
+            s3_domain          "$S3_DOMAIN" \
+            s3_cert_name       "$S3_CERT_NAME" \
+            template_revision  "$TEMPLATE_REVISION" \
+            >> "$tmp"
+    fi
     run_privileged install -m 0644 "$tmp" "$available"
     rm -f "$tmp"
     run_privileged ln -sfn "$available" "$enabled"
@@ -888,7 +976,7 @@ phase_summary() {
 ==========================================================================
 
   Public URL:             https://${DOMAIN}/
-  S3 endpoint (public):   https://${S3_DOMAIN}/
+  S3 endpoint (public):   $(if has_local_s3; then echo "https://${S3_DOMAIN}/"; else echo "(none — --no-local-s3; configure external S3 via the be-BOP UI)"; fi)
   be-BOP version:         ${RESOLVED_VERSION:-unchanged}
   bebop port (local):     ${BEBOP_PORT}
   phoenixd port (local):  ${PHOENIXD_PORT}
