@@ -825,13 +825,31 @@ phase_bebop_service() {
 }
 
 # Phase 13: HTTP healthcheck
+#
+# For external-domain tenants, we bypass the VDS's local resolver via
+# `curl --resolve` and direct curl at the host IPs we already validated
+# against the authoritative NS in phase 3. Without this, the healthcheck
+# routinely fails because the operator just set their public DNS and the
+# system resolver still has a negative cache — even though the zone IS
+# correctly published (proved by the auth-NS check). For internal tenants
+# we keep using the system resolver (OVH propagation is fast enough on
+# our zone).
 phase_healthcheck() {
     log_info "phase 13: healthcheck https://${DOMAIN}/..."
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[dry-run] skipping healthcheck"
         return 0
     fi
-    if ! http_wait_ok "https://${DOMAIN}/" "$HEALTHCHECK_RETRIES" "$HEALTHCHECK_INTERVAL"; then
+    local healthcheck_extra=()
+    if is_external_mode; then
+        # phase_dns called detect_host_ipv6 already on fresh / reactivate;
+        # run_reapply doesn't run phase_dns, so re-detect defensively here.
+        [[ -z "$HOST_IPV6" ]] && detect_host_ipv6
+        healthcheck_extra=( --resolve "${DOMAIN}:443:${HOST_IP},${HOST_IPV6}" )
+        log_info "external mode: --resolve ${DOMAIN}:443:${HOST_IP},${HOST_IPV6} (bypassing local resolver cache)"
+    fi
+    if ! http_wait_ok "https://${DOMAIN}/" "$HEALTHCHECK_RETRIES" "$HEALTHCHECK_INTERVAL" \
+            "${healthcheck_extra[@]+"${healthcheck_extra[@]}"}"; then
         die "healthcheck failed for https://${DOMAIN}/ (service may have crashed; check 'journalctl -u bebop@${TENANT_ID}')"
     fi
     log_info "healthcheck OK ✓"

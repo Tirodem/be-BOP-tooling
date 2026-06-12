@@ -7,14 +7,26 @@
 [[ -n "${_BEBOP_HEALTHCHECK_SOURCED:-}" ]] && return 0
 readonly _BEBOP_HEALTHCHECK_SOURCED=1
 
-# http_wait_ok <url> [retries=30] [interval_sec=2]
+# http_wait_ok <url> [retries=30] [interval_sec=2] [extra_curl_arg...]
 # Polls until the URL returns HTTP 2xx/3xx. Returns 0 on success, 1 on timeout.
 # Connect+request capped at 5s per attempt.
+#
+# Extra args after the interval are appended to the curl command — used by
+# add-tenant.sh phase_healthcheck to inject `--resolve <fqdn>:443:<ip>[,<ipv6>]`
+# in external-domain mode, bypassing the VDS's local resolver (which may
+# still have a negative cache from before the operator set their DNS).
 http_wait_ok() {
     local url="$1" retries="${2:-30}" interval="${3:-2}"
+    local extra_args=()
+    if (( $# > 3 )); then
+        shift 3
+        extra_args=("$@")
+    fi
     local i status
     for (( i=1; i<=retries; i++ )); do
-        status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 5 "$url" 2>/dev/null || echo "000")
+        status=$(curl "${extra_args[@]+"${extra_args[@]}"}" \
+            -sS -o /dev/null -w '%{http_code}' --max-time 5 "$url" 2>/dev/null \
+            || echo "000")
         if [[ "$status" =~ ^[23][0-9][0-9]$ ]]; then
             log_debug "http_wait_ok: ${url} → ${status} (try ${i}/${retries})"
             return 0
