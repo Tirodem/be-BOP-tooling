@@ -44,6 +44,9 @@ dns_resolve_aaaa() {
 # must be present AND correct. No --force bypass; the operator must fix
 # their DNS first.
 dns_check_external_fqdn() {
+    if ! command -v dig >/dev/null 2>&1; then
+        die "dig binary not found — install package 'dnsutils' (apt install -y dnsutils) and re-run. host-bootstrap.sh installs this automatically from f6f6f6f onward; if you're seeing this on a host bootstrapped earlier, re-run install.sh to apply the updated package list."
+    fi
     local fqdn="$1" want_ipv4="$2" want_ipv6="$3"
     local got_a got_aaaa
     got_a=$(dns_resolve_a "$fqdn")

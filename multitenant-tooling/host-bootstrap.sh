@@ -244,6 +244,7 @@ step_install_apt_packages() {
     local pkgs=(
         ca-certificates curl gpg jq openssl unzip stow xxd
         util-linux
+        dnsutils                # provides `dig`, used by lib/dns.sh for pre-flight DNS checks
         rclone
         nginx apache2-utils
         certbot
