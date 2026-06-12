@@ -32,13 +32,34 @@ source "$BEBOP_TOOLING_LIB_DIR/log.sh"
 source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
 # shellcheck source=lib/registry.sh
 source "$BEBOP_TOOLING_LIB_DIR/registry.sh"
+# shellcheck source=lib/notify.sh
+source "$BEBOP_TOOLING_LIB_DIR/notify.sh"
 # shellcheck source=lib/freeze.sh
 source "$BEBOP_TOOLING_LIB_DIR/freeze.sh"
 
 BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
 
+SECRETS_FILE=/etc/be-BOP-tooling/secrets.env
 RUN_NON_INTERACTIVE=false
+
+# === EXIT trap ==========================================================
+# Armed AFTER CLI parsing (so usage/help paths don't notify). Happy paths
+# in each mutation case set NOTIFIED=true after notify_success.
+NOTIFIED=false
+on_script_exit() {
+    local rc=$?
+    if [[ "$NOTIFIED" != "true" ]] && (( rc != 0 )); then
+        NOTIFIED=true
+        local body
+        body=$(printf 'Subcommand: %s\nPositional args: %s\nExit code: %d\n\nSee journalctl -t %s --since "1 hour ago" for the full log.\n' \
+            "${CMD:-(unset)}" "${POSITIONALS[*]:-(none)}" "$rc" \
+            "${BEBOP_TOOLING_SYSLOG_IDENT}")
+        notify_failure \
+            "[be-BOP tooling] freeze-tenant ${CMD:-(unset)} FAILED" \
+            "$body" || true
+    fi
+}
 
 usage() {
     cat <<EOF
@@ -81,6 +102,21 @@ case "$CMD" in
     list) ;;  # read-only
     *)    require_privileges ;;
 esac
+
+# Load Zulip/SMTP credentials so notify_* helpers can dispatch. Missing
+# secrets.env is non-fatal — notify.sh helpers log_warn + skip on their
+# own when ZULIP_* / SMTP_* are unset.
+if [[ -f "$SECRETS_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$SECRETS_FILE"
+else
+    log_warn "secrets file not found: ${SECRETS_FILE} — Zulip/SMTP alerts disabled"
+fi
+
+# Arm the failure-notification trap NOW: from this point on, any non-zero
+# exit (die, set -e, etc.) triggers a notify_failure unless a success path
+# has already set NOTIFIED=true.
+trap 'on_script_exit' EXIT
 
 registry_init
 
@@ -137,6 +173,17 @@ case "$CMD" in
             printf '%s\n' "$@"
         } | sort -u | _write_list
         log_info "freeze: added: $*"
+        frozen_now=$(_current_list)
+        frozen_count=$(printf '%s\n' "$frozen_now" | grep -c . || true)
+        notify_success \
+            "[be-BOP tooling] freeze: added $* (${frozen_count} frozen)" \
+            "Added: $*
+Frozen tenants now:
+${frozen_now}
+
+upgrade-all.sh will SKIP these (manual + nightly timer).
+Single-tenant upgrade-tenant.sh <id> still works."
+        NOTIFIED=true
         ;;
 
     remove)
@@ -148,6 +195,14 @@ case "$CMD" in
             <(printf '%s\n' "$@" | sort -u))
         printf '%s\n' "$local_to_keep" | sed '/^$/d' | _write_list
         log_info "freeze: removed (no-op if not present): $*"
+        frozen_now=$(_current_list)
+        frozen_count=$(printf '%s\n' "$frozen_now" | grep -c . || true)
+        notify_success \
+            "[be-BOP tooling] freeze: removed $* (${frozen_count} frozen)" \
+            "Removed (no-op if absent): $*
+Frozen tenants now:
+${frozen_now:-(none — list is empty)}"
+        NOTIFIED=true
         ;;
 
     list)
@@ -159,9 +214,9 @@ case "$CMD" in
         ;;
 
     clean)
+        wiped_count=$(_current_list | grep -c . || true)
         if [[ "$RUN_NON_INTERACTIVE" != "true" ]]; then
-            current_count=$(_current_list | wc -l)
-            echo "About to wipe ${current_count} frozen tenant(s) from $(freeze_list_path)."
+            echo "About to wipe ${wiped_count} frozen tenant(s) from $(freeze_list_path)."
             read -r -p "Continue ? [y/N] " ans
             case "$ans" in
                 y|Y|yes|YES) ;;
@@ -171,6 +226,11 @@ case "$CMD" in
         ensure_list_file
         : | _write_list
         log_info "freeze list cleaned"
+        notify_success \
+            "[be-BOP tooling] freeze list cleaned (${wiped_count} tenant(s) wiped)" \
+            "All previously frozen tenants are now eligible for upgrade-all
+again (manual + nightly timer)."
+        NOTIFIED=true
         ;;
 
     *)
