@@ -59,6 +59,31 @@ source "$BEBOP_TOOLING_LIB_DIR/release.sh"
 # shellcheck source=lib/dns.sh
 source "$BEBOP_TOOLING_LIB_DIR/dns.sh"
 
+# === EXIT trap ==========================================================
+# Defined early so it's in scope from any failure point — including the
+# CLI-validation block below and any die() called from phase_*. ERR alone
+# wouldn't catch die() (which exits directly; ERR only fires on simple-
+# command non-zero exits, not on `exit`). The trap is armed lower, after
+# BEBOP_TOOLING_TENANT_ID is set, so log lines in the notification are
+# correctly tagged. NOTIFIED flag prevents duplicates (happy paths set it
+# to true after notify_success).
+NOTIFIED=false
+on_script_exit() {
+    local rc=$?
+    [[ "$NOTIFIED" == "true" ]] && exit "$rc"
+    (( rc == 0 )) && return 0
+    NOTIFIED=true
+    log_error "add-tenant: failure (exit code ${rc}); initiating rollback"
+    txn_rollback 2>/dev/null || true
+    local body
+    body=$(printf 'Tenant: %s\nDecision path: %s\nFailure exit code: %d\nUndo steps attempted: %d\n\nSee journalctl -t %s --since "1 hour ago" for the full log.\n' \
+        "${TENANT_ID:-(unset)}" "${DECISION_PATH:-fresh}" "$rc" \
+        "$(txn_size 2>/dev/null || echo 0)" "${BEBOP_TOOLING_SYSLOG_IDENT:-bebop-tooling-add-tenant}")
+    notify_failure \
+        "[be-BOP tooling] add-tenant ${TENANT_ID:-(unset)} FAILED" \
+        "$body" || true
+}
+
 # === Constants ==========================================================
 readonly TENANT_REGEX='^[a-z0-9][a-z0-9-]*$'
 readonly TENANT_MAX_LEN=32
@@ -189,6 +214,8 @@ BEBOP_TOOLING_TENANT_ID="$TENANT_ID"
 BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_TENANT_ID BEBOP_TOOLING_SYSLOG_IDENT
 export RUN_NON_INTERACTIVE VERBOSE DRY_RUN
+
+trap 'on_script_exit' EXIT
 
 # === Globals (set during phases) ========================================
 DOMAIN=""              # <tenant>.<zone> for internal; --external-domain value otherwise
@@ -866,7 +893,6 @@ EOF
 run_fresh_creation() {
     DECISION_PATH=fresh
     txn_init
-    trap 'on_error_rollback' ERR
     detect_host_ip
     phase_derive_identifiers
     phase_clean_orphans
@@ -883,7 +909,7 @@ run_fresh_creation() {
     phase_healthcheck
     phase_kuma_and_registry
     txn_commit
-    trap - ERR
+    NOTIFIED=true
     notify_success \
         "[be-BOP tooling] add-tenant ${TENANT_ID} OK" \
         "Tenant ${TENANT_ID} is now active at https://${DOMAIN}/ (be-BOP ${RESOLVED_VERSION})."
@@ -893,7 +919,6 @@ run_fresh_creation() {
 run_reactivation() {
     DECISION_PATH=reactivate
     txn_init
-    trap 'on_error_rollback' ERR
     detect_host_ip
     phase_derive_identifiers   # ports re-read from registry
     # Skipped on reactivation: phase_garage, phase_directories,
@@ -930,7 +955,7 @@ run_reactivation() {
     phase_healthcheck
     phase_kuma_and_registry
     txn_commit
-    trap - ERR
+    NOTIFIED=true
     notify_success \
         "[be-BOP tooling] reactivate ${TENANT_ID} OK" \
         "Tenant ${TENANT_ID} restored at https://${DOMAIN}/."
@@ -961,35 +986,16 @@ run_reapply() {
     run_privileged systemctl restart "bebop@${TENANT_ID}.service"
     phase_healthcheck
     phase_kuma_and_registry
+    NOTIFIED=true
     notify_success \
         "[be-BOP tooling] re-apply ${TENANT_ID} OK" \
         "Tenant ${TENANT_ID} configuration refreshed (version: ${RESOLVED_VERSION})."
     phase_summary
 }
 
-# Error handler: rolls back transaction stack and notifies operators.
-# NOTIFIED guard prevents duplicate firing — bash's errtrace makes ERR
-# inherit into $() subshells, so a failing command captured in a
-# `var=$(helper)` assignment fires the trap once IN the subshell (which
-# runs the full handler including notify_failure) AND once IN the parent
-# when the assignment propagates the non-zero exit. Without the guard,
-# every error produces 2+ Zulip notifications.
-NOTIFIED=false
-on_error_rollback() {
-    local rc=$?
-    [[ "$NOTIFIED" == "true" ]] && exit "$rc"
-    NOTIFIED=true
-    log_error "add-tenant: failure (exit code ${rc}); initiating rollback"
-    txn_rollback || true
-    local body
-    body=$(printf 'Tenant: %s\nDecision path: %s\nFailure exit code: %d\nUndo steps attempted: %d\n\nSee journalctl -t %s --since "1 hour ago" for the full log.\n' \
-        "$TENANT_ID" "${DECISION_PATH:-fresh}" "$rc" \
-        "$(txn_size)" "$BEBOP_TOOLING_SYSLOG_IDENT")
-    notify_failure \
-        "[be-BOP tooling] add-tenant ${TENANT_ID} FAILED" \
-        "$body"
-    exit "$rc"
-}
+# (on_script_exit and the EXIT trap are defined near the top of the script,
+# right after the lib sources, so they are in scope from very early — see
+# the `=== EXIT trap ===` section.)
 
 # === Main ===============================================================
 main() {
