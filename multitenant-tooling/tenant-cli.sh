@@ -67,6 +67,7 @@ TENANT_ID=""
 RELEASE_VERSION=""
 FAIL_IF_LATEST_NOT_INSTALLED=false
 NO_RESTART_AFTER_INSTALL=false
+FORCE_REFRESH=false
 
 die_missing_tool() {
     local tool=$1
@@ -165,6 +166,9 @@ OPTIONS:
                             (status only) Exit with error if latest release not installed
     --no-restart-after-install
                             (install only) Don't restart bebop@<tenant> after installation
+    --force                 (install only) Wipe the host release cache entry for the
+                            resolved target BEFORE reinstalling. Use this when the same
+                            branch SHA was rebuilt and you want the fresh artifact.
     --verbose               Enable detailed logging output
 
 EXAMPLES:
@@ -210,6 +214,10 @@ parse_cli_arguments() {
                 ;;
             --no-restart-after-install)
                 NO_RESTART_AFTER_INSTALL=true
+                shift
+                ;;
+            --force)
+                FORCE_REFRESH=true
                 shift
                 ;;
             --verbose)
@@ -482,6 +490,16 @@ install_release() {
     # (e.g. "HTTP 403 — rate-limited") lands in the Zulip / email body.
     # shellcheck disable=SC2064
     trap "on_install_failure '${TENANT_ID}' '${version_for_message}' \$?" EXIT
+
+    # --force: wipe the host cache entry BEFORE ensure so the download +
+    # pnpm install re-runs even on cache hit. Useful when a branch SHA was
+    # rebuilt (same cache key, new artifact) or when an install was corrupted.
+    if [[ "$FORCE_REFRESH" == "true" ]]; then
+        local force_dir
+        force_dir=$(release_cache_dir "$target_name")
+        log_info "--force: removing host cache entry ${force_dir}"
+        run_privileged rm -rf "$force_dir"
+    fi
 
     # Populate the host cache if needed (no-op if another tenant already
     # installed this exact release; flock-protected against concurrent calls).
