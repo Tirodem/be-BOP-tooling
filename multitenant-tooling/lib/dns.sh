@@ -13,26 +13,73 @@
 [[ -n "${_BEBOP_DNS_SOURCED:-}" ]] && return 0
 readonly _BEBOP_DNS_SOURCED=1
 
+# _dns_authoritative_ns <fqdn>
+# Walks up the domain labels until an NS RRset is found, returns the first
+# NS hostname (no trailing dot) on stdout. Empty if none discoverable.
+#
+# Example for "bebop.alice.com":
+#   dig NS bebop.alice.com   → typically empty (no delegation at sub level)
+#   dig NS alice.com         → returns the zone's NS → success
+#
+# NS lookups still go through the system resolver, but NS records are
+# stable (change months/years apart), so cache staleness is a non-issue
+# for them — unlike the A / AAAA records we're actually trying to read,
+# which the operator may have just changed.
+_dns_authoritative_ns() {
+    local fqdn="$1" ns
+    while [[ "$fqdn" == *.* ]]; do
+        ns=$(dig +short +time=3 +tries=1 NS "$fqdn" 2>/dev/null | head -1 | sed 's/\.$//')
+        if [[ -n "$ns" ]]; then
+            printf '%s\n' "$ns"
+            return 0
+        fi
+        fqdn="${fqdn#*.}"  # drop the leftmost label
+    done
+}
+
 # dns_resolve_a <fqdn>  → prints the first A record (IPv4) or empty.
+# Queries the authoritative NS directly (via @<ns>) to bypass any
+# negative-response caching at the local / ISP resolver — important when
+# the operator has JUST set the record and the negative cache TTL hasn't
+# expired yet.
+#
 # The `|| true` suffix is load-bearing: "no record found" is grep exit 1,
 # which with set -e + pipefail in callers would propagate and fire the ERR
 # trap inside the calling $() subshell — and bash's errtrace inheritance
 # means the trap fires AGAIN in the parent when the assignment captures
-# the subshell's non-zero exit. Resulted in duplicate notify_failure
-# Zulip messages on every "missing DNS" run. "No record" is data, not
-# an error; we want exit 0 here.
+# the subshell's non-zero exit. "No record" is data, not an error.
 dns_resolve_a() {
-    dig +short +time=5 +tries=2 A "$1" 2>/dev/null \
-        | grep -E '^[0-9]+(\.[0-9]+){3}$' \
-        | head -1 || true
+    local fqdn="$1" ns
+    ns=$(_dns_authoritative_ns "$fqdn")
+    if [[ -n "$ns" ]]; then
+        log_debug "dns: querying authoritative NS ${ns} for A ${fqdn}"
+        dig +short +time=5 +tries=2 @"$ns" A "$fqdn" 2>/dev/null \
+            | grep -E '^[0-9]+(\.[0-9]+){3}$' \
+            | head -1 || true
+    else
+        log_debug "dns: no authoritative NS found for ${fqdn}; falling back to system resolver"
+        dig +short +time=5 +tries=2 A "$fqdn" 2>/dev/null \
+            | grep -E '^[0-9]+(\.[0-9]+){3}$' \
+            | head -1 || true
+    fi
 }
 
 # dns_resolve_aaaa <fqdn>  → prints the first AAAA record (IPv6) or empty.
-# Same `|| true` rationale as dns_resolve_a.
+# Same authoritative-NS query strategy as dns_resolve_a.
 dns_resolve_aaaa() {
-    dig +short +time=5 +tries=2 AAAA "$1" 2>/dev/null \
-        | grep -E '^[0-9a-fA-F:]+$' \
-        | head -1 || true
+    local fqdn="$1" ns
+    ns=$(_dns_authoritative_ns "$fqdn")
+    if [[ -n "$ns" ]]; then
+        log_debug "dns: querying authoritative NS ${ns} for AAAA ${fqdn}"
+        dig +short +time=5 +tries=2 @"$ns" AAAA "$fqdn" 2>/dev/null \
+            | grep -E '^[0-9a-fA-F:]+$' \
+            | head -1 || true
+    else
+        log_debug "dns: no authoritative NS found for ${fqdn}; falling back to system resolver"
+        dig +short +time=5 +tries=2 AAAA "$fqdn" 2>/dev/null \
+            | grep -E '^[0-9a-fA-F:]+$' \
+            | head -1 || true
+    fi
 }
 
 # dns_check_external_fqdn <fqdn> <expected_ipv4> <expected_ipv6>
