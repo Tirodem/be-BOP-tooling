@@ -91,10 +91,16 @@ release_resolve_version() {
     fi
     local resp
     resp=$(_release_gh_get "https://api.github.com/repos/${BEBOP_GITHUB_REPO}/releases?per_page=20")
+    # max_by(.published_at), NOT .[0]. The /releases endpoint orders by
+    # created_at (when the draft was created), so picking .[0] returns the
+    # most recently DRAFTED release — which can be older by publish date if
+    # an earlier draft was published later. Operators expect "latest" to mean
+    # "most recently published", so we filter by matching asset then take the
+    # max by published_at.
     local tag
     tag=$(printf '%s' "$resp" \
         | jq -r --arg re "$_BEBOP_RELEASE_ASSET_RE" \
-            '[.[] | select(.assets[]?.name | test($re))] | .[0].tag_name // empty')
+            '[.[] | select(.assets[]?.name | test($re))] | max_by(.published_at).tag_name // empty')
     if [[ -z "$tag" ]]; then
         die "release_resolve_version: no release with a matching be-BOP asset found"
     fi
@@ -277,10 +283,16 @@ release_resolve_nth_before() {
     if ! resp=$(_release_gh_get "https://api.github.com/repos/${BEBOP_GITHUB_REPO}/releases?per_page=100"); then
         return 1
     fi
+    # Same caveat as release_resolve_version: the /releases endpoint orders
+    # by created_at, not published_at. We sort by published_at descending
+    # before indexing so N-k walks the published timeline (what the merchant
+    # sees), not the draft-creation timeline.
     local target
     target=$(printf '%s' "$resp" \
         | jq -r --arg re "$_BEBOP_RELEASE_ASSET_RE" --arg ref "$reference_tag" --argjson k "$k" '
-            [.[] | select(.assets[]?.name | test($re)) | .tag_name]
+            [.[] | select(.assets[]?.name | test($re))]
+            | sort_by(.published_at) | reverse
+            | map(.tag_name)
             | (index($ref)) as $i
             | if $i == null then ""
               elif $i + $k >= length then ""
