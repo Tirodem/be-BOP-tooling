@@ -70,18 +70,28 @@ source "$BEBOP_TOOLING_LIB_DIR/dns.sh"
 NOTIFIED=false
 on_script_exit() {
     local rc=$?
-    [[ "$NOTIFIED" == "true" ]] && exit "$rc"
-    (( rc == 0 )) && return 0
-    NOTIFIED=true
-    log_error "add-tenant: failure (exit code ${rc}); initiating rollback"
-    txn_rollback 2>/dev/null || true
-    local body
-    body=$(printf 'Tenant: %s\nDecision path: %s\nFailure exit code: %d\nUndo steps attempted: %d\n\nSee journalctl -t %s --since "1 hour ago" for the full log.\n' \
-        "${TENANT_ID:-(unset)}" "${DECISION_PATH:-fresh}" "$rc" \
-        "$(txn_size 2>/dev/null || echo 0)" "${BEBOP_TOOLING_SYSLOG_IDENT:-bebop-tooling-add-tenant}")
-    notify_failure \
-        "[be-BOP tooling] add-tenant ${TENANT_ID:-(unset)} FAILED" \
-        "$body" || true
+    # On the happy path the body of run_* sets NOTIFIED=true after sending
+    # the success notification, so we skip the failure path here.
+    if [[ "$NOTIFIED" != "true" ]] && (( rc != 0 )); then
+        NOTIFIED=true
+        log_error "add-tenant: failure (exit code ${rc}); initiating rollback"
+        txn_rollback 2>/dev/null || true
+        local body
+        body=$(printf 'Tenant: %s\nDecision path: %s\nFailure exit code: %d\nUndo steps attempted: %d\n\nSee journalctl -t %s --since "1 hour ago" for the full log.\n' \
+            "${TENANT_ID:-(unset)}" "${DECISION_PATH:-fresh}" "$rc" \
+            "$(txn_size 2>/dev/null || echo 0)" "${BEBOP_TOOLING_SYSLOG_IDENT:-bebop-tooling-add-tenant}")
+        notify_failure \
+            "[be-BOP tooling] add-tenant ${TENANT_ID:-(unset)} FAILED" \
+            "$body" || true
+    fi
+    # ALWAYS release the registry lock, on success or failure. registry_unlock
+    # is a no-op if no lock is held (returns 0 immediately) so it's safe to
+    # call even when the trap fires before registry_lock has run. This used
+    # to be a separate `trap "registry_unlock" EXIT` inside main(), but
+    # bash keeps only ONE EXIT handler (last `trap … EXIT` wins) — combining
+    # both responsibilities here is what prevents the lock-release / failure-
+    # notification regression seen in a127560.
+    registry_unlock 2>/dev/null || true
 }
 
 # === Constants ==========================================================
@@ -1009,8 +1019,9 @@ main() {
 
     registry_init
     registry_lock
-    # shellcheck disable=SC2064
-    trap "registry_unlock" EXIT
+    # (registry_unlock is called from on_script_exit — the script-level
+    # EXIT trap defined near the top — so it runs after success notif
+    # AND after failure notif, on every exit path.)
 
     phase_status_decision
 
