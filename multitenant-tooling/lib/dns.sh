@@ -14,13 +14,25 @@
 readonly _BEBOP_DNS_SOURCED=1
 
 # dns_resolve_a <fqdn>  → prints the first A record (IPv4) or empty.
+# The `|| true` suffix is load-bearing: "no record found" is grep exit 1,
+# which with set -e + pipefail in callers would propagate and fire the ERR
+# trap inside the calling $() subshell — and bash's errtrace inheritance
+# means the trap fires AGAIN in the parent when the assignment captures
+# the subshell's non-zero exit. Resulted in duplicate notify_failure
+# Zulip messages on every "missing DNS" run. "No record" is data, not
+# an error; we want exit 0 here.
 dns_resolve_a() {
-    dig +short +time=5 +tries=2 A "$1" 2>/dev/null | grep -E '^[0-9]+(\.[0-9]+){3}$' | head -1
+    dig +short +time=5 +tries=2 A "$1" 2>/dev/null \
+        | grep -E '^[0-9]+(\.[0-9]+){3}$' \
+        | head -1 || true
 }
 
 # dns_resolve_aaaa <fqdn>  → prints the first AAAA record (IPv6) or empty.
+# Same `|| true` rationale as dns_resolve_a.
 dns_resolve_aaaa() {
-    dig +short +time=5 +tries=2 AAAA "$1" 2>/dev/null | grep -E '^[0-9a-fA-F:]+$' | head -1
+    dig +short +time=5 +tries=2 AAAA "$1" 2>/dev/null \
+        | grep -E '^[0-9a-fA-F:]+$' \
+        | head -1 || true
 }
 
 # dns_check_external_fqdn <fqdn> <expected_ipv4> <expected_ipv6>

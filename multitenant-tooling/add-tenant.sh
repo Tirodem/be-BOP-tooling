@@ -968,8 +968,17 @@ run_reapply() {
 }
 
 # Error handler: rolls back transaction stack and notifies operators.
+# NOTIFIED guard prevents duplicate firing — bash's errtrace makes ERR
+# inherit into $() subshells, so a failing command captured in a
+# `var=$(helper)` assignment fires the trap once IN the subshell (which
+# runs the full handler including notify_failure) AND once IN the parent
+# when the assignment propagates the non-zero exit. Without the guard,
+# every error produces 2+ Zulip notifications.
+NOTIFIED=false
 on_error_rollback() {
     local rc=$?
+    [[ "$NOTIFIED" == "true" ]] && exit "$rc"
+    NOTIFIED=true
     log_error "add-tenant: failure (exit code ${rc}); initiating rollback"
     txn_rollback || true
     local body
