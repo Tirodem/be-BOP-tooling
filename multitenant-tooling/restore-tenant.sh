@@ -308,8 +308,13 @@ if $HAS_PHOENIXD; then
     phoenix_dir="/var/lib/phoenixd/${TENANT_ID}/.phoenix"
     run_privileged install -d -m 0700 "$phoenix_dir"
     run_privileged install -m 0600 "${EXTRACT_DIR}/phoenixd/seed.dat" "${phoenix_dir}/seed.dat"
+    # phoenixd@.service uses DynamicUser=yes; the StateDirectory is already
+    # chowned to that ephemeral UID. install(1) drops new files as root, so
+    # realign owner to the dir or phoenixd can't read its own files post-restore.
+    run_privileged chown --reference="$phoenix_dir" "${phoenix_dir}/seed.dat"
     if [[ -f "${EXTRACT_DIR}/phoenixd/phoenix.conf" ]]; then
         run_privileged install -m 0600 "${EXTRACT_DIR}/phoenixd/phoenix.conf" "${phoenix_dir}/phoenix.conf"
+        run_privileged chown --reference="$phoenix_dir" "${phoenix_dir}/phoenix.conf"
     fi
 fi
 
