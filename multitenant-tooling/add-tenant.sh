@@ -126,6 +126,20 @@ REACTIVATE=false
 DRY_RUN=false
 RUN_NON_INTERACTIVE=false
 VERBOSE=false
+# Runtime-config overrides: stored as "<lock>:<key>=<value>" strings, applied
+# against the tenant's mongod runtimeConfig collection right before
+# bebop@<tenant> is (re)started. See parse_runtime_config_flag below.
+RUNTIME_CONFIG_OVERRIDES=()
+
+# Validates --runtime-config / --runtime-config-locked argument and appends to
+# RUNTIME_CONFIG_OVERRIDES. <lock> is "true" or "false".
+parse_runtime_config_flag() {
+    local lock="$1" arg="$2"
+    if [[ ! "$arg" =~ ^[a-zA-Z_][a-zA-Z0-9_]*= ]]; then
+        die "invalid runtime-config '${arg}': expected KEY=VALUE (KEY must match [a-zA-Z_][a-zA-Z0-9_]*)"
+    fi
+    RUNTIME_CONFIG_OVERRIDES+=("${lock}:${arg}")
+}
 
 usage() {
     cat <<EOF
@@ -156,6 +170,15 @@ Optional:
                           via the be-BOP UI. Implies: no s3.<tenant>.<zone>
                           DNS record, no S3 cert, no S3 nginx server block.
   --reactivate            restore a soft-deleted tenant (preserves data)
+  --runtime-config KEY=VALUE
+                          upsert {_id:KEY, data:VALUE} into the tenant's
+                          runtimeConfig collection just before bebop starts.
+                          Repeatable. Clears any existing lock on KEY.
+                          Example: --runtime-config websiteTitle="ACME Shop"
+  --runtime-config-locked KEY=VALUE
+                          same as --runtime-config but also sets lock:true,
+                          marking the entry read-only in the be-BOP UI.
+                          Repeatable. Example: --runtime-config-locked vatCountry=FR
   --secrets-file <path>   override default ${SECRETS_FILE}
   --non-interactive       no prompts; fail if input would be required
   --dry-run               print actions without executing
@@ -180,6 +203,8 @@ while (( $# )); do
         --external-domain) EXTERNAL_DOMAIN="$2"; shift 2 ;;
         --no-local-s3)     NO_LOCAL_S3=true; shift ;;
         --reactivate)      REACTIVATE=true; shift ;;
+        --runtime-config)        parse_runtime_config_flag "false" "$2"; shift 2 ;;
+        --runtime-config-locked) parse_runtime_config_flag "true"  "$2"; shift 2 ;;
         --secrets-file)    SECRETS_FILE="$2"; shift 2 ;;
         --non-interactive) RUN_NON_INTERACTIVE=true; shift ;;
         --dry-run)         DRY_RUN=true; shift ;;
@@ -904,9 +929,38 @@ phase_nginx() {
     fi
 }
 
+# Applies operator-supplied --runtime-config / --runtime-config-locked entries
+# to the tenant's runtimeConfig collection. Called right before bebop starts
+# so the daemon's first read picks up our overrides. No-op when the operator
+# passed no overrides.
+apply_runtime_config_overrides() {
+    [[ ${#RUNTIME_CONFIG_OVERRIDES[@]} -eq 0 ]] && return 0
+    log_info "applying ${#RUNTIME_CONFIG_OVERRIDES[@]} runtime-config override(s)..."
+    if [[ "$DRY_RUN" == "true" ]]; then
+        local entry
+        for entry in "${RUNTIME_CONFIG_OVERRIDES[@]}"; do
+            log_info "[dry-run] runtime-config: ${entry}"
+        done
+        return 0
+    fi
+    if ! mongo_wait_ready "$MONGO_PORT" 60 1; then
+        die "runtime-config: mongod@${TENANT_ID} not ready on port ${MONGO_PORT}"
+    fi
+    local entry lock rest key value
+    for entry in "${RUNTIME_CONFIG_OVERRIDES[@]}"; do
+        lock="${entry%%:*}"
+        rest="${entry#*:}"
+        key="${rest%%=*}"
+        value="${rest#*=}"
+        mongo_runtime_config_upsert "$MONGO_PORT" "$MONGO_DB_NAME" "$key" "$value" "$lock" \
+            || die "runtime-config: upsert failed for ${key}"
+    done
+}
+
 # Phase 12: bebop service
 phase_bebop_service() {
     log_info "phase 12: bebop@${TENANT_ID}.service..."
+    apply_runtime_config_overrides
     run_privileged systemctl enable --now "bebop@${TENANT_ID}.service"
     txn_register_undo "bebop@${TENANT_ID}.service" \
         "run_privileged systemctl disable --now 'bebop@${TENANT_ID}.service' 2>/dev/null || true"
@@ -1099,6 +1153,7 @@ run_reapply() {
     phase_config_env
     phase_certificate
     phase_nginx
+    apply_runtime_config_overrides
     run_privileged systemctl restart "bebop@${TENANT_ID}.service"
     phase_healthcheck
     phase_kuma_and_registry

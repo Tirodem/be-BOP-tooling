@@ -120,3 +120,36 @@ mongo_restore_db() {
     log_info "mongo: mongorestore db='${db}' port=${port} ← ${db_subdir}"
     mongorestore --quiet --port "$port" --db "$db" "$db_subdir"
 }
+
+# mongo_runtime_config_upsert <port> <db_name> <key> <value> <lock>
+# Upserts a single runtimeConfig document:
+#   { _id: <key>, data: <value>, [lock: true,] createdAt, updatedAt }
+# <lock> must be "true" or "false". When false, the lock field is $unset so
+# the flag is reversible (locked → unlocked on next deploy with the non-lock
+# variant of the flag).
+# Requires: mongosh + jq (already host deps).
+mongo_runtime_config_upsert() {
+    local port="$1" db="$2" key="$3" value="$4" lock="$5"
+    if [[ "$lock" != "true" && "$lock" != "false" ]]; then
+        log_error "mongo_runtime_config_upsert: lock must be true|false (got '${lock}')"
+        return 1
+    fi
+    local key_json value_json db_json
+    key_json=$(printf '%s' "$key" | jq -Rsa .)
+    value_json=$(printf '%s' "$value" | jq -Rsa .)
+    db_json=$(printf '%s' "$db" | jq -Rsa .)
+    local update
+    if [[ "$lock" == "true" ]]; then
+        update=$(printf '{ $set: { data: %s, lock: true, updatedAt: now }, $setOnInsert: { createdAt: now } }' "$value_json")
+    else
+        update=$(printf '{ $set: { data: %s, updatedAt: now }, $setOnInsert: { createdAt: now }, $unset: { lock: "" } }' "$value_json")
+    fi
+    local js
+    js=$(printf 'const now = new Date(); db.getSiblingDB(%s).runtimeConfig.updateOne({_id: %s}, %s, {upsert: true});' \
+        "$db_json" "$key_json" "$update")
+    if ! mongosh --quiet --port "$port" --eval "$js" >/dev/null 2>&1; then
+        log_error "mongo_runtime_config_upsert: failed for ${key} on ${db}@127.0.0.1:${port}"
+        return 1
+    fi
+    log_info "mongo: runtimeConfig.${key} upserted (lock=${lock})"
+}

@@ -43,6 +43,8 @@ source "$BEBOP_TOOLING_LIB_DIR/release.sh"
 source "$BEBOP_TOOLING_LIB_DIR/healthcheck.sh"
 # shellcheck source=lib/notify.sh
 source "$BEBOP_TOOLING_LIB_DIR/notify.sh"
+# shellcheck source=lib/mongo.sh
+source "$BEBOP_TOOLING_LIB_DIR/mongo.sh"
 
 readonly HEALTHCHECK_RETRIES=15
 readonly HEALTHCHECK_INTERVAL=2
@@ -55,6 +57,18 @@ ROLLBACK_ON_FAILURE=true
 DRY_RUN=false
 RUN_NON_INTERACTIVE=false
 VERBOSE=false
+# Runtime-config overrides applied to runtimeConfig collection right before
+# the bebop restart. Stored as "<lock>:<key>=<value>" strings. See
+# parse_runtime_config_flag below.
+RUNTIME_CONFIG_OVERRIDES=()
+
+parse_runtime_config_flag() {
+    local lock="$1" arg="$2"
+    if [[ ! "$arg" =~ ^[a-zA-Z_][a-zA-Z0-9_]*= ]]; then
+        die "invalid runtime-config '${arg}': expected KEY=VALUE (KEY must match [a-zA-Z_][a-zA-Z0-9_]*)"
+    fi
+    RUNTIME_CONFIG_OVERRIDES+=("${lock}:${arg}")
+}
 
 usage() {
     cat <<EOF
@@ -67,6 +81,14 @@ Options:
   --version <tag>             release tag, or "latest" (default)
   --no-rollback-on-failure    do NOT revert the symlink if the healthcheck
                               fails (default: rollback enabled)
+  --runtime-config KEY=VALUE
+                              upsert {_id:KEY, data:VALUE} into the tenant's
+                              runtimeConfig collection just before bebop is
+                              restarted. Repeatable. Clears any existing lock
+                              on KEY.
+  --runtime-config-locked KEY=VALUE
+                              same as --runtime-config but also sets lock:true
+                              (read-only in the be-BOP UI). Repeatable.
   --secrets-file <path>       override default ${SECRETS_FILE}
   --non-interactive           no prompts; exit if input would be required
   --dry-run                   print actions without executing
@@ -83,6 +105,8 @@ while (( $# )); do
         --version)                 VERSION="$2"; shift 2 ;;
         --rollback-on-failure)     ROLLBACK_ON_FAILURE=true; shift ;;
         --no-rollback-on-failure)  ROLLBACK_ON_FAILURE=false; shift ;;
+        --runtime-config)          parse_runtime_config_flag "false" "$2"; shift 2 ;;
+        --runtime-config-locked)   parse_runtime_config_flag "true"  "$2"; shift 2 ;;
         --secrets-file)            SECRETS_FILE="$2"; shift 2 ;;
         --non-interactive)         RUN_NON_INTERACTIVE=true; shift ;;
         --dry-run)                 DRY_RUN=true; shift ;;
@@ -158,20 +182,47 @@ main() {
     else
         new_tag=$(release_resolve_version "$VERSION")
     fi
-    if [[ "$new_tag" == "$old_tag" ]]; then
+    # Same-version invocations still proceed when the operator passed
+    # --runtime-config overrides — they want the config write + a restart.
+    if [[ "$new_tag" == "$old_tag" && ${#RUNTIME_CONFIG_OVERRIDES[@]} -eq 0 ]]; then
         log_info "tenant '${TENANT_ID}' already on ${new_tag} — nothing to do"
         exit 0
     fi
 
-    log_info "upgrade: ${TENANT_ID}: ${old_tag} → ${new_tag}"
+    if [[ "$new_tag" == "$old_tag" ]]; then
+        log_info "upgrade: ${TENANT_ID}: version unchanged (${new_tag}), applying ${#RUNTIME_CONFIG_OVERRIDES[@]} runtime-config override(s) + restart"
+    else
+        log_info "upgrade: ${TENANT_ID}: ${old_tag} → ${new_tag}"
+    fi
 
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[dry-run] would ensure cache for ${new_tag}, swap symlink, restart bebop@${TENANT_ID}, healthcheck"
+        log_info "[dry-run] would ensure cache for ${new_tag}, swap symlink, apply ${#RUNTIME_CONFIG_OVERRIDES[@]} runtime-config override(s), restart bebop@${TENANT_ID}, healthcheck"
         exit 0
     fi
 
     release_cache_ensure "$new_tag"
     release_cache_set_current "$TENANT_ID" "$new_tag"
+
+    if (( ${#RUNTIME_CONFIG_OVERRIDES[@]} > 0 )); then
+        local mongo_port mongo_db
+        mongo_port=$(registry_get_field "$TENANT_ID" mongo_port)
+        mongo_db=$(registry_get_field "$TENANT_ID" mongodb_database)
+        [[ -z "$mongo_port" || -z "$mongo_db" ]] \
+            && die "runtime-config: registry missing mongo_port / mongodb_database for ${TENANT_ID}"
+        log_info "applying ${#RUNTIME_CONFIG_OVERRIDES[@]} runtime-config override(s)..."
+        if ! mongo_wait_ready "$mongo_port" 60 1; then
+            die "runtime-config: mongod@${TENANT_ID} not ready on port ${mongo_port}"
+        fi
+        local entry lock rest key value
+        for entry in "${RUNTIME_CONFIG_OVERRIDES[@]}"; do
+            lock="${entry%%:*}"
+            rest="${entry#*:}"
+            key="${rest%%=*}"
+            value="${rest#*=}"
+            mongo_runtime_config_upsert "$mongo_port" "$mongo_db" "$key" "$value" "$lock" \
+                || die "runtime-config: upsert failed for ${key}"
+        done
+    fi
 
     log_info "restarting bebop@${TENANT_ID}.service..."
     run_privileged systemctl restart "bebop@${TENANT_ID}.service"
