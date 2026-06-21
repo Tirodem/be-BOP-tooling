@@ -24,9 +24,19 @@ server {
     listen [::]:80;
     server_name @http_redirect_names@;
 
-    # ACME HTTP-01 challenges are served by the default vhost (catch-all on
-    # /.well-known/acme-challenge/ from /var/lib/letsencrypt) — see host-bootstrap.
-    # Per-tenant vhosts only redirect non-ACME traffic to HTTPS.
+    # ACME HTTP-01 webroot. MUST be served here, not delegated to the host
+    # catch-all default vhost: because this server declares server_name for
+    # the tenant's FQDN, nginx routes port-80 requests for that FQDN here,
+    # NOT to the default. Without this location, the redirect below sends
+    # certbot's renewal challenge to HTTPS where the be-BOP app intercepts
+    # it and returns HTML — Let's Encrypt then rejects with "unauthorized".
+    # Initial issuance still works (the vhost doesn't exist yet during
+    # phase_certificate), so the bug only manifests at renewal time.
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/lib/letsencrypt;
+        default_type "text/plain";
+    }
+
     location / {
         return 307 https://$host$request_uri;
     }

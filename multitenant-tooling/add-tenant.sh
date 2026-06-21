@@ -108,7 +108,7 @@ readonly RESERVED_TENANT_IDS=(
     dashboard panel saas ops
 )
 readonly DEFAULT_BUCKET_QUOTA="20GiB"
-readonly TEMPLATE_REVISION="2026050501"
+readonly TEMPLATE_REVISION="2026062101"
 readonly HEALTHCHECK_RETRIES=15
 readonly HEALTHCHECK_INTERVAL=2
 readonly PHOENIXD_PASSWORD_RETRIES=20
@@ -800,9 +800,14 @@ phase_certificate() {
 }
 
 # _issue_cert_http01 <cert_name> <domain> <acme_email>
-# Single-domain HTTP-01 webroot. Depends on the default nginx vhost
-# installed by host-bootstrap.sh serving /.well-known/acme-challenge/
-# from /var/lib/letsencrypt/.
+# Single-domain HTTP-01 webroot. At INITIAL issuance, the per-tenant vhost
+# doesn't exist yet (phase_certificate runs before phase_nginx), so the
+# host catch-all default vhost installed by host-bootstrap.sh serves
+# /.well-known/acme-challenge/ from /var/lib/letsencrypt/. At RENEWAL,
+# the per-tenant vhost exists and matches server_name first — so the
+# vhost itself must also serve the webroot. The catch-all is now a
+# bootstrap-only fallback; the vhost template carries the load-bearing
+# webroot location.
 _issue_cert_http01() {
     local cert_name="$1" domain="$2" email="$3"
     if run_privileged test -d "/etc/letsencrypt/live/${cert_name}"; then
