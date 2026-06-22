@@ -202,14 +202,50 @@ drop_mongo_resources() {
     log_info "mongod state purged for ${TENANT_ID}"
 }
 
+# Empty a Garage bucket via the S3 API (rclone). Required because
+# `garage bucket delete` refuses non-empty buckets and has no --force
+# flag. Best-effort: warns and returns 0 if creds are unavailable,
+# letting the caller decide whether to proceed (the subsequent
+# `garage bucket delete` will then fail loudly if the bucket is still
+# non-empty).
+empty_garage_bucket() {
+    local bucket="$1"
+    if ! garage_bucket_exists "$bucket"; then
+        return 0
+    fi
+    local config="/etc/be-BOP/${TENANT_ID}/config.env"
+    local key_id="" key_secret=""
+    if run_privileged test -r "$config"; then
+        key_id=$(run_privileged grep -oP '^S3_KEY_ID=\K.*' "$config" 2>/dev/null || true)
+        key_secret=$(run_privileged grep -oP '^S3_KEY_SECRET=\K.*' "$config" 2>/dev/null || true)
+    fi
+    if [[ -z "$key_id" || -z "$key_secret" ]]; then
+        log_warn "garage: no S3 creds for '${bucket}' (missing or unreadable ${config}) — bucket may be non-empty; delete will fail"
+        return 0
+    fi
+    log_info "garage: emptying bucket '${bucket}' via rclone..."
+    RCLONE_CONFIG_GARAGE_TYPE=s3 \
+    RCLONE_CONFIG_GARAGE_PROVIDER=Other \
+    RCLONE_CONFIG_GARAGE_ENDPOINT=http://127.0.0.1:3900 \
+    RCLONE_CONFIG_GARAGE_REGION=garage \
+    RCLONE_CONFIG_GARAGE_ACCESS_KEY_ID="$key_id" \
+    RCLONE_CONFIG_GARAGE_SECRET_ACCESS_KEY="$key_secret" \
+        rclone --quiet delete "garage:${bucket}" \
+        || log_warn "garage: rclone delete failed for '${bucket}' — delete will likely fail"
+}
+
 # Drop Garage bucket + key. No-op for --no-local-s3 tenants (registry
 # has empty garage_bucket / garage_key, so there's nothing to drop).
+#
+# Order matters: empty the bucket BEFORE revoking the tenant key, since
+# rclone needs read/write on the bucket to list and delete objects.
 drop_garage_resources() {
     if ! has_local_s3_tenant; then
         log_info "tenant has no local Garage resources to drop (--no-local-s3)"
         return 0
     fi
     log_info "dropping Garage bucket=${GARAGE_BUCKET} key=${GARAGE_KEY_NAME}..."
+    empty_garage_bucket "$GARAGE_BUCKET"
     garage_bucket_revoke "$GARAGE_BUCKET" "$GARAGE_KEY_NAME" 2>/dev/null || true
     garage_bucket_delete "$GARAGE_BUCKET"
     garage_key_delete "$GARAGE_KEY_NAME"
