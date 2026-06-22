@@ -204,26 +204,26 @@ drop_mongo_resources() {
 
 # Empty a Garage bucket via the S3 API (rclone). Required because
 # `garage bucket delete` refuses non-empty buckets and has no --force
-# flag. Best-effort: warns and returns 0 if creds are unavailable,
-# letting the caller decide whether to proceed (the subsequent
-# `garage bucket delete` will then fail loudly if the bucket is still
-# non-empty).
+# flag. Uses an ephemeral key with full perms on the bucket so we
+# don't depend on the state of the tenant key (which may have been
+# revoked or deleted by a previously failed purge/archive run).
 empty_garage_bucket() {
     local bucket="$1"
     if ! garage_bucket_exists "$bucket"; then
         return 0
     fi
-    local config="/etc/be-BOP/${TENANT_ID}/config.env"
-    local key_id="" key_secret=""
-    if run_privileged test -r "$config"; then
-        key_id=$(run_privileged grep -oP '^S3_KEY_ID=\K.*' "$config" 2>/dev/null || true)
-        key_secret=$(run_privileged grep -oP '^S3_KEY_SECRET=\K.*' "$config" 2>/dev/null || true)
-    fi
-    if [[ -z "$key_id" || -z "$key_secret" ]]; then
-        log_warn "garage: no S3 creds for '${bucket}' (missing or unreadable ${config}) — bucket may be non-empty; delete will fail"
+    log_info "garage: emptying bucket '${bucket}' via rclone..."
+    local tmp_key="bebop-purge-${TENANT_ID}"
+    # Cleanup any orphan from a previous failed run.
+    garage_key_delete "$tmp_key" >/dev/null 2>&1 || true
+    local creds key_id key_secret
+    if ! creds=$(garage_key_create "$tmp_key" 2>/dev/null); then
+        log_warn "garage: could not create ephemeral key '${tmp_key}' — delete will likely fail"
         return 0
     fi
-    log_info "garage: emptying bucket '${bucket}' via rclone..."
+    key_id=$(printf '%s\n' "$creds" | cut -f1)
+    key_secret=$(printf '%s\n' "$creds" | cut -f2)
+    garage_bucket_grant "$bucket" "$tmp_key" >/dev/null
     RCLONE_CONFIG_GARAGE_TYPE=s3 \
     RCLONE_CONFIG_GARAGE_PROVIDER=Other \
     RCLONE_CONFIG_GARAGE_ENDPOINT=http://127.0.0.1:3900 \
@@ -232,6 +232,7 @@ empty_garage_bucket() {
     RCLONE_CONFIG_GARAGE_SECRET_ACCESS_KEY="$key_secret" \
         rclone --quiet delete "garage:${bucket}" \
         || log_warn "garage: rclone delete failed for '${bucket}' — delete will likely fail"
+    garage_key_delete "$tmp_key" >/dev/null 2>&1 || true
 }
 
 # Drop Garage bucket + key. No-op for --no-local-s3 tenants (registry
