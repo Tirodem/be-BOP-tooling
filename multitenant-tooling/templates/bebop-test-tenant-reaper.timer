@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# Reaper cadence: every 5 minutes. Persistent=true so a missed run during
+# downtime fires once on boot (we still want expired test tenants gone).
+
+[Unit]
+Description=be-BOP — fire the test-tenant reaper every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=true
+Unit=bebop-test-tenant-reaper.service
+
+[Install]
+WantedBy=timers.target

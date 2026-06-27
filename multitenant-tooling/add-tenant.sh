@@ -58,6 +58,8 @@ source "$BEBOP_TOOLING_LIB_DIR/healthcheck.sh"
 source "$BEBOP_TOOLING_LIB_DIR/release.sh"
 # shellcheck source=lib/dns.sh
 source "$BEBOP_TOOLING_LIB_DIR/dns.sh"
+# shellcheck source=lib/phoenixd.sh
+source "$BEBOP_TOOLING_LIB_DIR/phoenixd.sh"
 
 # === EXIT trap ==========================================================
 # Defined early so it's in scope from any failure point — including the
@@ -106,7 +108,12 @@ readonly RESERVED_TENANT_IDS=(
     s3 garage www admin api mail mx ns dns
     root system bebop phoenixd mongod
     dashboard panel saas ops
+    deploy
 )
+# Hard cap on the number of *active* tenants per host. Overridable via the
+# BEBOP_TENANT_CAP env var (or secrets.env). Lifted via the `absent` →
+# `fresh` path only — re-applies, reactivations, and removals are exempt.
+: "${BEBOP_TENANT_CAP:=16}"
 readonly DEFAULT_BUCKET_QUOTA="20GiB"
 readonly TEMPLATE_REVISION="2026062101"
 readonly HEALTHCHECK_RETRIES=15
@@ -342,6 +349,15 @@ phase_status_decision() {
     log_info "phase 1: tenant '${TENANT_ID}' status = ${status}"
     case "$status" in
         absent)
+            # Enforce the host-wide active-tenant cap on fresh creations only.
+            # Re-applies / reactivations of existing tenants are exempt — the
+            # tenant already counts, so capping them is meaningless and would
+            # block recovery.
+            local active_count
+            active_count=$(registry_count_by_status active)
+            if (( active_count >= BEBOP_TENANT_CAP )); then
+                die "tenant cap reached: ${active_count}/${BEBOP_TENANT_CAP} active tenants on this host. Raise BEBOP_TENANT_CAP or remove an idle tenant first (remove-tenant.sh <id> [--archive|--purge])."
+            fi
             return 0
             ;;
         active)
@@ -486,6 +502,12 @@ phase_clean_orphans() {
             fi
         fi
     done
+
+    # phoenixd orphan listening on the port we're about to allocate. A
+    # previously-purged tenant can leave a phoenixd process detached from
+    # its systemd unit (see lib/phoenixd.sh for why); without this kill,
+    # the new phoenixd@<TENANT_ID> would EADDRINUSE-loop on first start.
+    phoenixd_kill_orphans "$PHOENIXD_PORT"
 
     # Local state + config dirs.
     local dir
@@ -934,6 +956,40 @@ phase_nginx() {
     fi
 }
 
+# Auto-prefill runtimeConfig.smtp from the host-wide SMTP_* env vars (as loaded
+# from secrets.env). be-BOP reads this entry as a nested object — be careful to
+# upsert an actual object, not a JSON-stringified scalar. No-op when SMTP_HOST
+# is empty (operator opted out / not configured yet).
+#
+# The host-wide SMTP_TO is intentionally NOT propagated: it's used for tooling-
+# alert recipients (notify.sh), not for the tenant's outbound shop mail flow.
+apply_smtp_prefill() {
+    if [[ -z "${SMTP_HOST:-}" ]]; then
+        log_debug "smtp prefill: SMTP_HOST empty in secrets.env → skipping"
+        return 0
+    fi
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[dry-run] would prefill runtimeConfig.smtp from SMTP_* env vars"
+        return 0
+    fi
+    if ! mongo_wait_ready "$MONGO_PORT" 60 1; then
+        die "smtp prefill: mongod@${TENANT_ID} not ready on port ${MONGO_PORT}"
+    fi
+    local smtp_json
+    # `jq -n` builds the object; `port` is cast to a number because be-BOP's
+    # nodemailer config expects `port: 587` (number), not `port: "587"`.
+    smtp_json=$(jq -nc \
+        --arg h "$SMTP_HOST" \
+        --arg p "${SMTP_PORT:-587}" \
+        --arg u "${SMTP_USER:-}" \
+        --arg w "${SMTP_PASSWORD:-}" \
+        --arg f "${SMTP_FROM:-${SMTP_USER:-}}" \
+        '{host: $h, port: ($p | tonumber), user: $u, password: $w, from: $f, fake: false}'
+    )
+    mongo_runtime_config_upsert_obj "$MONGO_PORT" "$MONGO_DB_NAME" smtp "$smtp_json" false \
+        || die "smtp prefill: upsert failed"
+}
+
 # Applies operator-supplied --runtime-config / --runtime-config-locked entries
 # to the tenant's runtimeConfig collection. Called right before bebop starts
 # so the daemon's first read picks up our overrides. No-op when the operator
@@ -965,6 +1021,7 @@ apply_runtime_config_overrides() {
 # Phase 12: bebop service
 phase_bebop_service() {
     log_info "phase 12: bebop@${TENANT_ID}.service..."
+    apply_smtp_prefill
     apply_runtime_config_overrides
     run_privileged systemctl enable --now "bebop@${TENANT_ID}.service"
     txn_register_undo "bebop@${TENANT_ID}.service" \
@@ -1158,6 +1215,7 @@ run_reapply() {
     phase_config_env
     phase_certificate
     phase_nginx
+    apply_smtp_prefill
     apply_runtime_config_overrides
     run_privileged systemctl restart "bebop@${TENANT_ID}.service"
     phase_healthcheck

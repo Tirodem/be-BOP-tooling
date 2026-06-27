@@ -153,3 +153,39 @@ mongo_runtime_config_upsert() {
     fi
     log_info "mongo: runtimeConfig.${key} upserted (lock=${lock})"
 }
+
+# mongo_runtime_config_upsert_obj <port> <db_name> <key> <json_value> <lock>
+# Variant of mongo_runtime_config_upsert that stores <json_value> as a parsed
+# Mongo document (object, array, number, …) instead of a JSON string. Used for
+# nested runtimeConfig entries like `smtp` which be-BOP reads via Object.assign
+# (so the value MUST be an actual object, not a stringified one).
+# <json_value> must be a syntactically valid JSON literal; the caller is
+# responsible for producing it (e.g. via `jq -n '{host: $h, port: ($p | tonumber)}'`).
+mongo_runtime_config_upsert_obj() {
+    local port="$1" db="$2" key="$3" json_value="$4" lock="$5"
+    if [[ "$lock" != "true" && "$lock" != "false" ]]; then
+        log_error "mongo_runtime_config_upsert_obj: lock must be true|false (got '${lock}')"
+        return 1
+    fi
+    if ! printf '%s' "$json_value" | jq -e . >/dev/null 2>&1; then
+        log_error "mongo_runtime_config_upsert_obj: invalid JSON for ${key}"
+        return 1
+    fi
+    local key_json db_json
+    key_json=$(printf '%s' "$key" | jq -Rsa .)
+    db_json=$(printf '%s' "$db" | jq -Rsa .)
+    local update
+    if [[ "$lock" == "true" ]]; then
+        update=$(printf '{ $set: { data: %s, lock: true, updatedAt: now }, $setOnInsert: { createdAt: now } }' "$json_value")
+    else
+        update=$(printf '{ $set: { data: %s, updatedAt: now }, $setOnInsert: { createdAt: now }, $unset: { lock: "" } }' "$json_value")
+    fi
+    local js
+    js=$(printf 'const now = new Date(); db.getSiblingDB(%s).runtimeConfig.updateOne({_id: %s}, %s, {upsert: true});' \
+        "$db_json" "$key_json" "$update")
+    if ! mongosh --quiet --port "$port" --eval "$js" >/dev/null 2>&1; then
+        log_error "mongo_runtime_config_upsert_obj: failed for ${key} on ${db}@127.0.0.1:${port}"
+        return 1
+    fi
+    log_info "mongo: runtimeConfig.${key} upserted as object (lock=${lock})"
+}

@@ -56,6 +56,8 @@ source "$BEBOP_TOOLING_LIB_DIR/garage.sh"
 source "$BEBOP_TOOLING_LIB_DIR/notify.sh"
 # shellcheck source=lib/uptime-kuma.sh
 source "$BEBOP_TOOLING_LIB_DIR/uptime-kuma.sh"
+# shellcheck source=lib/phoenixd.sh
+source "$BEBOP_TOOLING_LIB_DIR/phoenixd.sh"
 
 # === CLI ================================================================
 SECRETS_FILE=/etc/be-BOP-tooling/secrets.env
@@ -291,8 +293,16 @@ delete_certificate() {
 }
 
 # Remove tenant filesystem trees.
+#
+# Kills any phoenixd orphan still holding PHOENIXD_PORT before deleting the
+# directories. `systemctl disable --now` upstream in this script does not
+# guarantee the daemon is dead — if the process double-forked or got detached
+# from its unit cgroup at some point, systemctl can't see it anymore. Without
+# this kill, the next tenant that recycles the port hits EADDRINUSE forever
+# (the new phoenixd@<id> unit just restart-loops). See lib/phoenixd.sh.
 purge_local_filesystem() {
     log_info "removing tenant local filesystem..."
+    phoenixd_kill_orphans "$PHOENIXD_PORT"
     run_privileged rm -rf \
         "/var/lib/be-BOP/${TENANT_ID}" \
         "/etc/be-BOP/${TENANT_ID}" \

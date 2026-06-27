@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# HTTP daemon that receives paid-order webhooks from a be-BOP "spawn a test
+# tenant" shop and provisions ephemeral test tenants on this host.
+#
+# Runs as root (the handler shells out to add-tenant.sh / tenant-cli.sh /
+# remove-tenant.sh which need root or be-bop-cli sudo rules). Bind is local-
+# only (127.0.0.1); nginx terminates TLS on deploy.<OVH_DNS_ZONE> and reverse-
+# proxies here with an IP whitelist.
+
+[Unit]
+Description=be-BOP — test-tenant deploy API
+Documentation=https://be-bop.io/
+After=network-online.target garage.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/be-BOP-tooling/secrets.env
+EnvironmentFile=-/etc/be-BOP-tooling/deploy-api.env
+ExecStart=/usr/bin/python3 /usr/local/share/be-BOP-tooling/lib/test-tenant-api.py
+Restart=always
+RestartSec=5
+TimeoutStartSec=30
+TimeoutStopSec=15
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bebop-tooling-test-tenant-api
+
+# We deliberately do NOT sandbox aggressively (DynamicUser=no, no
+# ProtectSystem=strict): the daemon forks add-tenant.sh which writes to
+# /etc/, /var/lib/, /etc/letsencrypt/, talks to systemd, etc. Hardening the
+# daemon would just break it. The trust boundary is the HMAC signature.
+
+[Install]
+WantedBy=multi-user.target

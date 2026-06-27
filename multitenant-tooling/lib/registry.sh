@@ -123,6 +123,14 @@ registry_list_by_status() {
     awk -F'\t' -v s="$status" 'NR>1 && $11==s { print $1 }' "$REGISTRY_PATH"
 }
 
+# Count tenants in the registry matching <status> (default: active). Outputs
+# a single integer on stdout. Used by add-tenant.sh to enforce the host-wide
+# active-tenant cap (BEBOP_TENANT_CAP).
+registry_count_by_status() {
+    local status="${1:-active}"
+    awk -F'\t' -v s="$status" 'NR>1 && $11==s { n++ } END { print n+0 }' "$REGISTRY_PATH"
+}
+
 # Allocate the smallest free port ≥ minimum, skipping ports reserved by tenants
 # in states that hold their port (active, soft-deleted). Archived tenants
 # release their ports.

@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# nginx vhost template for the test-tenant deploy API, exposed at
+# https://@deploy_hostname@/. Materialised at
+# /etc/nginx/sites-available/deploy.conf by host-bootstrap.sh when
+# BEBOP_DEPLOY_API_HOSTNAME is set in secrets.env.
+#
+# Source IP whitelist: the @allow_block@ token is replaced at render time by
+# a sequence of `allow <ip>;` directives followed by `deny all;`. host-
+# bootstrap.sh assembles the list from BEBOP_DEPLOY_API_ALLOWED_IPS (operator
+# override) or, when empty, defaults to 127.0.0.1 + the auto-detected VDS
+# public IP. The whitelist is enforced ONLY on /deploy-test-tenant — / and
+# /healthz return 444/200 respectively without IP gating.
+#
+# Auth is end-to-end HMAC-SHA256 (see test-tenant-api.py). nginx does not
+# carry credentials.
+#
+# tooling-fingerprint: @template_revision@
+#
+# Substitution placeholders:
+#   @deploy_hostname@      e.g. deploy.pvh-labs.com
+#   @daemon_port@          local Python daemon port (default 8820)
+#   @allow_block@          rendered allow/deny block (multi-line)
+#   @template_revision@    template fingerprint
+
+# --- HTTP -> HTTPS redirect + ACME webroot ---------------------------------
+server {
+    listen 80;
+    listen [::]:80;
+    server_name @deploy_hostname@;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/lib/letsencrypt;
+        default_type "text/plain";
+    }
+
+    location / {
+        return 307 https://$host$request_uri;
+    }
+}
+
+# --- HTTPS deploy API -----------------------------------------------------
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name @deploy_hostname@;
+
+    ssl_certificate     /etc/letsencrypt/live/bebop-deploy-api/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/bebop-deploy-api/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ecdh_curve X25519:prime256v1:secp384r1;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL-deploy:10m;
+    ssl_session_tickets off;
+    ssl_prefer_server_ciphers off;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    # Health check: no auth, no IP gating — used by Kuma + operators.
+    location = /healthz {
+        proxy_pass http://127.0.0.1:@daemon_port@;
+        proxy_set_header Host $host;
+    }
+
+    # The single business endpoint. IP whitelisted; HMAC verified by daemon.
+    location = /deploy-test-tenant {
+@allow_block@
+        proxy_pass http://127.0.0.1:@daemon_port@;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_http_version 1.1;
+        # Webhooks return 202 fast (daemon offloads to a thread); a short
+        # timeout is enough and keeps zombie connections from piling up.
+        proxy_read_timeout 60s;
+        proxy_send_timeout 60s;
+        client_max_body_size 1M;
+    }
+
+    # Anything else: drop silently (no information leak).
+    location / {
+        return 444;
+    }
+}
