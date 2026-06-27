@@ -46,6 +46,7 @@ import smtplib
 import subprocess
 import sys
 import threading
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -130,9 +131,17 @@ def extract_tenant_config(payload: dict) -> dict:
         if slug and "value" in entry:
             by_slug[slug] = entry["value"]
 
-    tenant_id = (by_slug.get("subdomain") or "").strip().lower()
-    if not tenant_id:
+    raw_subdomain = (by_slug.get("subdomain") or "").strip()
+    if not raw_subdomain:
         raise ValueError("missing customCheckoutField slug='subdomain'")
+    tenant_id = normalize_subdomain(raw_subdomain)
+    if not tenant_id:
+        raise ValueError(
+            f"subdomain '{raw_subdomain}' normalised to an empty slug "
+            "(only non-ascii / punctuation?)"
+        )
+    if tenant_id != raw_subdomain.lower():
+        LOG.info("subdomain normalised: %r → %r", raw_subdomain, tenant_id)
 
     # Default admin_email = buyer's contact email; overridable per checkout.
     admin_email = by_slug.get("admin-email", "").strip()
@@ -143,6 +152,23 @@ def extract_tenant_config(payload: dict) -> dict:
 
     branch = (by_slug.get("branch") or CFG["branch_default"]).strip()
     return {"tenant_id": tenant_id, "admin_email": admin_email, "branch": branch}
+
+
+def normalize_subdomain(raw: str) -> str:
+    """Turn a buyer-supplied free-form string into a valid DNS subdomain slug.
+
+    Operations: Unicode NFKD + ASCII fold (strips accents — `Café` → `Cafe`),
+    lowercase, every non-`[a-z0-9]` run collapses to a single `-`, leading/
+    trailing hyphens trimmed, then truncated to TENANT_MAX_LEN and any tail
+    hyphen the truncation produced is stripped. Empty / all-junk input
+    yields an empty string — caller must reject it.
+    """
+    if not raw:
+        return ""
+    nfkd = unicodedata.normalize("NFKD", raw)
+    ascii_only = nfkd.encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-z0-9]+", "-", ascii_only.lower()).strip("-")
+    return slug[:TENANT_MAX_LEN].rstrip("-")
 
 
 def validate_tenant_id(tenant_id: str) -> None:
