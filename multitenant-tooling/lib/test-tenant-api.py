@@ -212,14 +212,22 @@ def send_buyer_email(to_addr: str, tenant_url: str, expires_at: str) -> None:
         f"— be-BOP\n"
     )
     try:
-        with smtplib.SMTP(host, port, timeout=30) as smtp:
+        # Port 465 = SMTPS (implicit TLS from the get-go). Anything else
+        # (587 default, 25, …) is plain SMTP + STARTTLS upgrade. Using SMTP()
+        # on port 465 hangs the handshake → timeout, which is what bit us.
+        if port == 465:
+            smtp_cls = smtplib.SMTP_SSL
+        else:
+            smtp_cls = smtplib.SMTP
+        with smtp_cls(host, port, timeout=30) as smtp:
             smtp.ehlo()
-            try:
-                smtp.starttls()
-                smtp.ehlo()
-            except smtplib.SMTPException:
-                # Server doesn't advertise STARTTLS — accept (best effort).
-                LOG.warning("send_buyer_email: STARTTLS unavailable on %s:%d", host, port)
+            if port != 465:
+                try:
+                    smtp.starttls()
+                    smtp.ehlo()
+                except smtplib.SMTPException:
+                    # Server doesn't advertise STARTTLS — accept (best effort).
+                    LOG.warning("send_buyer_email: STARTTLS unavailable on %s:%d", host, port)
             if user:
                 smtp.login(user, pwd)
             smtp.send_message(msg)
