@@ -125,7 +125,6 @@ readonly PHOENIXD_PASSWORD_INTERVAL=2
 SECRETS_FILE=/etc/be-BOP-tooling/secrets.env
 TENANT_ID=""
 ADMIN_EMAIL=""
-LE_EMAIL_OVERRIDE=""  # set by --le-email <addr>; overrides LE_OPERATOR_EMAIL just for this run
 EXTERNAL_DOMAIN=""    # set by --external-domain <fqdn>; empty = internal tenant
 NO_LOCAL_S3=false     # set by --no-local-s3; true = skip Garage/S3 plumbing
 ENABLE_PHOENIXD=true
@@ -158,15 +157,8 @@ Usage:
 
 Required:
   <tenant_id>             slug, [a-z0-9][a-z0-9-]*, max ${TENANT_MAX_LEN} chars
-  --admin-email <email>   merchant contact (used for Let's Encrypt + alerts)
-
-Optional Let's Encrypt override:
-  --le-email <email>      force this address as the Let's Encrypt account email
-                          for THIS run only (highest priority — overrides both
-                          LE_OPERATOR_EMAIL and --admin-email). Used by the
-                          test-tenant deploy API to attach the per-buyer
-                          email to the cert. Beware: each unique address
-                          consumes one of LE's "10 accounts / IP / 3h" slots.
+  --admin-email <email>   merchant contact — used as the Let's Encrypt
+                          account email AND for be-BOP tooling alerts
 
 Optional:
   --no-phoenixd           skip the per-tenant phoenixd daemon (default: enabled)
@@ -213,7 +205,6 @@ EOF
 while (( $# )); do
     case "$1" in
         --admin-email)     ADMIN_EMAIL="$2"; shift 2 ;;
-        --le-email)        LE_EMAIL_OVERRIDE="$2"; shift 2 ;;
         --phoenixd)        ENABLE_PHOENIXD=true; shift ;;
         --no-phoenixd)     ENABLE_PHOENIXD=false; shift ;;
         --bebop-version)   BEBOP_VERSION="$2"; shift 2 ;;
@@ -804,10 +795,12 @@ phase_certificate() {
     if [[ -d "${SCRIPT_DIR}/hooks" ]]; then
         hooks_dir="${SCRIPT_DIR}/hooks"
     fi
-    # Priority: --le-email override (test-tenant deploy API uses this to
-    # force the per-buyer email) → LE_OPERATOR_EMAIL (fleet-wide compte LE,
-    # évite le rate-limit 10 comptes/IP/3h) → --admin-email fallback.
-    local acme_email="${LE_EMAIL_OVERRIDE:-${LE_OPERATOR_EMAIL:-$ADMIN_EMAIL}}"
+    # The LE account email is always the per-tenant --admin-email. This
+    # consumes one of LE's "10 accounts / IP / 3h" slots per unique address,
+    # which matters at high churn (test-tenant deploy API spawning many
+    # ephemeral tenants from distinct buyer emails). If you hit the limit,
+    # rate-limit the spawn shop upstream.
+    local acme_email="$ADMIN_EMAIL"
 
     # Four combinations:
     #   external + has_local_s3 : main HTTP-01  + s3 DNS-01  (two certs)

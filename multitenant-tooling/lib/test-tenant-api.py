@@ -168,14 +168,9 @@ def run(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
 
 
 def add_tenant(tenant_id: str, admin_email: str) -> tuple[int, str, str]:
-    # --le-email forces certbot to register the per-buyer email as the LE
-    # account, overriding the fleet-wide LE_OPERATOR_EMAIL. Note: each unique
-    # buyer email burns one of Let's Encrypt's "10 accounts / IP / 3h" slots,
-    # so heavy use of the spawn shop will hit the rate-limit.
     return run([
         "add-tenant.sh", tenant_id,
         "--admin-email", admin_email,
-        "--le-email", admin_email,
         "--non-interactive",
     ], timeout=900)
 
