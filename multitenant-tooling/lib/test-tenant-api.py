@@ -294,6 +294,12 @@ class Handler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError):
             return self._send_json(400, {"error": "bad JSON"})
 
+        # Log the raw payload (post-signature, pre-extraction) so the operator
+        # can see exactly what be-BOP sent — useful when slug mappings change
+        # or buyer emails go missing. The webhook body has no secret data
+        # (HMAC signature is on the header), so logging is safe.
+        LOG.info("payload: %s", json.dumps(payload, ensure_ascii=False))
+
         # 3. Replay window.
         ts = payload.get("timestamp")
         if not isinstance(ts, str) or not is_fresh(ts, CFG["replay_window_seconds"]):
