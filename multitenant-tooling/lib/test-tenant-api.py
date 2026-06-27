@@ -251,9 +251,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, code: int, obj: dict) -> None:
         body = json.dumps(obj).encode("utf-8")
+        # Log the error reason at WARNING level for any 4xx/5xx so journalctl
+        # carries the diagnostic without us having to capture be-BOP's reply
+        # body (be-BOP is fire-and-forget; the reply is discarded).
+        if code >= 400 and "error" in obj:
+            LOG.warning("HTTP %d %s — %s", code, self.path, obj["error"])
+        body_len = len(body)
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Length", str(body_len))
         self.end_headers()
         self.wfile.write(body)
 
