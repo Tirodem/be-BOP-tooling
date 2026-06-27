@@ -113,11 +113,12 @@ def extract_tenant_config(payload: dict) -> dict:
         admin_email  : required, str  (defaults to payload['contact']['email'])
         branch       : optional, str  (defaults to CFG['branch_default'])
 
-    STUB: until the operator confirms the exact slug names, we look for
-        slug == 'tenant-id'   → tenant_id
-        slug == 'admin-email' → admin_email override
-        slug == 'branch'      → branch override
-    These are placeholder slugs; replace with the real ones when known.
+    Slug mapping (be-BOP shop checkout schema):
+        slug == 'subdomain'    → tenant_id (REQUIRED)
+        slug == 'admin-email'  → admin_email override (optional;
+                                 fallback = payload.contact.email)
+        slug == 'branch'       → branch override (optional;
+                                 fallback = CFG['branch_default'] == 'main')
     """
     fields = payload.get("customCheckoutFields") or []
     by_slug: dict[str, str] = {}
@@ -129,9 +130,9 @@ def extract_tenant_config(payload: dict) -> dict:
         if slug and "value" in entry:
             by_slug[slug] = entry["value"]
 
-    tenant_id = (by_slug.get("tenant-id") or "").strip().lower()
+    tenant_id = (by_slug.get("subdomain") or "").strip().lower()
     if not tenant_id:
-        raise ValueError("missing customCheckoutField slug='tenant-id'")
+        raise ValueError("missing customCheckoutField slug='subdomain'")
 
     # Default admin_email = buyer's contact email; overridable per checkout.
     admin_email = by_slug.get("admin-email", "").strip()
