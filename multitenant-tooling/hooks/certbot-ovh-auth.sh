@@ -31,7 +31,11 @@ exec 2>&1
 
 : "${SECRETS_FILE:=/etc/be-BOP-tooling/secrets.env}"
 : "${BEBOP_TOOLING_LIB_DIR:=/usr/local/share/be-BOP-tooling/lib}"
-: "${ACME_PROPAGATION_SECONDS:=60}"
+# Max wait time for OVH to serve the TXT on all its authoritative NS.
+# We poll actively (see poll_txt_propagation below), so this is a safety
+# ceiling — typical hits are 10-30s. Previous impl slept blindly for 60s
+# per SAN, doubling the cost of a 2-SAN cert (main + s3).
+: "${ACME_PROPAGATION_SECONDS:=90}"
 
 # shellcheck disable=SC1090
 source "$SECRETS_FILE"
@@ -61,6 +65,50 @@ fi
 log_info "certbot-ovh-auth: publishing TXT ${sub}.${zone} for ACME challenge"
 ovh_dns_record_create "$sub" TXT "$CERTBOT_VALIDATION" >/dev/null
 ovh_dns_zone_refresh
-log_info "certbot-ovh-auth: sleeping ${ACME_PROPAGATION_SECONDS}s for DNS propagation..."
-sleep "$ACME_PROPAGATION_SECONDS"
+
+# Actively poll OVH's authoritative NS until every one of them serves the
+# TXT with the expected value, instead of a blind `sleep 60`. Cuts a fresh
+# 2-SAN cert issuance (main + s3) from ~120s of blind wait to ~20-40s of
+# actual propagation. Timeout guard = ACME_PROPAGATION_SECONDS.
+poll_txt_propagation() {
+    local fqdn="$1" expected="$2" timeout="${3:-90}"
+    local nservers nservers_count deadline
+    nservers=$(dig +short +time=3 +tries=1 NS "$OVH_DNS_ZONE" 2>/dev/null \
+        | sed 's/\.$//' | grep -v '^$' || true)
+    if [[ -z "$nservers" ]]; then
+        log_warn "certbot-ovh-auth: NS lookup for '${OVH_DNS_ZONE}' failed; blind sleep ${timeout}s"
+        sleep "$timeout"
+        return 0
+    fi
+    nservers_count=$(printf '%s\n' "$nservers" | wc -l)
+    log_info "certbot-ovh-auth: polling ${nservers_count} authoritative NS for TXT ${fqdn}..."
+    deadline=$(( $(date +%s) + timeout ))
+    local attempt=0
+    while (( $(date +%s) < deadline )); do
+        (( attempt++ ))
+        local ns_line all_ok=1 seen=0
+        while IFS= read -r ns_line; do
+            [[ -z "$ns_line" ]] && continue
+            # `tr -d '"'` strips the quotes dig wraps TXT values in.
+            # `grep -Fx` is a fixed-string, whole-line match — no regex
+            # metacharacter surprises from the ACME token.
+            if dig +short +time=3 +tries=1 @"$ns_line" TXT "$fqdn" 2>/dev/null \
+                | tr -d '"' | grep -Fxq "$expected"; then
+                (( seen++ )) || true
+            else
+                all_ok=0
+            fi
+        done <<< "$nservers"
+        if (( all_ok == 1 )); then
+            log_info "certbot-ovh-auth: TXT propagated on all ${nservers_count} NS (attempt ${attempt})"
+            return 0
+        fi
+        log_debug "certbot-ovh-auth: propagation ${seen}/${nservers_count} NS; retrying in 2s"
+        sleep 2
+    done
+    log_warn "certbot-ovh-auth: propagation timeout after ${timeout}s (${seen}/${nservers_count} NS ready); proceeding — LE will retry"
+    return 0
+}
+
+poll_txt_propagation "${sub}.${zone}" "$CERTBOT_VALIDATION" "$ACME_PROPAGATION_SECONDS"
 log_info "certbot-ovh-auth: ready"
