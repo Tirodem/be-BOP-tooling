@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import html
 import json
 import logging
 import os
@@ -56,6 +57,13 @@ LOG = logging.getLogger("test-tenant-api")
 
 # --- Config (env-driven; populated in main()) -------------------------------
 CFG: dict = {}
+
+# HTML template for the buyer notification. Sits next to the script tree at
+# <install-prefix>/templates/. Loaded lazily and cached.
+TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "tenant-up-notification.html"
+_HTML_TEMPLATE_CACHE: str | None = None
+
+FIRST_NAME_SLUGS = ("first-name", "firstname", "prenom")
 
 # --- Tenant id rules (must match add-tenant.sh) -----------------------------
 TENANT_REGEX = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -113,6 +121,8 @@ def extract_tenant_config(payload: dict) -> dict:
         tenant_id    : required, str
         admin_email  : required, str  (defaults to payload['contact']['email'])
         branch       : optional, str  (defaults to CFG['branch_default'])
+        first_name   : optional, str  ('' if none of the FIRST_NAME_SLUGS
+                                       appear in customCheckoutFields)
 
     Slug mapping (be-BOP shop checkout schema):
         slug == 'subdomain'    → tenant_id (REQUIRED)
@@ -120,6 +130,8 @@ def extract_tenant_config(payload: dict) -> dict:
                                  fallback = payload.contact.email)
         slug == 'branch'       → branch override (optional;
                                  fallback = CFG['branch_default'] == 'main')
+        slug ∈ FIRST_NAME_SLUGS → first_name for the buyer email greeting
+                                 (optional; '' if absent)
     """
     fields = payload.get("customCheckoutFields") or []
     by_slug: dict[str, str] = {}
@@ -151,7 +163,19 @@ def extract_tenant_config(payload: dict) -> dict:
         raise ValueError("missing admin_email (no slug='admin-email' AND no contact.email)")
 
     branch = (by_slug.get("branch") or CFG["branch_default"]).strip()
-    return {"tenant_id": tenant_id, "admin_email": admin_email, "branch": branch}
+
+    first_name = ""
+    for slug in FIRST_NAME_SLUGS:
+        if slug in by_slug and by_slug[slug].strip():
+            first_name = by_slug[slug].strip()
+            break
+
+    return {
+        "tenant_id": tenant_id,
+        "admin_email": admin_email,
+        "branch": branch,
+        "first_name": first_name,
+    }
 
 
 def normalize_subdomain(raw: str) -> str:
@@ -216,8 +240,42 @@ def remove_tenant(tenant_id: str) -> tuple[int, str, str]:
 
 
 # --- Email ------------------------------------------------------------------
-def send_buyer_email(to_addr: str, tenant_url: str, expires_at: str) -> None:
-    """Send a one-shot mail to the buyer with their test tenant URL."""
+def _load_html_template() -> str | None:
+    """Load the HTML template once and cache. Returns None if unreadable
+    (send_buyer_email then falls back to text-only)."""
+    global _HTML_TEMPLATE_CACHE
+    if _HTML_TEMPLATE_CACHE is not None:
+        return _HTML_TEMPLATE_CACHE
+    try:
+        _HTML_TEMPLATE_CACHE = TEMPLATE_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        LOG.error("html template unreadable at %s: %s", TEMPLATE_PATH, exc)
+        _HTML_TEMPLATE_CACHE = ""
+    return _HTML_TEMPLATE_CACHE or None
+
+
+def render_buyer_html(first_name: str, backoffice_url: str) -> str | None:
+    """Render the HTML template with buyer data. Placeholders:
+        {{firstName}}      → escaped first_name; if empty, the leading
+                             ' {{firstName}}' is stripped so the greeting
+                             becomes 'Bonjour,' (no dangling space + comma).
+        {{backofficeUrl}}  → escaped backoffice URL (used in href AND
+                             visible link text).
+    """
+    tpl = _load_html_template()
+    if not tpl:
+        return None
+    if first_name:
+        tpl = tpl.replace("{{firstName}}", html.escape(first_name))
+    else:
+        tpl = tpl.replace(" {{firstName}}", "")
+    return tpl.replace("{{backofficeUrl}}", html.escape(backoffice_url, quote=True))
+
+
+def send_buyer_email(
+    to_addr: str, first_name: str, backoffice_url: str, expires_at: str
+) -> None:
+    """Send a one-shot mail to the buyer with their test tenant back-office URL."""
     host = CFG.get("smtp_host")
     if not host or not to_addr:
         LOG.warning("send_buyer_email: SMTP_HOST or recipient empty; skipping")
@@ -227,16 +285,25 @@ def send_buyer_email(to_addr: str, tenant_url: str, expires_at: str) -> None:
     pwd = CFG.get("smtp_password") or ""
     sender = CFG.get("smtp_from") or user or "no-reply@localhost"
 
-    msg = EmailMessage()
-    msg["Subject"] = "Your be-BOP test shop is ready"
-    msg["From"] = sender
-    msg["To"] = to_addr
-    msg.set_content(
-        f"Hi,\n\n"
-        f"Your ephemeral test be-BOP is live at:\n  {tenant_url}\n\n"
-        f"It will be automatically destroyed at {expires_at} (UTC).\n\n"
+    greeting = f"Bonjour {first_name}," if first_name else "Bonjour,"
+    text_body = (
+        f"{greeting}\n\n"
+        f"Votre boutique be-BOP de test est prête. Accédez à votre arrière-boutique :\n"
+        f"  {backoffice_url}\n\n"
+        f"Elle sera automatiquement supprimée le {expires_at} (UTC).\n\n"
         f"— be-BOP\n"
     )
+
+    msg = EmailMessage()
+    msg["Subject"] = "Votre boutique be-BOP est prête"
+    msg["From"] = sender
+    msg["To"] = to_addr
+    msg.set_content(text_body)
+    html_body = render_buyer_html(first_name, backoffice_url)
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
+    else:
+        LOG.warning("send_buyer_email: HTML template unavailable, sending text-only")
     try:
         # Port 465 = SMTPS (implicit TLS from the get-go). Anything else
         # (587 default, 25, …) is plain SMTP + STARTTLS upgrade. Using SMTP()
@@ -349,6 +416,7 @@ class Handler(BaseHTTPRequestHandler):
         tenant_id = cfg["tenant_id"]
         admin_email = cfg["admin_email"]
         branch = cfg["branch"]
+        first_name = cfg["first_name"]
         buyer_email = (payload.get("contact") or {}).get("email") or ""
         order_number = payload.get("orderNumber")
 
@@ -357,7 +425,7 @@ class Handler(BaseHTTPRequestHandler):
         # ACK before a long add-tenant.sh run starts.
         threading.Thread(
             target=self._provision,
-            args=(tenant_id, admin_email, branch, buyer_email, order_number),
+            args=(tenant_id, admin_email, branch, buyer_email, first_name, order_number),
             daemon=True,
             name=f"provision-{tenant_id}",
         ).start()
@@ -375,10 +443,12 @@ class Handler(BaseHTTPRequestHandler):
         admin_email: str,
         branch: str,
         buyer_email: str,
+        first_name: str,
         order_number: object,
     ) -> None:
         zone = CFG["ovh_dns_zone"]
         tenant_url = f"https://{tenant_id}.{zone}/"
+        backoffice_url = f"https://{tenant_id}.{zone}/admin"
         expires_at = iso8601(now_utc() + timedelta(seconds=CFG["ttl_seconds"]))
 
         # Track BEFORE provisioning: if provisioning crashes hard, the reaper
@@ -425,8 +495,8 @@ class Handler(BaseHTTPRequestHandler):
             # buyer sees something and the reaper still kills it at expiry.
             # We DO email them so they don't think nothing happened.
 
-        # Email buyer with their URL (best-effort; logs on failure).
-        send_buyer_email(buyer_email, tenant_url, expires_at)
+        # Email buyer with their back-office URL (best-effort; logs on failure).
+        send_buyer_email(buyer_email, first_name, backoffice_url, expires_at)
         LOG.info("provision %s: ready at %s (expires %s, order=%s)",
                  tenant_id, tenant_url, expires_at, order_number)
 
