@@ -39,10 +39,14 @@ phoenixd_kill_orphans() {
     # We extract the pid= numbers AND filter by process name to avoid
     # nuking an unrelated service that happens to bind the same port (which
     # would itself be a misconfig, but better safe than sorry).
+    # `|| true` traps the "no match → exit 1" from `grep -oP` (a fresh tenant
+    # has nothing listening on the port). Without it, `set -e -o pipefail`
+    # aborts add-tenant in phase_clean_orphans before the txn stack has any
+    # entry, so rollback logs "empty stack — nothing to undo".
     local pids
-    pids=$(run_privileged ss -H -tlnp "sport = :${port}" 2>/dev/null \
+    pids=$( { run_privileged ss -H -tlnp "sport = :${port}" 2>/dev/null \
         | grep -oP 'users:\(\("phoenixd",pid=\K[0-9]+' \
-        | sort -u)
+        | sort -u; } || true )
     if [[ -z "$pids" ]]; then
         log_debug "phoenixd_kill_orphans: no phoenixd on port ${port}"
         return 0
