@@ -69,9 +69,11 @@ TEMPLATE_PATH = TEMPLATES_DIR / "tenant-up-notification.html"
 LOGO_PATH = TEMPLATES_DIR / "tenant-up-notification-logo.png"
 LOGO_CID = "tenant-up-logo"
 FORBIDDEN_PATH = TEMPLATES_DIR / "forbidden-subdomains.txt"
+FORBIDDEN_WORD_PATH = TEMPLATES_DIR / "forbidden-subdomains-word.txt"
 _HTML_TEMPLATE_CACHE: str | None = None
 _LOGO_BYTES_CACHE: bytes | None = None
 _FORBIDDEN_CACHE: set[str] | None = None
+_FORBIDDEN_WORD_CACHE: set[str] | None = None
 
 # --- Tenant id rules (must match add-tenant.sh) -----------------------------
 TENANT_REGEX = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -208,41 +210,67 @@ def normalize_subdomain(raw: str) -> str:
     return slug[:TENANT_MAX_LEN].rstrip("-")
 
 
-def _load_forbidden_substrings() -> set[str]:
-    """Load the operator-curated blocklist from templates/forbidden-subdomains.txt.
-    Format: one substring per line, `#` for comments, empty lines ignored.
-    All entries are lowercased at load time; the slug we compare against is
-    already lowercased by normalize_subdomain(). Cached until daemon restart."""
-    global _FORBIDDEN_CACHE
-    if _FORBIDDEN_CACHE is not None:
-        return _FORBIDDEN_CACHE
+def _load_blocklist(path: Path, label: str) -> set[str]:
+    """Read a blocklist file: one entry per line, lowercased, `#` for
+    comments, empty lines ignored. Missing/unreadable file → empty set +
+    warning log (no enforcement on that level)."""
     entries: set[str] = set()
     try:
-        for raw in FORBIDDEN_PATH.read_text(encoding="utf-8").splitlines():
+        for raw in path.read_text(encoding="utf-8").splitlines():
             s = raw.strip().lower()
             if s and not s.startswith("#"):
                 entries.add(s)
     except OSError as exc:
-        LOG.warning("forbidden-subdomains list unreadable at %s: %s — "
-                    "no slug blocking will be enforced", FORBIDDEN_PATH, exc)
-    _FORBIDDEN_CACHE = entries
-    LOG.info("loaded %d forbidden subdomain substring(s)", len(entries))
+        LOG.warning("%s blocklist unreadable at %s: %s — no enforcement on this level",
+                    label, path, exc)
     return entries
 
 
-def is_forbidden_slug(slug: str) -> bool:
-    """True if the (already-normalised) slug contains any forbidden
-    substring. Plain substring check — no acrobatics.
+def _load_forbidden_substrings() -> set[str]:
+    """Substring blocklist: matches if the entry appears ANYWHERE in the
+    normalised slug. Cached until daemon restart."""
+    global _FORBIDDEN_CACHE
+    if _FORBIDDEN_CACHE is None:
+        _FORBIDDEN_CACHE = _load_blocklist(FORBIDDEN_PATH, "substring")
+        LOG.info("loaded %d forbidden substring(s)", len(_FORBIDDEN_CACHE))
+    return _FORBIDDEN_CACHE
 
-    Catches: `HITLER`, `hîtlèr`, `hitlershop` (all normalise/contain 'hitler').
-    Misses (accepted limitation): separator-obfuscation like `h-i-t-l-e-r`
-    (normalise passes hyphens through as-is) and letter-insertion like
-    `hictler`. If a specific obfuscation shows up in production, add its
-    exact normalised form to templates/forbidden-subdomains.txt."""
-    forbidden = _load_forbidden_substrings()
-    if not forbidden:
-        return False
-    return any(f in slug for f in forbidden)
+
+def _load_forbidden_words() -> set[str]:
+    """Whole-word blocklist: matches if the entry equals any '-'-separated
+    token of the normalised slug. Reserved for terms too FP-prone for
+    substring matching (`pute`, `cul`, `bite` — would false-positive on
+    computer / masculin / orbite). Cached until daemon restart."""
+    global _FORBIDDEN_WORD_CACHE
+    if _FORBIDDEN_WORD_CACHE is None:
+        _FORBIDDEN_WORD_CACHE = _load_blocklist(FORBIDDEN_WORD_PATH, "whole-word")
+        LOG.info("loaded %d forbidden whole-word(s)", len(_FORBIDDEN_WORD_CACHE))
+    return _FORBIDDEN_WORD_CACHE
+
+
+def is_forbidden_slug(slug: str) -> bool:
+    """True if the (already-normalised) slug matches ANY blocklist:
+      * substring list — entry appears anywhere in the slug
+      * whole-word list — entry equals any `-`-separated token of the slug
+
+    Two levels because substring matching false-positives on FP-prone terms
+    (`pute` in `computer`, `cul` in `masculin`, `bite` in `orbite`), while
+    exact-slug-only matching is trivially bypassed (`pute-shop`). Whole-word
+    is the sweet spot for that class: catches `pute` and `pute-shop`, still
+    lets `computer` through.
+
+    Accepted limits: separator obfuscation (`h-i-t-l-e-r`) and letter
+    insertion (`hictler`) still pass — add the exact normalised form to
+    the relevant list if seen in production."""
+    contains = _load_forbidden_substrings()
+    if contains and any(f in slug for f in contains):
+        return True
+    words = _load_forbidden_words()
+    if words:
+        tokens = set(slug.split("-"))
+        if tokens & words:
+            return True
+    return False
 
 
 def gen_random_tenant_id() -> str:

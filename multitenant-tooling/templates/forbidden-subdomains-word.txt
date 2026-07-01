@@ -1,0 +1,31 @@
+# forbidden-subdomains-word.txt — WHOLE-WORD blocklist
+#
+# The daemon matches these entries as WHOLE `-`-separated tokens of the
+# normalised slug. So the entry `pute` blocks a slug that has `pute` as one
+# of its tokens: `pute`, `pute-shop`, `shop-pute-cochonne` are all blocked —
+# but `computer`, `réputable`, `dispute` are NOT (they normalise to a single
+# token whose value is `computer` / `reputable` / `dispute`, none of which
+# equals `pute`).
+#
+# One entry per line, `#` for comments, empty lines ignored, lowercased at
+# load time. Reload on daemon restart:
+#     sudo systemctl restart bebop-test-tenant-api
+#
+# This file is the escape hatch for terms whose substring form would produce
+# unacceptable false positives on legitimate French/English tenant names.
+# Anything safe enough for substring matching belongs in forbidden-subdomains.txt.
+
+# --- FR insultes / crudités -----------------------------------------------
+pute
+nique
+cul
+bite
+poil
+
+# --- Injures racistes / antisémites (whole-word only) ---------------------
+# `juif` is not inherently offensive but blocking as a whole word prevents
+# obvious hateful subdomains (`juif-out`, etc.). This also blocks legitimate
+# uses like `juif-cuisine` — trade-off known, adjust if needed.
+juif
+negro
+feuj

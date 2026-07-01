@@ -1,19 +1,57 @@
-# forbidden-subdomains.txt
+# forbidden-subdomains.txt — SUBSTRING blocklist
 #
-# Substrings that MUST NOT appear anywhere in a tenant's public subdomain.
-# Matched case-insensitively against the normalised slug (already Unicode
-# NFKD + ASCII-folded + lowercased by test-tenant-api.py::normalize_subdomain).
-#
-# When a buyer-supplied slug matches ANY entry here, the daemon SKIPS the
-# normal `<base>-<NNNN>` collision retry (which would just append 4 digits to
-# an offensive slug, e.g. 'hitler-1824' — still offensive) and instead
-# generates a fully random `<8 a-z>-<4 0-9>` slug via gen_random_tenant_id().
-#
-# One entry per line. Lines starting with `#` and empty lines are ignored.
-# The file is loaded ONCE at daemon startup and cached — restart the daemon
-# to pick up edits:
+# The daemon matches these entries as SUBSTRINGS against the normalised slug
+# (Unicode NFKD + ASCII fold + lowercase + `[^a-z0-9]+` collapsed to `-`).
+# One entry per line, `#` for comments, empty lines ignored, lowercased at
+# load time. Reload on daemon restart:
 #     sudo systemctl restart bebop-test-tenant-api
 #
-# Substring matching applies: 'hit' would block 'hitler', 'shit', 'hitman', …
-# — choose entries carefully to avoid false positives on legitimate French
-# and English roots.
+# Only put entries whose substring appearance in ANY legitimate French/English
+# tenant slug is essentially impossible (very low false-positive risk).
+# Terms with FP risk (`pute` in `computer`, `cul` in `masculin`, `bite` in
+# `orbite`, …) go in forbidden-subdomains-word.txt (whole-word match) instead.
+#
+# When a buyer-supplied slug matches, the daemon SKIPS the normal
+# `<base>-<NNNN>` collision retry (which would leave the offensive substring)
+# and generates a fully random `<8 a-z>-<4 0-9>` slug via gen_random_tenant_id().
+#
+# Scope: substrings whose blocking is justified by French law risk
+# (apologie du terrorisme / crimes contre l'humanité, injures ou provocations
+# à la haine raciale / antisémite publiques, pédopornographie) OR clear
+# obscenity/insult with no meaningful FP risk.
+
+# --- Apologie du nazisme / crimes contre l'humanité ------------------------
+hitler
+nazi
+nsdap
+waffen
+swastika
+kkk
+
+# --- Apologie du terrorisme -----------------------------------------------
+alqaeda
+daesh
+taliban
+bokoharam
+
+# --- Injures/provocations racistes publiques (EN) -------------------------
+nigger
+nigga
+kike
+gook
+wetback
+
+# --- Injures racistes / antisémites publiques (FR) ------------------------
+bougnoule
+bicot
+chinetoque
+youpin
+
+# --- Pédopornographie -----------------------------------------------------
+pedophile
+lolicon
+shotacon
+
+# --- Insultes / obscénités (bas risque de FP) -----------------------------
+merde
+couilles
