@@ -231,26 +231,18 @@ def _load_forbidden_substrings() -> set[str]:
 
 
 def is_forbidden_slug(slug: str) -> bool:
-    """True if the (lowercased, already-normalised) slug contains any
-    forbidden substring — checked against BOTH the slug as-is AND the
-    hyphen-stripped form.
+    """True if the (already-normalised) slug contains any forbidden
+    substring. Plain substring check — no acrobatics.
 
-    Rationale for the double form: normalize_subdomain() collapses runs of
-    non-[a-z0-9] to a single '-', so buyer inputs like 'h-i-t-l-e-r',
-    'h i t l e r', 'h!t!l!e!r' land as 'h-i-t-l-e-r'. Substring matching on
-    that alone would MISS 'hitler'. Checking the '-'-stripped form
-    ('hitler') catches trivial separator-based obfuscation.
-
-    Known limits: this DOES NOT defeat letter-insertion attacks — e.g. a
-    buyer typing 'hiçtler' where the ç folds to 'c' lands as 'hictler'
-    ('hitler' not a substring). Substring matching cannot fix that class
-    of attempt; add both forms ('hictler' etc.) to the blocklist if you
-    see them recur."""
+    Catches: `HITLER`, `hîtlèr`, `hitlershop` (all normalise/contain 'hitler').
+    Misses (accepted limitation): separator-obfuscation like `h-i-t-l-e-r`
+    (normalise passes hyphens through as-is) and letter-insertion like
+    `hictler`. If a specific obfuscation shows up in production, add its
+    exact normalised form to templates/forbidden-subdomains.txt."""
     forbidden = _load_forbidden_substrings()
     if not forbidden:
         return False
-    flat = slug.replace("-", "")
-    return any(f in slug or f in flat for f in forbidden)
+    return any(f in slug for f in forbidden)
 
 
 def gen_random_tenant_id() -> str:
