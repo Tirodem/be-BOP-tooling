@@ -43,6 +43,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import smtplib
 import subprocess
 import sys
@@ -79,6 +80,14 @@ RESERVED_TENANT_IDS = {
     "root", "system", "bebop", "phoenixd", "mongod",
     "dashboard", "panel", "saas", "ops", "deploy",
 }
+
+# Registry read for collision detection. We shell-free-read the TSV rather
+# than sourcing lib/registry.sh from bash on every check — the file is small
+# and format-stable (`lib/registry.sh` header comment). Any change to that
+# header column ordering breaks us; kept intentionally minimal to make the
+# breakage loud.
+REGISTRY_PATH = Path("/var/lib/be-BOP/tenants.tsv")
+TENANT_ID_RETRY_ATTEMPTS = 3
 
 
 # --- Helpers ----------------------------------------------------------------
@@ -195,6 +204,50 @@ def normalize_subdomain(raw: str) -> str:
     ascii_only = nfkd.encode("ascii", "ignore").decode("ascii")
     slug = re.sub(r"[^a-z0-9]+", "-", ascii_only.lower()).strip("-")
     return slug[:TENANT_MAX_LEN].rstrip("-")
+
+
+def _tenant_registry_status(tenant_id: str) -> str:
+    """Read /var/lib/be-BOP/tenants.tsv directly. Returns the status column
+    ('active', 'soft-deleted', 'archived', ...) or 'absent' if the tenant_id
+    is not present. Returns 'unknown' if the file is unreadable — the caller
+    treats unknown as collision to stay on the safe side."""
+    try:
+        with REGISTRY_PATH.open(encoding="utf-8") as f:
+            for i, raw in enumerate(f):
+                if i == 0:
+                    continue  # header
+                cols = raw.rstrip("\n").split("\t")
+                if cols and cols[0] == tenant_id and len(cols) >= 11:
+                    return cols[10]
+    except OSError as exc:
+        LOG.warning("registry read failed at %s: %s", REGISTRY_PATH, exc)
+        return "unknown"
+    return "absent"
+
+
+def resolve_free_tenant_id(base: str) -> str | None:
+    """Return `base` unchanged if the registry has no such tenant. Otherwise
+    try up to TENANT_ID_RETRY_ATTEMPTS candidates of the form
+    `<base>-<NNNN>` (4-digit cryptographic random). Returns None when nothing
+    free was found — the caller should refuse the request with 409."""
+    if _tenant_registry_status(base) == "absent":
+        return base
+    LOG.info("tenant_id %r collides in registry; retrying with -NNNN suffix", base)
+    # Truncate base so `<trunc>-XXXX` fits under TENANT_MAX_LEN.
+    trunc = base[: TENANT_MAX_LEN - 5].rstrip("-")
+    if not trunc:
+        LOG.warning("base %r too short after truncation; cannot suffix-retry", base)
+        return None
+    for attempt in range(1, TENANT_ID_RETRY_ATTEMPTS + 1):
+        suffix = f"{secrets.randbelow(10000):04d}"
+        cand = f"{trunc}-{suffix}"
+        if _tenant_registry_status(cand) == "absent":
+            LOG.info("tenant_id resolved to %r after %d attempt(s)", cand, attempt)
+            return cand
+        LOG.info("attempt %d: %r also colliding — retrying", attempt, cand)
+    LOG.warning("no free tenant_id after %d attempts (base=%r)",
+                TENANT_ID_RETRY_ATTEMPTS, base)
+    return None
 
 
 def validate_tenant_id(tenant_id: str) -> None:
@@ -439,6 +492,22 @@ class Handler(BaseHTTPRequestHandler):
             validate_tenant_id(cfg["tenant_id"])
         except ValueError as exc:
             return self._send_json(400, {"error": str(exc)})
+
+        # 4b. Resolve slug collisions BEFORE returning 202 so the URL echoed
+        # to be-BOP (and later used in the buyer email) matches the actually-
+        # provisioned tenant. Bumps the base slug to `<base>-<NNNN>` up to
+        # TENANT_ID_RETRY_ATTEMPTS times if the registry already has an
+        # entry (any status — including soft-deleted, to avoid resurrecting
+        # DNS/cert artefacts still tied to that ID).
+        resolved_id = resolve_free_tenant_id(cfg["tenant_id"])
+        if resolved_id is None:
+            return self._send_json(409, {
+                "error": (
+                    f"tenant_id '{cfg['tenant_id']}' collides in registry and "
+                    f"{TENANT_ID_RETRY_ATTEMPTS} suffix retries all collided too"
+                )
+            })
+        cfg["tenant_id"] = resolved_id
 
         tenant_id = cfg["tenant_id"]
         admin_email = cfg["admin_email"]
