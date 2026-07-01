@@ -85,7 +85,12 @@ poll_txt_propagation() {
     deadline=$(( $(date +%s) + timeout ))
     local attempt=0
     while (( $(date +%s) < deadline )); do
-        (( attempt++ ))
+        # Pre-increment: `(( expr ))` returns 1 when expr evaluates to 0,
+        # and under `set -e` that kills the whole hook. `(( attempt++ ))`
+        # would evaluate the PRE-value (0 on first pass) → exit 1 → hook
+        # aborts before ever calling dig. `(( ++attempt ))` evaluates to
+        # the NEW value (>=1), always exit 0.
+        (( ++attempt ))
         local ns_line all_ok=1 seen=0
         while IFS= read -r ns_line; do
             [[ -z "$ns_line" ]] && continue
