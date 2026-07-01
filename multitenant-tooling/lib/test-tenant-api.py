@@ -58,12 +58,17 @@ LOG = logging.getLogger("test-tenant-api")
 # --- Config (env-driven; populated in main()) -------------------------------
 CFG: dict = {}
 
-# HTML template for the buyer notification. Sits next to the script tree at
-# <install-prefix>/templates/. Loaded lazily and cached.
-TEMPLATE_PATH = Path(__file__).resolve().parent.parent / "templates" / "tenant-up-notification.html"
+# HTML template + logo for the buyer notification. Both sit next to the
+# script tree at <install-prefix>/templates/. Loaded lazily and cached.
+# The logo ships as PNG (rendered from bebop-light.svg) because SVG and
+# data URIs are stripped by Gmail/Outlook — only multipart/related + CID
+# has broad email-client support.
+TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
+TEMPLATE_PATH = TEMPLATES_DIR / "tenant-up-notification.html"
+LOGO_PATH = TEMPLATES_DIR / "tenant-up-notification-logo.png"
+LOGO_CID = "tenant-up-logo"
 _HTML_TEMPLATE_CACHE: str | None = None
-
-FIRST_NAME_SLUGS = ("first-name", "firstname", "prenom")
+_LOGO_BYTES_CACHE: bytes | None = None
 
 # --- Tenant id rules (must match add-tenant.sh) -----------------------------
 TENANT_REGEX = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -121,8 +126,8 @@ def extract_tenant_config(payload: dict) -> dict:
         tenant_id    : required, str
         admin_email  : required, str  (defaults to payload['contact']['email'])
         branch       : optional, str  (defaults to CFG['branch_default'])
-        first_name   : optional, str  ('' if none of the FIRST_NAME_SLUGS
-                                       appear in customCheckoutFields)
+        first_name   : optional, str  (from payload['billingAddress']['firstName'];
+                                       '' if billingAddress absent)
 
     Slug mapping (be-BOP shop checkout schema):
         slug == 'subdomain'    → tenant_id (REQUIRED)
@@ -130,8 +135,8 @@ def extract_tenant_config(payload: dict) -> dict:
                                  fallback = payload.contact.email)
         slug == 'branch'       → branch override (optional;
                                  fallback = CFG['branch_default'] == 'main')
-        slug ∈ FIRST_NAME_SLUGS → first_name for the buyer email greeting
-                                 (optional; '' if absent)
+    firstName does NOT come from customCheckoutFields — be-BOP collects it
+    in the standard billing-address block of the paid-order webhook.
     """
     fields = payload.get("customCheckoutFields") or []
     by_slug: dict[str, str] = {}
@@ -164,11 +169,8 @@ def extract_tenant_config(payload: dict) -> dict:
 
     branch = (by_slug.get("branch") or CFG["branch_default"]).strip()
 
-    first_name = ""
-    for slug in FIRST_NAME_SLUGS:
-        if slug in by_slug and by_slug[slug].strip():
-            first_name = by_slug[slug].strip()
-            break
+    billing = payload.get("billingAddress") or {}
+    first_name = (billing.get("firstName") or "").strip()
 
     return {
         "tenant_id": tenant_id,
@@ -254,6 +256,21 @@ def _load_html_template() -> str | None:
     return _HTML_TEMPLATE_CACHE or None
 
 
+def _load_logo_bytes() -> bytes | None:
+    """Load the logo PNG once and cache. Returns None if unreadable
+    (send_buyer_email then sends HTML with a broken <img cid:> link,
+    which is fine — text alternative still lands)."""
+    global _LOGO_BYTES_CACHE
+    if _LOGO_BYTES_CACHE is not None:
+        return _LOGO_BYTES_CACHE
+    try:
+        _LOGO_BYTES_CACHE = LOGO_PATH.read_bytes()
+    except OSError as exc:
+        LOG.error("logo PNG unreadable at %s: %s", LOGO_PATH, exc)
+        _LOGO_BYTES_CACHE = b""
+    return _LOGO_BYTES_CACHE or None
+
+
 def render_buyer_html(first_name: str, backoffice_url: str) -> str | None:
     """Render the HTML template with buyer data. Placeholders:
         {{firstName}}      → escaped first_name; if empty, the leading
@@ -302,6 +319,16 @@ def send_buyer_email(
     html_body = render_buyer_html(first_name, backoffice_url)
     if html_body:
         msg.add_alternative(html_body, subtype="html")
+        # Embed the logo as a related MIME part so Gmail/Outlook display it.
+        # data: URIs and SVG-from-URL are stripped by most webmail clients;
+        # multipart/related + Content-ID (`cid:LOGO_CID`) is the only method
+        # with broad support.
+        logo = _load_logo_bytes()
+        if logo:
+            html_part = msg.get_payload()[-1]
+            html_part.add_related(
+                logo, maintype="image", subtype="png", cid=LOGO_CID
+            )
     else:
         LOG.warning("send_buyer_email: HTML template unavailable, sending text-only")
     try:
