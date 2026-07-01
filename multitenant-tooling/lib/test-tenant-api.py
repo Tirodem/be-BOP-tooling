@@ -68,8 +68,10 @@ TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
 TEMPLATE_PATH = TEMPLATES_DIR / "tenant-up-notification.html"
 LOGO_PATH = TEMPLATES_DIR / "tenant-up-notification-logo.png"
 LOGO_CID = "tenant-up-logo"
+FORBIDDEN_PATH = TEMPLATES_DIR / "forbidden-subdomains.txt"
 _HTML_TEMPLATE_CACHE: str | None = None
 _LOGO_BYTES_CACHE: bytes | None = None
+_FORBIDDEN_CACHE: set[str] | None = None
 
 # --- Tenant id rules (must match add-tenant.sh) -----------------------------
 TENANT_REGEX = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -206,6 +208,44 @@ def normalize_subdomain(raw: str) -> str:
     return slug[:TENANT_MAX_LEN].rstrip("-")
 
 
+def _load_forbidden_substrings() -> set[str]:
+    """Load the operator-curated blocklist from templates/forbidden-subdomains.txt.
+    Format: one substring per line, `#` for comments, empty lines ignored.
+    All entries are lowercased at load time; the slug we compare against is
+    already lowercased by normalize_subdomain(). Cached until daemon restart."""
+    global _FORBIDDEN_CACHE
+    if _FORBIDDEN_CACHE is not None:
+        return _FORBIDDEN_CACHE
+    entries: set[str] = set()
+    try:
+        for raw in FORBIDDEN_PATH.read_text(encoding="utf-8").splitlines():
+            s = raw.strip().lower()
+            if s and not s.startswith("#"):
+                entries.add(s)
+    except OSError as exc:
+        LOG.warning("forbidden-subdomains list unreadable at %s: %s — "
+                    "no slug blocking will be enforced", FORBIDDEN_PATH, exc)
+    _FORBIDDEN_CACHE = entries
+    LOG.info("loaded %d forbidden subdomain substring(s)", len(entries))
+    return entries
+
+
+def is_forbidden_slug(slug: str) -> bool:
+    """True if the (lowercased) slug contains any forbidden substring."""
+    forbidden = _load_forbidden_substrings()
+    return any(f in slug for f in forbidden)
+
+
+def gen_random_tenant_id() -> str:
+    """Generate an 8-letter (a-z) + '-' + 4-digit (0-9) random tenant_id.
+    Structured (not a flat 12-char string) so operators can eyeball logs and
+    see the 'auto-generated because forbidden slug' signal at a glance."""
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    a = "".join(secrets.choice(letters) for _ in range(8))
+    b = f"{secrets.randbelow(10000):04d}"
+    return f"{a}-{b}"
+
+
 def _tenant_registry_status(tenant_id: str) -> str:
     """Read /var/lib/be-BOP/tenants.tsv directly. Returns the status column
     ('active', 'soft-deleted', 'archived', ...) or 'absent' if the tenant_id
@@ -226,10 +266,33 @@ def _tenant_registry_status(tenant_id: str) -> str:
 
 
 def resolve_free_tenant_id(base: str) -> str | None:
-    """Return `base` unchanged if the registry has no such tenant. Otherwise
-    try up to TENANT_ID_RETRY_ATTEMPTS candidates of the form
-    `<base>-<NNNN>` (4-digit cryptographic random). Returns None when nothing
-    free was found — the caller should refuse the request with 409."""
+    """Resolve the final tenant_id we'll actually provision under.
+
+    Two paths depending on whether `base` matches the forbidden-substring list:
+    * FORBIDDEN — skip the `<base>-<NNNN>` retry (would still contain the
+      offensive substring, e.g. 'hitler-1824'). Generate an 8-letter + 4-digit
+      random slug via gen_random_tenant_id(). Retry up to
+      TENANT_ID_RETRY_ATTEMPTS times to dodge both registry collisions AND
+      random slugs that happen to contain a forbidden substring themselves.
+    * NORMAL — return `base` if the registry has no such tenant; else try
+      `<base>-<NNNN>` up to TENANT_ID_RETRY_ATTEMPTS.
+    Returns None when nothing worked — the caller should refuse with 409."""
+    if is_forbidden_slug(base):
+        LOG.warning("tenant_id %r matches forbidden-substring list; randomising", base)
+        for attempt in range(1, TENANT_ID_RETRY_ATTEMPTS + 1):
+            cand = gen_random_tenant_id()
+            if is_forbidden_slug(cand):
+                LOG.debug("random slug %r happened to hit forbidden list (attempt %d)",
+                          cand, attempt)
+                continue
+            if _tenant_registry_status(cand) == "absent":
+                LOG.info("tenant_id randomised to %r after %d attempt(s)", cand, attempt)
+                return cand
+            LOG.debug("random slug %r collides in registry (attempt %d)", cand, attempt)
+        LOG.warning("randomisation failed after %d attempts (base=%r)",
+                    TENANT_ID_RETRY_ATTEMPTS, base)
+        return None
+
     if _tenant_registry_status(base) == "absent":
         return base
     LOG.info("tenant_id %r collides in registry; retrying with -NNNN suffix", base)

@@ -1,0 +1,19 @@
+# forbidden-subdomains.txt
+#
+# Substrings that MUST NOT appear anywhere in a tenant's public subdomain.
+# Matched case-insensitively against the normalised slug (already Unicode
+# NFKD + ASCII-folded + lowercased by test-tenant-api.py::normalize_subdomain).
+#
+# When a buyer-supplied slug matches ANY entry here, the daemon SKIPS the
+# normal `<base>-<NNNN>` collision retry (which would just append 4 digits to
+# an offensive slug, e.g. 'hitler-1824' — still offensive) and instead
+# generates a fully random `<8 a-z>-<4 0-9>` slug via gen_random_tenant_id().
+#
+# One entry per line. Lines starting with `#` and empty lines are ignored.
+# The file is loaded ONCE at daemon startup and cached — restart the daemon
+# to pick up edits:
+#     sudo systemctl restart bebop-test-tenant-api
+#
+# Substring matching applies: 'hit' would block 'hitler', 'shit', 'hitman', …
+# — choose entries carefully to avoid false positives on legitimate French
+# and English roots.
