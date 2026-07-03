@@ -1238,6 +1238,18 @@ run_reapply() {
 # the `=== EXIT trap ===` section.)
 
 # === Main ===============================================================
+# Preflight: sweep any orphaned tenant artefacts BEFORE we start allocating
+# ports or spinning up services. registry_allocate_port scans only the
+# registry, so an orphan's port would appear free and be handed out — the
+# new tenant then fails at EADDRINUSE. Auto-purge closes that class of
+# failure without operator intervention.
+preflight_purge_orphans() {
+    log_info "preflight: scan + auto-purge of orphans..."
+    if ! find-orphans.sh --purge-all --yes 2>&1; then
+        log_warn "preflight: find-orphans --purge-all returned non-zero (continuing)"
+    fi
+}
+
 main() {
     require_privileges
 
@@ -1252,6 +1264,8 @@ main() {
     # (registry_unlock is called from on_script_exit — the script-level
     # EXIT trap defined near the top — so it runs after success notif
     # AND after failure notif, on every exit path.)
+
+    preflight_purge_orphans
 
     phase_status_decision
 

@@ -72,8 +72,12 @@ FORBIDDEN_PATH = TEMPLATES_DIR / "forbidden-subdomains.txt"
 FORBIDDEN_WORD_PATH = TEMPLATES_DIR / "forbidden-subdomains-word.txt"
 _HTML_TEMPLATE_CACHE: str | None = None
 _LOGO_BYTES_CACHE: bytes | None = None
-_FORBIDDEN_CACHE: set[str] | None = None
-_FORBIDDEN_WORD_CACHE: set[str] | None = None
+# NOTE: blocklists are intentionally NOT cached. A stale cache once let
+# `swastika` through because the daemon had been restarted BEFORE the
+# forbidden list was populated, and reading the file only happened once at
+# process start. The files are ~50 lines each; re-reading on every webhook
+# is trivial and removes the "did you restart the daemon after editing?"
+# discipline burden.
 
 # --- Tenant id rules (must match add-tenant.sh) -----------------------------
 TENANT_REGEX = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -228,24 +232,17 @@ def _load_blocklist(path: Path, label: str) -> set[str]:
 
 def _load_forbidden_substrings() -> set[str]:
     """Substring blocklist: matches if the entry appears ANYWHERE in the
-    normalised slug. Cached until daemon restart."""
-    global _FORBIDDEN_CACHE
-    if _FORBIDDEN_CACHE is None:
-        _FORBIDDEN_CACHE = _load_blocklist(FORBIDDEN_PATH, "substring")
-        LOG.info("loaded %d forbidden substring(s)", len(_FORBIDDEN_CACHE))
-    return _FORBIDDEN_CACHE
+    normalised slug. Re-read from disk on every call — cost is trivial
+    (file is small) and eliminates cache-staleness surprises."""
+    return _load_blocklist(FORBIDDEN_PATH, "substring")
 
 
 def _load_forbidden_words() -> set[str]:
     """Whole-word blocklist: matches if the entry equals any '-'-separated
     token of the normalised slug. Reserved for terms too FP-prone for
     substring matching (`pute`, `cul`, `bite` — would false-positive on
-    computer / masculin / orbite). Cached until daemon restart."""
-    global _FORBIDDEN_WORD_CACHE
-    if _FORBIDDEN_WORD_CACHE is None:
-        _FORBIDDEN_WORD_CACHE = _load_blocklist(FORBIDDEN_WORD_PATH, "whole-word")
-        LOG.info("loaded %d forbidden whole-word(s)", len(_FORBIDDEN_WORD_CACHE))
-    return _FORBIDDEN_WORD_CACHE
+    computer / masculin / orbite). Re-read from disk on every call."""
+    return _load_blocklist(FORBIDDEN_WORD_PATH, "whole-word")
 
 
 def is_forbidden_slug(slug: str) -> bool:
