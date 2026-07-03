@@ -156,14 +156,19 @@ discover_dir_ids() {
     done
 }
 
-# nginx vhosts: sites-available/bebop-<id>.conf and sites-enabled/bebop-<id>.conf.
+# nginx vhosts and their stale backups.
+#   - bebop-<id>.conf                    (active or sitting in sites-available)
+#   - bebop-<id>.conf.bak.<timestamp>    (dropped by fix-acme-vhosts.sh or
+#                                         other bulk operations; often left
+#                                         behind indefinitely)
 discover_nginx_ids() {
     local d
     for d in /etc/nginx/sites-available /etc/nginx/sites-enabled; do
         run_privileged test -d "$d" || continue
-        run_privileged find "$d" -mindepth 1 -maxdepth 1 -name 'bebop-*.conf' \
+        run_privileged find "$d" -mindepth 1 -maxdepth 1 \
+            \( -name 'bebop-*.conf' -o -name 'bebop-*.conf.bak.*' \) \
             -printf '%f\n' 2>/dev/null \
-            | sed -nE 's/^bebop-(.+)\.conf$/\1/p' \
+            | sed -nE 's/^bebop-(.+)\.conf(\.bak\..+)?$/\1/p' \
             | grep -v '^$' || true
     done
 }
@@ -204,10 +209,10 @@ registry_known_ids() {
 # it — reporting an id with no listed artefact wastes the operator's time.
 _id_has_artefact() {
     local id="$1" u d
+    # systemd — is-enabled catches instances enabled via .wants/ symlinks
+    # (which list-unit-files misses for template instances). is-active
+    # catches transient/running units not enabled at boot.
     for u in "bebop@${id}.service" "phoenixd@${id}.service" "mongod@${id}.service"; do
-        if run_privileged systemctl list-unit-files --no-legend "$u" 2>/dev/null | grep -q .; then
-            return 0
-        fi
         if run_privileged systemctl is-enabled --quiet "$u" 2>/dev/null; then
             return 0
         fi
@@ -224,6 +229,11 @@ _id_has_artefact() {
             return 0
         fi
     done
+    # nginx stale backups
+    if [[ -n "$(run_privileged find /etc/nginx/sites-available -maxdepth 1 \
+                    -name "bebop-${id}.conf.bak.*" -print -quit 2>/dev/null)" ]]; then
+        return 0
+    fi
     return 1
 }
 
@@ -256,11 +266,16 @@ _report_one() {
     local id="$1"
     printf '  %s\n' "$id"
 
-    local u status
+    # systemd — is-enabled catches template instances enabled via .wants/
+    # symlinks (which list-unit-files misses). We report both states so an
+    # operator can tell "just a stray symlink" from "actually running".
+    local u enabled active
     for u in "bebop@${id}.service" "phoenixd@${id}.service" "mongod@${id}.service"; do
-        if run_privileged systemctl list-unit-files --no-legend "$u" 2>/dev/null | grep -q .; then
-            status=$(run_privileged systemctl is-active "$u" 2>/dev/null || true)
-            printf '    systemd:     %s (%s)\n' "$u" "${status:-unknown}"
+        enabled=$(run_privileged systemctl is-enabled "$u" 2>/dev/null || true)
+        active=$(run_privileged systemctl is-active "$u" 2>/dev/null || true)
+        if [[ -n "$enabled" || -n "$active" ]]; then
+            printf '    systemd:     %s (enabled=%s active=%s)\n' \
+                "$u" "${enabled:-none}" "${active:-none}"
         fi
     done
 
@@ -278,6 +293,14 @@ _report_one() {
             printf '    nginx:       %s\n' "$v"
         fi
     done
+
+    # Stale .bak.<timestamp> nginx files.
+    local f
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        printf '    nginx.bak:   %s\n' "$f"
+    done < <(run_privileged find /etc/nginx/sites-available -maxdepth 1 \
+                    -name "bebop-${id}.conf.bak.*" 2>/dev/null || true)
 
     local c
     for c in "bebop-${id}" "bebop-${id}-s3"; do
@@ -326,20 +349,40 @@ _run() {
     "$@"
 }
 
-# Stop + disable one systemd unit if it is known to systemd. Ignore errors:
-# our goal is to converge to "gone", any state along the way is acceptable.
+# Stop + disable one systemd unit. Ignores errors: our goal is to converge
+# to "gone", any state along the way is acceptable.
+#
+# We check is-enabled/is-active because list-unit-files does NOT match
+# template instances enabled via a .wants/ symlink — so a purge that only
+# looks at list-unit-files would leave orphan symlinks in place, which
+# is exactly the failure mode this script exists to fix. We also fall
+# back to a direct symlink lookup for the (rare) case where the symlink
+# points to a template that no longer exists on disk.
 _stop_disable_unit() {
     local unit="$1"
-    if run_privileged systemctl list-unit-files --no-legend "$unit" 2>/dev/null | grep -q .; then
-        log_info "disable+stop ${unit}"
-        _run run_privileged systemctl disable --now "$unit" 2>/dev/null || true
-    elif run_privileged systemctl list-units --all --no-legend "$unit" 2>/dev/null | grep -q .; then
-        # Loaded but not enabled — stop is enough.
-        log_info "stop ${unit}"
-        _run run_privileged systemctl stop "$unit" 2>/dev/null || true
-    else
-        log_debug "unit ${unit} not present"
+    local is_enabled=false is_active=false
+    if run_privileged systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+        is_enabled=true
     fi
+    if run_privileged systemctl is-active --quiet "$unit" 2>/dev/null; then
+        is_active=true
+    fi
+    if [[ "$is_enabled" == "true" || "$is_active" == "true" ]]; then
+        log_info "disable+stop ${unit} (enabled=${is_enabled} active=${is_active})"
+        _run run_privileged systemctl disable --now "$unit" 2>/dev/null || true
+        return 0
+    fi
+    # Neither enabled nor active — check for orphan .wants/ symlink whose
+    # target may have vanished (systemctl would then reject is-enabled).
+    local sym
+    sym=$(run_privileged find /etc/systemd/system -maxdepth 3 -name "$unit" \
+              -type l -print -quit 2>/dev/null || true)
+    if [[ -n "$sym" ]]; then
+        log_info "rm orphan systemd symlink ${sym}"
+        _run run_privileged rm -f "$sym"
+        return 0
+    fi
+    log_debug "unit ${unit} not present"
 }
 
 _remove_nginx_vhost() {
@@ -357,6 +400,16 @@ _remove_nginx_vhost() {
         _run run_privileged rm -f "$available"
         touched=true
     fi
+    # Stale backups left by fix-acme-vhosts.sh or other bulk edits. Only
+    # dropped for orphan tenants (registered ids never reach _purge_one).
+    local f
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        log_info "rm nginx backup ${f}"
+        _run run_privileged rm -f "$f"
+        touched=true
+    done < <(run_privileged find /etc/nginx/sites-available -maxdepth 1 \
+                    -name "bebop-${id}.conf.bak.*" 2>/dev/null || true)
     if [[ "$touched" == "true" && "$DRY_RUN" != "true" ]]; then
         if run_privileged nginx -t 2>/dev/null; then
             run_privileged systemctl reload nginx || true
