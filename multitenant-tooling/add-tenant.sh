@@ -1168,6 +1168,12 @@ run_reactivation() {
     if [[ "$DRY_RUN" != "true" ]]; then
         mongo_wait_ready "$MONGO_PORT" 60 1 \
             || die "mongod@${TENANT_ID} did not become ready on reactivation"
+        # Idempotent: skips if rs.status() is already OK. Guards against
+        # tenants whose RS config was lost (mongod running but never
+        # rs.initiate()'d, or state directory wiped underneath us) —
+        # without this call, bebop would keep hitting
+        # ReplicaSetNoPrimary and never come up.
+        mongo_init_rs "$MONGO_PORT"
     fi
     # Re-read existing phoenixd password from disk (no recreation).
     if [[ "$ENABLE_PHOENIXD" == "true" ]]; then
@@ -1205,6 +1211,18 @@ run_reapply() {
     # Idempotent: no rollback needed (we only rewrite config + reload).
     detect_host_ip
     phase_derive_identifiers
+    # Ensure mongod is up AND its replica set is initialised. Both steps
+    # are idempotent (systemctl enable --now is a no-op on running units;
+    # mongo_init_rs skips if rs.status() is already OK). This turns
+    # add-tenant.sh <id> into the canonical "repair" command for a live
+    # tenant whose mongod state got out of sync — no separate heal script
+    # required.
+    run_privileged systemctl enable --now "mongod@${TENANT_ID}.service"
+    if [[ "$DRY_RUN" != "true" ]]; then
+        mongo_wait_ready "$MONGO_PORT" 60 1 \
+            || die "mongod@${TENANT_ID} did not become ready on reapply"
+        mongo_init_rs "$MONGO_PORT"
+    fi
     # Rebuild the local MONGO_URL deterministically from registry data.
     MONGO_URL=$(mongo_build_url "$MONGO_PORT" "$MONGO_DB_NAME")
     # Re-derive existing Garage creds + phoenixd password from current config.env.
