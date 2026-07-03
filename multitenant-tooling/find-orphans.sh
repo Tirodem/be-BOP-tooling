@@ -126,21 +126,18 @@ done
 # Each discovery function prints one id per line on stdout. We union the
 # results and then filter out ids that appear in the registry.
 
-# systemd: template-instance units for bebop@, phoenixd@, mongod@ that are
-# either enabled OR currently loaded (list-unit-files misses ephemeral
-# --now-only units but list-units catches them).
+# systemd: template-instance units that are *enabled*. An enable creates a
+# symlink under a .wants/ directory of some target — we enumerate those.
+# Ignoring list-units --all deliberately: it surfaces residual/failed
+# instances long after their disk artefacts are gone, producing a lot of
+# false positives with no actionable content.
 discover_systemd_ids() {
     local template
     for template in bebop phoenixd mongod; do
-        run_privileged systemctl list-unit-files --no-legend \
-            "${template}@*.service" 2>/dev/null \
-            | awk '{print $1}' \
-            | sed -E "s/^${template}@(.+)\\.service$/\\1/" \
-            | grep -v '^$' || true
-        run_privileged systemctl list-units --all --no-legend \
-            "${template}@*.service" 2>/dev/null \
-            | awk '{print $1}' \
-            | sed -E "s/^${template}@(.+)\\.service$/\\1/" \
+        run_privileged find /etc/systemd/system -maxdepth 3 \
+            -name "${template}@*.service" -type l \
+            -printf '%f\n' 2>/dev/null \
+            | sed -nE "s/^${template}@(.+)\\.service$/\\1/p" \
             | grep -v '^$' || true
     done
 }
@@ -166,7 +163,7 @@ discover_nginx_ids() {
         run_privileged test -d "$d" || continue
         run_privileged find "$d" -mindepth 1 -maxdepth 1 -name 'bebop-*.conf' \
             -printf '%f\n' 2>/dev/null \
-            | sed -E 's/^bebop-(.+)\.conf$/\1/' \
+            | sed -nE 's/^bebop-(.+)\.conf$/\1/p' \
             | grep -v '^$' || true
     done
 }
@@ -176,7 +173,7 @@ discover_le_ids() {
     run_privileged test -d /etc/letsencrypt/live || return 0
     run_privileged find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d \
         -name 'bebop-*' -printf '%f\n' 2>/dev/null \
-        | sed -E 's/^bebop-//' \
+        | sed -nE 's/^bebop-(.+)$/\1/p' \
         | sed -E 's/-s3$//' \
         | grep -v '^$' || true
 }
@@ -201,20 +198,55 @@ registry_known_ids() {
     awk -F'\t' 'NR>1 && $1!="" {print $1}' "$REGISTRY_PATH" | sort -u
 }
 
+# True iff at least one concrete artefact exists on disk / in systemd for
+# this id. Belt-and-suspenders check applied after registry diff: if a
+# discovery source turned up an id but nothing concrete remains, we skip
+# it — reporting an id with no listed artefact wastes the operator's time.
+_id_has_artefact() {
+    local id="$1" u d
+    for u in "bebop@${id}.service" "phoenixd@${id}.service" "mongod@${id}.service"; do
+        if run_privileged systemctl list-unit-files --no-legend "$u" 2>/dev/null | grep -q .; then
+            return 0
+        fi
+        if run_privileged systemctl is-enabled --quiet "$u" 2>/dev/null; then
+            return 0
+        fi
+        if run_privileged systemctl is-active --quiet "$u" 2>/dev/null; then
+            return 0
+        fi
+    done
+    for d in "/etc/be-BOP/${id}" "/var/lib/be-BOP/${id}" "/var/lib/be-BOP-mongodb/${id}" \
+             "/etc/nginx/sites-available/bebop-${id}.conf" \
+             "/etc/nginx/sites-enabled/bebop-${id}.conf" \
+             "/etc/letsencrypt/live/bebop-${id}" \
+             "/etc/letsencrypt/live/bebop-${id}-s3"; do
+        if run_privileged test -e "$d"; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Print the sorted list of orphan ids on stdout.
 list_orphans() {
-    local all known
+    local all known candidates id
     all=$(discover_all_ids)
     known=$(registry_known_ids)
     if [[ -z "$all" ]]; then
         return 0
     fi
     if [[ -z "$known" ]]; then
-        printf '%s\n' "$all"
-        return 0
+        candidates="$all"
+    else
+        # comm -23: lines only in file 1
+        candidates=$(comm -23 <(printf '%s\n' "$all") <(printf '%s\n' "$known"))
     fi
-    # comm -23: lines only in file 1
-    comm -23 <(printf '%s\n' "$all") <(printf '%s\n' "$known")
+    while IFS= read -r id; do
+        [[ -z "$id" ]] && continue
+        if _id_has_artefact "$id"; then
+            printf '%s\n' "$id"
+        fi
+    done <<< "$candidates"
 }
 
 # === Reporting ==========================================================
