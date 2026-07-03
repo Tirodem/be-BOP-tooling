@@ -110,6 +110,7 @@ chmod 0755 \
     "${INSTALL_DIR}/upgrade-tenant.sh" \
     "${INSTALL_DIR}/upgrade-all.sh" \
     "${INSTALL_DIR}/list-tenants.sh" \
+    "${INSTALL_DIR}/find-orphans.sh" \
     "${INSTALL_DIR}/tenant-cli.sh" \
     "${INSTALL_DIR}/gh-rate-limit.sh" \
     "${INSTALL_DIR}/certbot-renew-check.sh" \
