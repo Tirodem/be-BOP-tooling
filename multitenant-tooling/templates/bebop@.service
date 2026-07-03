@@ -29,6 +29,11 @@ WorkingDirectory=/var/lib/be-BOP/%i/releases/current
 Environment=HOME=/var/lib/be-BOP/%i/state
 Environment=NODE_ENV=production
 EnvironmentFile=/etc/be-BOP/%i/config.env
+# Guarantees mongod@<tenant> is up AND its rs0 replica set is initialised
+# BEFORE node starts. The '+' prefix runs the hook as real root (bypassing
+# DynamicUser). Failure here blocks the start on purpose — a bebop without
+# a primary-elected mongo just hits 30s Mongo timeouts and exits.
+ExecStartPre=+/usr/local/bin/bebop-mongo-preflight.sh %i
 ExecStart=/usr/bin/node build/index.js
 # Exit-code protocol v1 (contract be-BOP ↔ orchestrator validated 2026-06-12).
 # be-BOP signals intent to the orchestrator via specific exit codes:

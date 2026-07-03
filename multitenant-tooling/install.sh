@@ -118,6 +118,7 @@ chmod 0755 \
     "${INSTALL_DIR}/restore-tenant.sh" \
     "${INSTALL_DIR}/freeze-tenant.sh" \
     "${INSTALL_DIR}/bebop-exit-handler.sh" \
+    "${INSTALL_DIR}/bebop-mongo-preflight.sh" \
     "${INSTALL_DIR}/test-tenant-reaper.sh" \
     "${INSTALL_DIR}/install.sh" 2>/dev/null || true
 # Hooks must be executable for certbot --manual-{auth,cleanup}-hook
