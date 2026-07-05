@@ -60,8 +60,6 @@ source "$BEBOP_TOOLING_LIB_DIR/release.sh"
 source "$BEBOP_TOOLING_LIB_DIR/dns.sh"
 # shellcheck source=lib/phoenixd.sh
 source "$BEBOP_TOOLING_LIB_DIR/phoenixd.sh"
-# shellcheck source=lib/scaleway.sh
-source "$BEBOP_TOOLING_LIB_DIR/scaleway.sh"
 
 # === EXIT trap ==========================================================
 # Defined early so it's in scope from any failure point — including the
@@ -737,26 +735,28 @@ phase_phoenixd() {
     log_info "phoenixd ${TENANT_ID} ready (http-password obtained)"
 }
 
-# Phase 8b: mail-relay tenant registration.
+# Phase 8b: mail-relay tenant registration (LOCAL ONLY).
 #
-# Registers the tenant's sending sub-domain with Scaleway TEM, posts the
-# SPF/DKIM/DMARC records via lib/ovh.sh, creates a relay-side credential,
-# and queues the SMTP config in RUNTIME_CONFIG_OVERRIDES so
-# apply_runtime_config_overrides() seeds it into runtimeConfig.smtp just
-# before bebop starts.
+# Creates the tenant's row in the local mail-relay SQLite and seeds its
+# runtimeConfig.smtp so bebop@<tenant> starts with a working SMTP config
+# against 127.0.0.1:2525. That's it — this phase touches ZERO upstream
+# provider. The tenant can send from day one (relay accepts AUTH and
+# logs everything to send_log) whether or not an upstream provider is
+# configured.
 #
-# Failure mode D (locked in design): Scaleway API down / DNS post-fail →
-# tenant remains fully functional (site up, orders taken), only the mail
-# side stays in mail_status=pending. A Zulip alert fires so ops can retry
-# via `mail-relay-ctl retry-scaleway <tid>`.
+# Upstream domain declaration (see lib/scaleway.sh for the V1 adapter)
+# is decoupled from provisioning: a separate systemd-timer sweep scans
+# the relay for tenants with upstream_domain_id IS NULL and declares
+# them upstream when the operator has provided provider credentials.
+# See mail-upstream-sync.sh + bebop-mail-relay-upstream-sync.timer.
 #
-# Idempotent: skipped entirely if the tenant already has a relay row
-# (reapply / reactivate paths), or if the operator passed a manual
-# --runtime-config smtp=... (BYO / migration).
+# Idempotent: skipped if the operator queued a manual --runtime-config
+# smtp=... override (BYO or migration), or if the tenant already has a
+# relay row (reapply / reactivate — password rotation is an explicit
+# ops action via mail-relay-ctl reset-tenant).
 phase_mail_relay() {
-    log_info "phase 8b: mail-relay tenant registration..."
+    log_info "phase 8b: mail-relay local registration (upstream decoupled)..."
 
-    # Operator override: skip auto SMTP if a manual smtp override was passed.
     local entry
     for entry in "${RUNTIME_CONFIG_OVERRIDES[@]+"${RUNTIME_CONFIG_OVERRIDES[@]}"}"; do
         if [[ "$entry" == *:smtp=* ]]; then
@@ -770,97 +770,25 @@ phase_mail_relay() {
         return 0
     fi
 
-    # Decide whether we're creating this tenant on the relay or retrying
-    # a previously-failed Scaleway registration. We probe the current
-    # mail_status via `mail-relay-ctl show`; empty output means no row.
-    local existing_status password
-    existing_status=$(mail-relay-ctl.sh show "$TENANT_ID" 2>/dev/null \
-        | awk -v t="$TENANT_ID" '$1==t {print $2; exit}' || true)
+    # Idempotent: `create` errors out if the row already exists. We treat
+    # "already exists" as success and continue to seed the runtimeConfig
+    # (in case the caller cleared it manually) — but skip password
+    # generation since we can't recover it.
+    local relay_creds password
+    if relay_creds=$(mail-relay-ctl.sh create "$TENANT_ID" 2>/dev/null); then
+        password=$(printf '%s' "$relay_creds" | cut -f2)
+        txn_register_undo "mail-relay row for ${TENANT_ID}" \
+            "mail-relay-ctl.sh delete '${TENANT_ID}' 2>/dev/null || true"
+    else
+        log_info "mail-relay: '${TENANT_ID}' already has a relay row — skipping (use reset-tenant to rotate password)"
+        return 0
+    fi
 
-    case "$existing_status" in
-        "")
-            # New tenant → create relay row.
-            local relay_creds
-            relay_creds=$(mail-relay-ctl.sh create "$TENANT_ID") || {
-                log_warn "mail-relay: mail-relay-ctl create failed — leaving tenant without SMTP"
-                return 0
-            }
-            password=$(printf '%s' "$relay_creds" | cut -f2)
-            txn_register_undo "mail-relay row for ${TENANT_ID}" \
-                "mail-relay-ctl.sh delete '${TENANT_ID}' 2>/dev/null || true"
-            ;;
-        active)
-            log_info "mail-relay: '${TENANT_ID}' already active — skipping"
-            return 0
-            ;;
-        pending|failed)
-            # Retry path (called from the timer or an operator via
-            # `add-tenant.sh <tid>`). The relay row exists but its
-            # bcrypt-only password can't be recovered — so we rotate,
-            # and re-seed runtimeConfig.smtp with the new password.
-            log_info "mail-relay: '${TENANT_ID}' status=${existing_status} — rotating password + retrying Scaleway"
-            local relay_creds
-            relay_creds=$(mail-relay-ctl.sh reset-tenant "$TENANT_ID") || {
-                log_warn "mail-relay: reset-tenant failed — leaving mail_status=${existing_status}"
-                return 0
-            }
-            password=$(printf '%s' "$relay_creds" | cut -f2)
-            ;;
-        *)
-            log_warn "mail-relay: '${TENANT_ID}' has unexpected status '${existing_status}' — skipping"
-            return 0
-            ;;
-    esac
-
-    # Step 2: Scaleway TEM domain declaration.
+    # Compose SMTP config and append to the generic runtimeConfig
+    # overrides array. apply_runtime_config_overrides() at
+    # phase_bebop_service writes it via mongo_runtime_config_upsert
+    # (commit 8242d54's generic mechanism — nothing smtp-specific).
     local subdomain="${TENANT_ID}.${OVH_DNS_ZONE}"
-    local domain_id
-    if ! domain_id=$(scaleway_tem_domain_create "$subdomain" 2>/dev/null); then
-        log_warn "mail-relay: Scaleway TEM registration failed for '${subdomain}' → mail_status=pending"
-        mail-relay-ctl.sh set-status "$TENANT_ID" pending || true
-        notify_failure \
-            "[be-BOP tooling] mail-relay: '${TENANT_ID}' pending Scaleway registration" \
-            "Provisioning of tenant '${TENANT_ID}' completed except Scaleway TEM domain declaration. The relay row is created but mail_status=pending. Retry via: mail-relay-ctl.sh retry-scaleway '${TENANT_ID}'."
-        return 0
-    fi
-
-    # Step 3: poll for the DKIM public key. Scaleway sometimes provisions
-    # it a few seconds after the create call — retry a handful of times
-    # before giving up.
-    local dkim_key attempt=0
-    while (( attempt < 5 )); do
-        dkim_key=$(scaleway_tem_domain_dkim_public_key "$domain_id" 2>/dev/null || true)
-        [[ -n "$dkim_key" ]] && break
-        sleep 3
-        (( ++attempt ))
-    done
-    if [[ -z "$dkim_key" ]]; then
-        log_warn "mail-relay: DKIM public key not populated within 15s → mail_status=pending"
-        mail-relay-ctl.sh set-status "$TENANT_ID" pending || true
-        notify_failure \
-            "[be-BOP tooling] mail-relay: '${TENANT_ID}' pending — Scaleway DKIM not ready" \
-            "Domain '${subdomain}' registered at Scaleway but the DKIM key wasn't populated yet. Retry via: mail-relay-ctl.sh retry-scaleway '${TENANT_ID}'."
-        return 0
-    fi
-
-    # Step 4: post SPF / DKIM / DMARC records in the OVH zone.
-    local spf="v=spf1 include:_spf.tem.scaleway.com -all"
-    local dkim_txt="v=DKIM1; k=rsa; p=${dkim_key}"
-    local dmarc="v=DMARC1; p=quarantine"
-    ovh_dns_record_create "$TENANT_ID" TXT "$spf" 300 >/dev/null
-    ovh_dns_record_create "scw._domainkey.${TENANT_ID}" TXT "$dkim_txt" 300 >/dev/null
-    ovh_dns_record_create "_dmarc.${TENANT_ID}" TXT "$dmarc" 300 >/dev/null
-    ovh_dns_zone_refresh
-    txn_register_undo "mail DNS records for ${TENANT_ID}" \
-        "ovh_dns_record_delete \"\$(ovh_dns_record_find '${TENANT_ID}' TXT)\" 2>/dev/null || true; \
-         ovh_dns_record_delete \"\$(ovh_dns_record_find 'scw._domainkey.${TENANT_ID}' TXT)\" 2>/dev/null || true; \
-         ovh_dns_record_delete \"\$(ovh_dns_record_find '_dmarc.${TENANT_ID}' TXT)\" 2>/dev/null || true"
-
-    # Step 5: compose and queue the runtimeConfig.smtp override. The
-    # apply_runtime_config_overrides() call at phase_bebop_service will
-    # write this to the tenant's mongo runtimeConfig via
-    # mongo_runtime_config_upsert (from commit 8242d54 — the generic
-    # seed mechanism, not smtp-specific).
     local smtp_value
     smtp_value=$(jq -nc \
         --arg host "127.0.0.1" \
@@ -871,9 +799,7 @@ phase_mail_relay() {
         --argjson fake false \
         '{host: $host, port: $port, user: $user, password: $pass, from: $from, fake: $fake}')
     RUNTIME_CONFIG_OVERRIDES+=("false:smtp=${smtp_value}")
-
-    mail-relay-ctl.sh set-status "$TENANT_ID" active || true
-    log_info "mail-relay: '${TENANT_ID}' registered at Scaleway (id=${domain_id}) + relay + runtimeConfig seed queued"
+    log_info "mail-relay: '${TENANT_ID}' relay row + runtimeConfig.smtp queued (upstream declaration deferred to timer)"
 }
 
 # Phase 9: per-tenant config.env

@@ -21,13 +21,22 @@
 #   set-quota <tenant_id> <window>=<hard>[,<soft>]  [<window>=<hard>[,<soft>]]...
 #                                    override quotas for one tenant; NULL
 #                                    to reset to daemon defaults
-#   set-status <tenant_id> <status>  active | pending | failed | disabled
+#   set-status <tenant_id> <status>  active | disabled
+#   set-upstream-id <tenant_id> <domain_id>|-
+#                                    stamp (or clear with "-") the tenant's
+#                                    upstream provider domain id. A NULL id
+#                                    is the flag the retry-upstream sweep
+#                                    looks for.
 #   reset-tenant <tenant_id>        rotate password (rare — compromise
 #                                    recovery); prints new password on stdout
 #   prune-send-log [--older-than-days=90]
 #                                    delete send_log rows past retention
-#   retry-scaleway <tenant_id|--all>  hook for the milestone-6 retry loop.
-#                                    In this milestone: log-only stub.
+#   retry-upstream <tenant_id|--all>  declare the tenant's sending domain
+#                                    upstream (via lib/scaleway.sh's
+#                                    adapter, which exposes a
+#                                    provider-agnostic mail_upstream_* API).
+#                                    Silent no-op if the operator hasn't
+#                                    provided upstream credentials yet.
 
 set -eEuo pipefail
 
@@ -69,10 +78,11 @@ Usage:
   mail-relay-ctl set-quota <tenant_id> <window>=<hard>[,<soft>] [<window>=<hard>[,<soft>]]...
       <window> ∈ { 10min, 24h, month }
       <hard>, <soft> integers; use "-" to reset to daemon defaults
-  mail-relay-ctl set-status <tenant_id> {active|pending|failed|disabled}
+  mail-relay-ctl set-status <tenant_id> {active|disabled}
+  mail-relay-ctl set-upstream-id <tenant_id> <domain_id>|-
   mail-relay-ctl reset-tenant <tenant_id>
   mail-relay-ctl prune-send-log [--older-than-days=90]
-  mail-relay-ctl retry-scaleway <tenant_id>|--all
+  mail-relay-ctl retry-upstream <tenant_id>|--all
   mail-relay-ctl -h | --help
 EOF
 }
@@ -150,7 +160,10 @@ cmd_list() {
     local status_filter=""
     [[ "${1:-}" != "--all" ]] && status_filter="WHERE mail_status='active'"
     _sq -header -column \
-        "SELECT tenant_id, mail_status, created_at FROM tenants ${status_filter} ORDER BY tenant_id;"
+        "SELECT tenant_id, mail_status, \
+                CASE WHEN upstream_domain_id IS NULL THEN 'no' ELSE 'yes' END AS upstream_declared, \
+                created_at \
+         FROM tenants ${status_filter} ORDER BY tenant_id;"
 }
 
 cmd_show() {
@@ -159,7 +172,7 @@ cmd_show() {
     local q="$(_sqlq "$tenant_id")"
     echo "== Tenant row =="
     _sq -header -column \
-        "SELECT tenant_id, mail_status, hard_cap_10min, hard_cap_24h, hard_cap_month, soft_alert_10min, soft_alert_24h, soft_alert_month, created_at FROM tenants WHERE tenant_id='${q}';"
+        "SELECT tenant_id, mail_status, upstream_domain_id, hard_cap_10min, hard_cap_24h, hard_cap_month, soft_alert_10min, soft_alert_24h, soft_alert_month, created_at FROM tenants WHERE tenant_id='${q}';"
     echo
     echo "== Send counters (accepted only) =="
     _sq -header -column "
@@ -230,11 +243,25 @@ cmd_set_status() {
     local status="${2:-}"
     _check_tenant_id "$tenant_id"
     case "$status" in
-        active|pending|failed|disabled) ;;
-        *) die "status must be one of: active | pending | failed | disabled" ;;
+        active|disabled) ;;
+        *) die "status must be one of: active | disabled" ;;
     esac
     _sq "UPDATE tenants SET mail_status='$(_sqlq "$status")' WHERE tenant_id='$(_sqlq "$tenant_id")';"
     log_info "tenant '${tenant_id}' status → ${status}"
+}
+
+cmd_set_upstream_id() {
+    local tenant_id="${1:-}"
+    local domain_id="${2:-}"
+    _check_tenant_id "$tenant_id"
+    [[ -z "$domain_id" ]] && die "set-upstream-id needs a domain id (or '-' to clear)"
+    if [[ "$domain_id" == "-" ]]; then
+        _sq "UPDATE tenants SET upstream_domain_id=NULL WHERE tenant_id='$(_sqlq "$tenant_id")';"
+        log_info "tenant '${tenant_id}' upstream_domain_id → NULL"
+    else
+        _sq "UPDATE tenants SET upstream_domain_id='$(_sqlq "$domain_id")' WHERE tenant_id='$(_sqlq "$tenant_id")';"
+        log_info "tenant '${tenant_id}' upstream_domain_id → ${domain_id}"
+    fi
 }
 
 cmd_reset_tenant() {
@@ -266,44 +293,64 @@ cmd_prune_send_log() {
     log_info "prune-send-log: deleted ${deleted} row(s) older than ${days} days"
 }
 
-cmd_retry_scaleway() {
-    # Delegates the actual reprovisioning work to add-tenant.sh in reapply
-    # mode. Reasons:
-    #   - phase_mail_relay is state-aware (detects pending / failed rows and
-    #     rotates the password + retries Scaleway), so the reapply is a
-    #     natural retry.
-    #   - Idempotent: any tenant already in mail_status=active is a fast
-    #     no-op via the "already active — skipping" branch.
-    #   - Restarts bebop@<tenant> at the end so a freshly seeded
-    #     runtimeConfig.smtp is picked up immediately.
+cmd_retry_upstream() {
+    # Declares each pending tenant's sending domain against the upstream
+    # provider (Scaleway TEM in V1, whatever else later). The provider
+    # specifics live inside lib/scaleway.sh — the adapter exposes a
+    # provider-agnostic mail_upstream_* surface (is_configured,
+    # setup_domain, teardown_domain). This function knows only that
+    # surface.
+    #
+    # Silent no-op if the operator hasn't set up an upstream yet — the
+    # fake SMTP works standalone, and this sweep runs every 15 min via
+    # bebop-mail-relay-upstream-sync.timer so provisioned tenants get
+    # upstream declared as soon as credentials appear in secrets.env.
     local target="${1:-}"
-    [[ -z "$target" ]] && { usage; die "retry-scaleway needs a tenant_id or --all"; }
+    [[ -z "$target" ]] && { usage; die "retry-upstream needs a tenant_id or --all"; }
+
+    # Source the current upstream adapter + OVH (for DNS record posting).
+    # shellcheck source=lib/scaleway.sh
+    source "${BEBOP_TOOLING_LIB_DIR}/scaleway.sh"
+    # shellcheck source=lib/ovh.sh
+    source "${BEBOP_TOOLING_LIB_DIR}/ovh.sh"
+
+    if ! mail_upstream_is_configured; then
+        log_debug "retry-upstream: no upstream provider configured — noop"
+        return 0
+    fi
+    [[ -z "${OVH_DNS_ZONE:-}" ]] && die "retry-upstream: OVH_DNS_ZONE unset — cannot compose sending domains"
+
     if [[ "$target" == "--all" ]]; then
         local ids
-        ids=$(_sq "SELECT tenant_id FROM tenants WHERE mail_status IN ('pending', 'failed') ORDER BY tenant_id;")
+        ids=$(_sq "SELECT tenant_id FROM tenants WHERE upstream_domain_id IS NULL AND mail_status='active' ORDER BY tenant_id;")
         if [[ -z "$ids" ]]; then
-            log_info "retry-scaleway --all: no tenants in pending/failed state"
+            log_debug "retry-upstream --all: no tenants pending upstream declaration"
             return 0
         fi
         local id
         while IFS= read -r id; do
             [[ -z "$id" ]] && continue
-            log_info "retry-scaleway: dispatching add-tenant.sh for '${id}'"
-            if command -v add-tenant.sh >/dev/null 2>&1; then
-                add-tenant.sh "$id" --non-interactive \
-                    || log_warn "retry-scaleway: add-tenant.sh '${id}' exited non-zero"
-            else
-                log_warn "retry-scaleway: add-tenant.sh not on PATH — cannot retry '${id}'"
-            fi
+            _do_upstream_setup "$id"
         done <<< "$ids"
         return 0
     fi
     _check_tenant_id "$target"
-    log_info "retry-scaleway: dispatching add-tenant.sh for '${target}'"
-    if ! command -v add-tenant.sh >/dev/null 2>&1; then
-        die "retry-scaleway: add-tenant.sh not on PATH"
+    _do_upstream_setup "$target"
+}
+
+# Runs one tenant through the upstream setup. Non-fatal on failure — the
+# timer will retry next tick. Returns 0 on success, non-zero otherwise.
+_do_upstream_setup() {
+    local tid="$1"
+    local full_domain="${tid}.${OVH_DNS_ZONE}"
+    log_info "retry-upstream: declaring '${full_domain}' upstream..."
+    local domain_id
+    if ! domain_id=$(mail_upstream_setup_domain "$tid" "$full_domain"); then
+        log_warn "retry-upstream: setup failed for '${tid}' — will retry"
+        return 1
     fi
-    add-tenant.sh "$target" --non-interactive
+    _sq "UPDATE tenants SET upstream_domain_id='$(_sqlq "$domain_id")' WHERE tenant_id='$(_sqlq "$tid")';"
+    log_info "retry-upstream: '${tid}' declared (id=${domain_id})"
 }
 
 main() {
@@ -320,7 +367,7 @@ main() {
         set-status)      cmd_set_status "$@" ;;
         reset-tenant)    cmd_reset_tenant "$@" ;;
         prune-send-log)  cmd_prune_send_log "$@" ;;
-        retry-scaleway)  cmd_retry_scaleway "$@" ;;
+        retry-upstream)  cmd_retry_upstream "$@" ;;
         -h|--help|help)  usage ;;
         *) usage; die "unknown command: $cmd" ;;
     esac

@@ -6,7 +6,7 @@
 # next boot instead of waiting for the next scheduled tick.
 
 [Unit]
-Description=Periodic Scaleway retry sweep for the mail-relay
+Description=Periodic upstream declaration sweep for the mail-relay
 Documentation=https://be-bop.io/
 
 [Timer]

@@ -6,7 +6,7 @@
 #
 # Milestones covered by this file:
 #   1. AUTH LOGIN/PLAIN + SQLite state (tenants / send_log / alert_state)
-#   3. Sync forwarding to the upstream transactional provider (Scaleway TEM
+#   3. Sync forwarding to the upstream transactional provider (the transactional provider
 #      by config; provider-agnostic by design), retry policy 5s / 15s / 30s
 #      on 4xx or connection errors, 5xx propagated directly to be-BOP.
 #
@@ -93,7 +93,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
 
-# --- Upstream provider (Scaleway TEM by config) ----------------------------
+# --- Upstream provider (the transactional provider by config) ----------------------------
 
 UPSTREAM_HOST = os.environ.get("MAIL_RELAY_UPSTREAM_HOST", "").strip()
 UPSTREAM_PORT = int(os.environ.get("MAIL_RELAY_UPSTREAM_PORT", "587"))
@@ -115,9 +115,9 @@ RETRY_BACKOFFS = (5, 15, 30)  # attempts 2, 3, and 4 wait these before firing
 # --- Quotas & alerting -----------------------------------------------------
 
 # Default caps per tenant. Overridable per-tenant via mail-relay-ctl set-quota.
-# Rationale: 2€/tenant/month Scaleway ceiling (8000 mails at Essential
-# pay-as-you-go) is the true budget guard; 10min/24h are anti-burst and
-# anti-slow-burst nets around that.
+# Rationale: 2€/tenant/month upstream provider budget ceiling (8000
+# mails at the pay-as-you-go rate we target) is the true budget guard;
+# 10min/24h are anti-burst and anti-slow-burst nets around that.
 DEFAULT_HARD_CAP_10MIN = 100
 DEFAULT_SOFT_ALERT_10MIN = 50
 DEFAULT_HARD_CAP_24H = 500
@@ -179,17 +179,30 @@ ZULIP_CONFIGURED = bool(ZULIP_SITE and ZULIP_BOT_EMAIL and ZULIP_BOT_API_KEY and
 # daemon falls back to the compiled-in defaults below.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS tenants (
-    tenant_id       TEXT PRIMARY KEY,
-    pass_hash       TEXT NOT NULL,
-    hard_cap_10min  INTEGER,
-    hard_cap_24h    INTEGER,
-    hard_cap_month  INTEGER,
-    soft_alert_10min INTEGER,
-    soft_alert_24h  INTEGER,
-    soft_alert_month INTEGER,
-    mail_status     TEXT NOT NULL DEFAULT 'active',
-    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+    tenant_id           TEXT PRIMARY KEY,
+    pass_hash           TEXT NOT NULL,
+    hard_cap_10min      INTEGER,
+    hard_cap_24h        INTEGER,
+    hard_cap_month      INTEGER,
+    soft_alert_10min    INTEGER,
+    soft_alert_24h      INTEGER,
+    soft_alert_month    INTEGER,
+    mail_status         TEXT NOT NULL DEFAULT 'active',
+    -- Upstream provider's domain id, once registration succeeds. NULL
+    -- means "not yet declared upstream" — the tenant is fully operational
+    -- against THIS relay (accepts AUTH, records sends, forwards if the
+    -- upstream SMTP is configured), and the retry timer will attempt the
+    -- upstream declaration in the background. Decoupling the two states
+    -- means a tenant provisioned before upstream credentials exist still
+    -- gets a working SMTP config out of the box.
+    upstream_domain_id  TEXT,
+    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
+
+-- Migration for state.db files created before upstream_domain_id existed.
+-- SQLite is happy re-running ALTER TABLE against an already-present column
+-- provided we ignore the "duplicate column" error.
+
 
 CREATE TABLE IF NOT EXISTS send_log (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -197,7 +210,7 @@ CREATE TABLE IF NOT EXISTS send_log (
     sent_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     recipient   TEXT NOT NULL,
     size_bytes  INTEGER NOT NULL DEFAULT 0,
-    status      TEXT NOT NULL,       -- accepted | rejected-quota | rejected-scaleway
+    status      TEXT NOT NULL,       -- accepted | rejected-quota | rejected-upstream
     FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
 );
 
@@ -236,6 +249,14 @@ def db_conn():
 def init_schema() -> None:
     with db_conn() as conn:
         conn.executescript(SCHEMA)
+        # In-place migration for existing state.db files. IF NOT EXISTS
+        # isn't supported by ALTER TABLE in SQLite < 3.35, so we brute-
+        # force via try/except and swallow "duplicate column name".
+        try:
+            conn.execute("ALTER TABLE tenants ADD COLUMN upstream_domain_id TEXT")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc):
+                raise
     LOG.info("state db ready at %s", DB_PATH)
 
 
@@ -604,7 +625,7 @@ async def forward_with_retry(envelope) -> UpstreamResult:
 
 class RelayHandler:
     """Accepts messages after AUTH, forwards synchronously to the upstream
-    provider (Scaleway TEM in V1), logs the outcome per recipient in
+    provider (the transactional provider in V1), logs the outcome per recipient in
     send_log. If MAIL_RELAY_UPSTREAM_* is not configured (empty in
     secrets.env), the handler runs in log-only mode: sends are accepted
     and recorded but not forwarded, useful for pre-provider dev."""

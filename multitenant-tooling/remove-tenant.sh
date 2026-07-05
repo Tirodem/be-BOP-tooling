@@ -186,11 +186,15 @@ is_external_tenant() {
     [[ -n "$DOMAIN" && "$DOMAIN" != "${TENANT_ID}.${ZONE}" ]]
 }
 
-# Drop the tenant's mail-relay footprint: SQLite row (creds + send_log +
-# alert_state via mail-relay-ctl delete) plus the Scaleway TEM sending
-# domain (lookup + delete). Also clears the OVH TXT records
-# (SPF/DKIM/DMARC) posted at signup. All steps are best-effort — we
-# never want a partial cleanup to block a purge from completing.
+# Drop the tenant's mail-relay footprint. Two independent pieces:
+#   1. Local SQLite row (creds + send_log + alert_state) via
+#      mail-relay-ctl delete.
+#   2. Upstream provider footprint (domain declaration + our DNS records
+#      pointing at it) via lib/scaleway.sh's provider-agnostic
+#      mail_upstream_teardown_domain — noop if no upstream is configured
+#      or if this is an external-domain tenant (DNS lives elsewhere).
+# All steps are best-effort — we never want a partial cleanup to block a
+# purge from completing.
 drop_mail_relay_resources() {
     log_info "dropping mail-relay resources for ${TENANT_ID}..."
     if command -v mail-relay-ctl.sh >/dev/null 2>&1; then
@@ -199,25 +203,8 @@ drop_mail_relay_resources() {
     else
         log_debug "drop_mail_relay: mail-relay-ctl.sh not on PATH, skipping SQLite cleanup"
     fi
-    # Scaleway TEM domain (soft failure — if the API is unreachable, we
-    # log and move on; a stale entry costs nothing on Scaleway's side).
-    if [[ -n "${SCALEWAY_TEM_API_KEY:-}" && -n "${SCALEWAY_TEM_PROJECT_ID:-}" ]]; then
-        local subdomain="${TENANT_ID}.${OVH_DNS_ZONE:-}"
-        local domain_id
-        domain_id=$(scaleway_tem_domain_find "$subdomain" 2>/dev/null || true)
-        if [[ -n "$domain_id" ]]; then
-            scaleway_tem_domain_delete "$domain_id" \
-                || log_warn "drop_mail_relay: scaleway domain delete failed for '${subdomain}'"
-        fi
-    fi
-    # OVH TXT records for SPF / DKIM / DMARC. is_external_tenant tenants
-    # never had these (their DNS lives elsewhere), so skip them.
     if ! is_external_tenant && [[ -n "${OVH_DNS_ZONE:-}" ]]; then
-        local id
-        for host in "$TENANT_ID" "scw._domainkey.${TENANT_ID}" "_dmarc.${TENANT_ID}"; do
-            id=$(ovh_dns_record_find "$host" TXT 2>/dev/null || true)
-            [[ -n "$id" ]] && ovh_dns_record_delete "$id" 2>/dev/null || true
-        done
+        mail_upstream_teardown_domain "$TENANT_ID" "${TENANT_ID}.${OVH_DNS_ZONE}"
     fi
 }
 

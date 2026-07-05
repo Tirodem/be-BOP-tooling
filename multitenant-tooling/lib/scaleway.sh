@@ -174,3 +174,90 @@ scaleway_tem_domain_delete() {
     log_warn "scaleway: delete of id=${id} failed (rc=${rc}); leaving to next reconcile"
     return "$rc"
 }
+
+# === Provider-agnostic surface ==========================================
+#
+# The rest of the tooling talks to `mail_upstream_*` only. Everything below
+# is what a hypothetical second provider (Mailgun, Postmark…) would need to
+# reimplement in its own adapter lib. The names, argument order and stdout
+# format below are the contract; the Scaleway-specific implementation is
+# above.
+
+# mail_upstream_is_configured
+# Return 0 iff the upstream adapter has the credentials it needs to talk
+# to its provider. Callers (retry-upstream, remove-tenant) use this to
+# noop silently when the operator hasn't set up an upstream yet — the
+# fake SMTP itself works standalone.
+mail_upstream_is_configured() {
+    [[ -n "${SCALEWAY_TEM_API_KEY:-}" && -n "${SCALEWAY_TEM_PROJECT_ID:-}" ]]
+}
+
+# mail_upstream_setup_domain <tenant_subdomain_label> <full_domain>
+#
+# End-to-end registration for one tenant's sending domain:
+#   1. Register the domain with the upstream provider.
+#   2. Wait for DKIM material to be available.
+#   3. Post SPF / DKIM / DMARC records in our DNS zone via lib/ovh.sh
+#      (the caller must have sourced lib/ovh.sh and OVH_DNS_ZONE must
+#      match the parent zone of <full_domain>).
+#
+# Prints the upstream provider's internal domain id on stdout on success —
+# the caller stores it via `mail-relay-ctl set-upstream-id`. Returns
+# non-zero on any failure with a WARN log; callers treat this as
+# "not this tick" and the retry timer picks it up next round.
+mail_upstream_setup_domain() {
+    local subdomain_label="$1" full_domain="$2"
+    [[ -z "$subdomain_label" || -z "$full_domain" ]] \
+        && { log_error "mail_upstream_setup_domain: both args required"; return 2; }
+    local domain_id
+    if ! domain_id=$(scaleway_tem_domain_create "$full_domain" 2>/dev/null); then
+        log_warn "mail_upstream_setup_domain: provider registration failed for '${full_domain}'"
+        return 1
+    fi
+    # DKIM key is populated by the provider a few seconds after creation.
+    local dkim_key attempt=0
+    while (( attempt < 5 )); do
+        dkim_key=$(scaleway_tem_domain_dkim_public_key "$domain_id" 2>/dev/null || true)
+        [[ -n "$dkim_key" ]] && break
+        sleep 3
+        (( ++attempt ))
+    done
+    if [[ -z "$dkim_key" ]]; then
+        log_warn "mail_upstream_setup_domain: DKIM key not populated for '${full_domain}' — will retry"
+        return 1
+    fi
+    # DNS records. The SPF include and DKIM selector are provider-specific;
+    # they live here so nothing else in the tooling needs to know.
+    ovh_dns_record_create "$subdomain_label" TXT \
+        "v=spf1 include:_spf.tem.scaleway.com -all" 300 >/dev/null
+    ovh_dns_record_create "scw._domainkey.${subdomain_label}" TXT \
+        "v=DKIM1; k=rsa; p=${dkim_key}" 300 >/dev/null
+    ovh_dns_record_create "_dmarc.${subdomain_label}" TXT \
+        "v=DMARC1; p=quarantine" 300 >/dev/null
+    ovh_dns_zone_refresh
+    printf '%s\n' "$domain_id"
+}
+
+# mail_upstream_teardown_domain <tenant_subdomain_label> <full_domain>
+#
+# Reverse of mail_upstream_setup_domain: drop the provider-side domain
+# and remove the DNS records we posted. Best-effort — a stale entry on
+# the provider side costs nothing and shouldn't block the local purge.
+mail_upstream_teardown_domain() {
+    local subdomain_label="$1" full_domain="$2"
+    [[ -z "$subdomain_label" || -z "$full_domain" ]] \
+        && { log_warn "mail_upstream_teardown_domain: skipping (empty args)"; return 0; }
+    if mail_upstream_is_configured; then
+        local domain_id
+        domain_id=$(scaleway_tem_domain_find "$full_domain" 2>/dev/null || true)
+        if [[ -n "$domain_id" ]]; then
+            scaleway_tem_domain_delete "$domain_id" \
+                || log_warn "mail_upstream_teardown_domain: provider delete failed for '${full_domain}'"
+        fi
+    fi
+    local host id
+    for host in "$subdomain_label" "scw._domainkey.${subdomain_label}" "_dmarc.${subdomain_label}"; do
+        id=$(ovh_dns_record_find "$host" TXT 2>/dev/null || true)
+        [[ -n "$id" ]] && ovh_dns_record_delete "$id" 2>/dev/null || true
+    done
+}
