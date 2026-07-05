@@ -267,10 +267,43 @@ cmd_prune_send_log() {
 }
 
 cmd_retry_scaleway() {
-    # Milestone 6 will replace this stub with the actual Scaleway registration
-    # retry (reads registry, filters mail_status='pending', calls lib/scaleway.sh).
-    log_info "retry-scaleway: milestone-6 stub — will be implemented alongside the timer/trigger"
-    return 0
+    # Delegates the actual reprovisioning work to add-tenant.sh in reapply
+    # mode. Reasons:
+    #   - phase_mail_relay is state-aware (detects pending / failed rows and
+    #     rotates the password + retries Scaleway), so the reapply is a
+    #     natural retry.
+    #   - Idempotent: any tenant already in mail_status=active is a fast
+    #     no-op via the "already active — skipping" branch.
+    #   - Restarts bebop@<tenant> at the end so a freshly seeded
+    #     runtimeConfig.smtp is picked up immediately.
+    local target="${1:-}"
+    [[ -z "$target" ]] && { usage; die "retry-scaleway needs a tenant_id or --all"; }
+    if [[ "$target" == "--all" ]]; then
+        local ids
+        ids=$(_sq "SELECT tenant_id FROM tenants WHERE mail_status IN ('pending', 'failed') ORDER BY tenant_id;")
+        if [[ -z "$ids" ]]; then
+            log_info "retry-scaleway --all: no tenants in pending/failed state"
+            return 0
+        fi
+        local id
+        while IFS= read -r id; do
+            [[ -z "$id" ]] && continue
+            log_info "retry-scaleway: dispatching add-tenant.sh for '${id}'"
+            if command -v add-tenant.sh >/dev/null 2>&1; then
+                add-tenant.sh "$id" --non-interactive \
+                    || log_warn "retry-scaleway: add-tenant.sh '${id}' exited non-zero"
+            else
+                log_warn "retry-scaleway: add-tenant.sh not on PATH — cannot retry '${id}'"
+            fi
+        done <<< "$ids"
+        return 0
+    fi
+    _check_tenant_id "$target"
+    log_info "retry-scaleway: dispatching add-tenant.sh for '${target}'"
+    if ! command -v add-tenant.sh >/dev/null 2>&1; then
+        die "retry-scaleway: add-tenant.sh not on PATH"
+    fi
+    add-tenant.sh "$target" --non-interactive
 }
 
 main() {

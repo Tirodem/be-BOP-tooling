@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# Periodic sweep that retries Scaleway TEM domain declarations for tenants
+# whose provisioning failed at signup (mail_status = pending / failed in
+# the mail-relay SQLite). Fires the retry via mail-relay-ctl, which in
+# turn dispatches add-tenant.sh in reapply mode for each affected tenant.
+
+[Unit]
+Description=be-BOP — mail-relay Scaleway retry sweep
+Documentation=https://be-bop.io/
+After=network-online.target bebop-mail-relay.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/be-BOP-tooling/secrets.env
+ExecStart=/usr/local/bin/mail-relay-ctl.sh retry-scaleway --all
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bebop-mail-relay-retry

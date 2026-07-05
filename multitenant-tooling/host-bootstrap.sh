@@ -1280,16 +1280,22 @@ step_setup_test_tenant_deploy_api() {
 # in V1). Idempotent — safe to re-run on updates.
 step_setup_mail_relay() {
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[dry-run] would install bebop-mail-relay systemd unit"
+        log_info "[dry-run] would install bebop-mail-relay + retry timer systemd units"
         return 0
     fi
     log_info "Installing bebop-mail-relay systemd unit..."
-    run_privileged install -m 0644 \
-        "${BEBOP_TOOLING_TEMPLATE_DIR}/bebop-mail-relay.service" \
-        /etc/systemd/system/bebop-mail-relay.service
+    local u
+    for u in bebop-mail-relay.service \
+             bebop-mail-relay-retry.service \
+             bebop-mail-relay-retry.timer; do
+        run_privileged install -m 0644 \
+            "${BEBOP_TOOLING_TEMPLATE_DIR}/${u}" "/etc/systemd/system/${u}"
+    done
     run_privileged systemctl daemon-reload
     run_privileged systemctl enable --now bebop-mail-relay.service
+    run_privileged systemctl enable --now bebop-mail-relay-retry.timer
     log_info "bebop-mail-relay listening on 127.0.0.1:2525"
+    log_info "bebop-mail-relay-retry sweeping every 15 minutes"
 }
 
 # === Summary ===========================================================

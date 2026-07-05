@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# Fires bebop-mail-relay-retry.service every 15 minutes. Persistent=true
+# means a missed run (VDS was down, service was masked) catches up on
+# next boot instead of waiting for the next scheduled tick.
+
+[Unit]
+Description=Periodic Scaleway retry sweep for the mail-relay
+Documentation=https://be-bop.io/
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+Persistent=true
+Unit=bebop-mail-relay-retry.service
+
+[Install]
+WantedBy=timers.target

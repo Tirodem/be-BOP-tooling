@@ -770,23 +770,47 @@ phase_mail_relay() {
         return 0
     fi
 
-    # Skip if tenant already has a relay row. Password rotation is an
-    # explicit ops action (`mail-relay-ctl reset-tenant`), never automatic.
-    if mail-relay-ctl.sh show "$TENANT_ID" 2>/dev/null | grep -qE "^\s*${TENANT_ID}\s"; then
-        log_info "mail-relay: tenant '${TENANT_ID}' already has a relay row — skipping"
-        return 0
-    fi
+    # Decide whether we're creating this tenant on the relay or retrying
+    # a previously-failed Scaleway registration. We probe the current
+    # mail_status via `mail-relay-ctl show`; empty output means no row.
+    local existing_status password
+    existing_status=$(mail-relay-ctl.sh show "$TENANT_ID" 2>/dev/null \
+        | awk -v t="$TENANT_ID" '$1==t {print $2; exit}' || true)
 
-    # Step 1: create relay row (starts as active, we downgrade to pending
-    # if Scaleway/DNS setup fails).
-    local relay_creds password
-    relay_creds=$(mail-relay-ctl.sh create "$TENANT_ID") || {
-        log_warn "mail-relay: mail-relay-ctl create failed — leaving tenant without SMTP"
-        return 0
-    }
-    password=$(printf '%s' "$relay_creds" | cut -f2)
-    txn_register_undo "mail-relay row for ${TENANT_ID}" \
-        "mail-relay-ctl.sh delete '${TENANT_ID}' 2>/dev/null || true"
+    case "$existing_status" in
+        "")
+            # New tenant → create relay row.
+            local relay_creds
+            relay_creds=$(mail-relay-ctl.sh create "$TENANT_ID") || {
+                log_warn "mail-relay: mail-relay-ctl create failed — leaving tenant without SMTP"
+                return 0
+            }
+            password=$(printf '%s' "$relay_creds" | cut -f2)
+            txn_register_undo "mail-relay row for ${TENANT_ID}" \
+                "mail-relay-ctl.sh delete '${TENANT_ID}' 2>/dev/null || true"
+            ;;
+        active)
+            log_info "mail-relay: '${TENANT_ID}' already active — skipping"
+            return 0
+            ;;
+        pending|failed)
+            # Retry path (called from the timer or an operator via
+            # `add-tenant.sh <tid>`). The relay row exists but its
+            # bcrypt-only password can't be recovered — so we rotate,
+            # and re-seed runtimeConfig.smtp with the new password.
+            log_info "mail-relay: '${TENANT_ID}' status=${existing_status} — rotating password + retrying Scaleway"
+            local relay_creds
+            relay_creds=$(mail-relay-ctl.sh reset-tenant "$TENANT_ID") || {
+                log_warn "mail-relay: reset-tenant failed — leaving mail_status=${existing_status}"
+                return 0
+            }
+            password=$(printf '%s' "$relay_creds" | cut -f2)
+            ;;
+        *)
+            log_warn "mail-relay: '${TENANT_ID}' has unexpected status '${existing_status}' — skipping"
+            return 0
+            ;;
+    esac
 
     # Step 2: Scaleway TEM domain declaration.
     local subdomain="${TENANT_ID}.${OVH_DNS_ZONE}"
