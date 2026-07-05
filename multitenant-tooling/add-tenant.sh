@@ -667,23 +667,43 @@ phase_garage() {
 # /etc/ trees that hold port.env / config.env.
 phase_directories() {
     log_info "phase 6: directory skeleton for tenant..."
-    # Refuse to create a fresh tenant on top of stale data. A leftover
-    # /var/lib/be-BOP-mongodb/<id> would let the "new" tenant inherit the
-    # previous merchant's DB — including their superadmin credentials —
-    # which is exactly the failure mode this guard exists to close.
-    # Operators purge the resid with `find-orphans.sh --purge <tid>` and
-    # re-run.
-    local residual
-    for residual in "/var/lib/be-BOP/${TENANT_ID}" \
-                    "/var/lib/be-BOP-mongodb/${TENANT_ID}" \
-                    "/var/lib/phoenixd/${TENANT_ID}" \
-                    "/etc/be-BOP/${TENANT_ID}" \
-                    "/etc/be-BOP-mongodb/${TENANT_ID}" \
-                    "/etc/phoenixd/${TENANT_ID}"; do
-        if run_privileged test -e "$residual"; then
-            die "phase_directories: residual '${residual}' exists — a previous purge left data behind. Clean with: sudo find-orphans.sh --purge ${TENANT_ID}"
+    # Auto-heal residual data from a previous incomplete purge. On the
+    # fresh path we know the registry says absent, so anything on disk
+    # is stale by definition. We call find-orphans.sh --purge <tid> --yes,
+    # which uses systemctl clean --what=state (handles the DynamicUser +
+    # StateDirectory pairs — both the public symlink and the private
+    # /var/lib/private/… target) plus explicit rm on the config dirs.
+    _has_residual() {
+        local r
+        for r in "/var/lib/be-BOP/${TENANT_ID}" \
+                 "/var/lib/be-BOP-mongodb/${TENANT_ID}" \
+                 "/var/lib/phoenixd/${TENANT_ID}" \
+                 "/var/lib/private/be-BOP/${TENANT_ID}" \
+                 "/var/lib/private/be-BOP-mongodb/${TENANT_ID}" \
+                 "/var/lib/private/phoenixd/${TENANT_ID}" \
+                 "/etc/be-BOP/${TENANT_ID}" \
+                 "/etc/be-BOP-mongodb/${TENANT_ID}" \
+                 "/etc/phoenixd/${TENANT_ID}"; do
+            run_privileged test -e "$r" && { echo "$r"; return 0; }
+        done
+        return 1
+    }
+    local first_residual
+    if first_residual=$(_has_residual); then
+        log_warn "phase_directories: residual data detected ('${first_residual}') — auto-purging via find-orphans.sh"
+        if command -v find-orphans.sh >/dev/null 2>&1; then
+            find-orphans.sh --purge "$TENANT_ID" --yes 2>&1 || true
+        else
+            log_warn "phase_directories: find-orphans.sh not on PATH — cannot auto-purge"
         fi
-    done
+        # Re-check. If a survivor persists after the auto-purge, the bug
+        # is deeper than stale StateDirectory (permissions, external mount,
+        # …) — die so an operator investigates.
+        if first_residual=$(_has_residual); then
+            die "phase_directories: '${first_residual}' still exists after find-orphans auto-purge — investigate manually"
+        fi
+        log_info "phase_directories: residual data cleaned"
+    fi
     run_privileged install -d -m 0755 "/var/lib/be-BOP/${TENANT_ID}"
     run_privileged install -d -m 0755 "/var/lib/be-BOP/${TENANT_ID}/releases"
     run_privileged install -d -m 0755 "/etc/be-BOP/${TENANT_ID}"

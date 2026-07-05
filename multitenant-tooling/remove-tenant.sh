@@ -242,21 +242,22 @@ has_local_s3_tenant() {
 # Stop and remove the per-tenant mongod instance + its data dir.
 # Used by archive/purge paths only — soft-delete just stops the unit.
 #
-# Belt-and-braces against the "purged tenant retains data" class of bug:
-#   1. stop_disable_unit (already fixed to use is-enabled / is-active)
-#   2. Verify mongod really let go: is-active must be false AND no process
-#      still listening on MONGO_PORT. If either holds, kill it.
-#   3. rm -rf the dirs.
-#   4. Verify the dirs are gone. If not, die — never report "purge complete"
-#      while data survives on disk.
+# The service uses DynamicUser=yes + StateDirectory=be-BOP-mongodb/%i,
+# so systemd stores actual data at /var/lib/private/be-BOP-mongodb/<tid>
+# with a symlink at /var/lib/be-BOP-mongodb/<tid>. A plain rm -rf on the
+# symlink leaves the private dir intact — which is how a purged tenant
+# ends up inheriting its predecessor's DB on recreation.
+#
+# We use systemctl clean --what=state (systemd's blessed primitive for
+# clearing a StateDirectory) plus explicit rm on both paths as belt-and-
+# suspenders, then verify both paths are gone before declaring success.
 drop_mongo_resources() {
     log_info "dropping local mongod for ${TENANT_ID} (port=${MONGO_PORT})..."
     stop_disable_unit "mongod@${TENANT_ID}.service"
     [[ "$DRY_RUN" == "true" ]] && return 0
 
-    # 2. Guarantee the process is really gone. systemctl might have said
-    # "OK" while an out-of-cgroup double-forked child still holds the
-    # dbPath. Look for pids on our port and SIGKILL any survivors.
+    # Kill any mongod process still bound to the port (systemctl can miss
+    # out-of-cgroup double-forked children).
     local pids
     pids=$( { run_privileged ss -H -tlnp "sport = :${MONGO_PORT}" 2>/dev/null \
         | grep -oP 'users:\(\("mongod",pid=\K[0-9]+' \
@@ -268,17 +269,22 @@ drop_mongo_resources() {
         sleep 1
     fi
 
-    # 3. Remove data + config dirs.
+    # systemd-blessed StateDirectory cleanup (handles /var/lib/private/…).
+    run_privileged systemctl clean --what=state "mongod@${TENANT_ID}.service" 2>/dev/null || true
+    # Belt-and-suspenders: explicit rm on both the symlink and the
+    # private target.
     run_privileged rm -rf \
         "/var/lib/be-BOP-mongodb/${TENANT_ID}" \
+        "/var/lib/private/be-BOP-mongodb/${TENANT_ID}" \
         "/etc/be-BOP-mongodb/${TENANT_ID}"
 
-    # 4. Refuse to declare success if anything survived.
+    # Refuse to declare success if any of the three paths survived.
     local survivor
     for survivor in "/var/lib/be-BOP-mongodb/${TENANT_ID}" \
+                    "/var/lib/private/be-BOP-mongodb/${TENANT_ID}" \
                     "/etc/be-BOP-mongodb/${TENANT_ID}"; do
         if run_privileged test -e "$survivor"; then
-            die "drop_mongo: '${survivor}' still exists after rm -rf — refusing to report purge complete"
+            die "drop_mongo: '${survivor}' still exists after cleanup — refusing to report purge complete"
         fi
     done
     log_info "mongod state purged for ${TENANT_ID}"
@@ -383,23 +389,30 @@ delete_certificate() {
 purge_local_filesystem() {
     log_info "removing tenant local filesystem..."
     phoenixd_kill_orphans "$PHOENIXD_PORT"
+    # bebop@ and phoenixd@ also use DynamicUser=yes + StateDirectory,
+    # so the real data lives at /var/lib/private/... behind a symlink
+    # under /var/lib/…. Use systemctl clean to erase both, then explicit
+    # rm as belt-and-suspenders.
+    run_privileged systemctl clean --what=state "bebop@${TENANT_ID}.service" 2>/dev/null || true
+    run_privileged systemctl clean --what=state "phoenixd@${TENANT_ID}.service" 2>/dev/null || true
     run_privileged rm -rf \
         "/var/lib/be-BOP/${TENANT_ID}" \
+        "/var/lib/private/be-BOP/${TENANT_ID}" \
         "/etc/be-BOP/${TENANT_ID}" \
         "/var/lib/phoenixd/${TENANT_ID}" \
+        "/var/lib/private/phoenixd/${TENANT_ID}" \
         "/etc/phoenixd/${TENANT_ID}"
-    # Post-rm verification. Any survivor here means a purge that reports
-    # "complete" while data lingers on disk — a real data-hygiene bug
-    # (verified: this is how a purged+recreated tenant could inherit its
-    # predecessor's superadmin). We refuse to declare success on such a
-    # state; the operator has to investigate.
+    # Verify all six paths are gone before returning. A survivor means
+    # the purge is incomplete — never report "complete" on a dirty state.
     local survivor
     for survivor in "/var/lib/be-BOP/${TENANT_ID}" \
+                    "/var/lib/private/be-BOP/${TENANT_ID}" \
                     "/etc/be-BOP/${TENANT_ID}" \
                     "/var/lib/phoenixd/${TENANT_ID}" \
+                    "/var/lib/private/phoenixd/${TENANT_ID}" \
                     "/etc/phoenixd/${TENANT_ID}"; do
         if run_privileged test -e "$survivor"; then
-            die "purge_local_filesystem: '${survivor}' still exists after rm -rf — refusing to report purge complete"
+            die "purge_local_filesystem: '${survivor}' still exists after cleanup — refusing to report purge complete"
         fi
     done
 }

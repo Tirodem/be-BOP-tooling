@@ -142,15 +142,22 @@ discover_systemd_ids() {
     done
 }
 
-# On-disk directories under /etc and /var/lib.
+# On-disk directories under /etc and /var/lib. We scan BOTH the public
+# StateDirectory symlink location (/var/lib/be-BOP-mongodb/…) AND the
+# actual private target (/var/lib/private/be-BOP-mongodb/…) — the second
+# path is where the data really lives when DynamicUser=yes is set on the
+# service, and a purge that only checks the public path can miss data
+# that survived a rm -rf on the symlink.
 discover_dir_ids() {
     local base
-    for base in /etc/be-BOP /var/lib/be-BOP /var/lib/be-BOP-mongodb; do
+    for base in /etc/be-BOP /etc/be-BOP-mongodb /etc/phoenixd \
+                /var/lib/be-BOP /var/lib/be-BOP-mongodb /var/lib/phoenixd \
+                /var/lib/private/be-BOP /var/lib/private/be-BOP-mongodb /var/lib/private/phoenixd; do
         run_privileged test -d "$base" || continue
         # `-mindepth 1 -maxdepth 1 -type d` — plain child dirs only.
-        # We keep entries that look like a tenant slug ([a-z0-9][a-z0-9-]*)
-        # so we don't flag `tenants.tsv` (a file) or `.tenants.tsv.lock`.
-        run_privileged find "$base" -mindepth 1 -maxdepth 1 -type d \
+        # Follow symlinks (-L) because /var/lib/be-BOP-mongodb/<tid> is
+        # itself a symlink managed by systemd's StateDirectory.
+        run_privileged find -L "$base" -mindepth 1 -maxdepth 1 -type d \
             -printf '%f\n' 2>/dev/null \
             | grep -E '^[a-z0-9][a-z0-9-]*$' || true
     done
@@ -220,7 +227,9 @@ _id_has_artefact() {
             return 0
         fi
     done
-    for d in "/etc/be-BOP/${id}" "/var/lib/be-BOP/${id}" "/var/lib/be-BOP-mongodb/${id}" \
+    for d in "/etc/be-BOP/${id}" "/etc/be-BOP-mongodb/${id}" "/etc/phoenixd/${id}" \
+             "/var/lib/be-BOP/${id}" "/var/lib/be-BOP-mongodb/${id}" "/var/lib/phoenixd/${id}" \
+             "/var/lib/private/be-BOP/${id}" "/var/lib/private/be-BOP-mongodb/${id}" "/var/lib/private/phoenixd/${id}" \
              "/etc/nginx/sites-available/bebop-${id}.conf" \
              "/etc/nginx/sites-enabled/bebop-${id}.conf" \
              "/etc/letsencrypt/live/bebop-${id}" \
@@ -280,8 +289,10 @@ _report_one() {
     done
 
     local d
-    for d in "/etc/be-BOP/${id}" "/var/lib/be-BOP/${id}" "/var/lib/be-BOP-mongodb/${id}"; do
-        if run_privileged test -d "$d"; then
+    for d in "/etc/be-BOP/${id}" "/etc/be-BOP-mongodb/${id}" "/etc/phoenixd/${id}" \
+             "/var/lib/be-BOP/${id}" "/var/lib/be-BOP-mongodb/${id}" "/var/lib/phoenixd/${id}" \
+             "/var/lib/private/be-BOP/${id}" "/var/lib/private/be-BOP-mongodb/${id}" "/var/lib/private/phoenixd/${id}"; do
+        if run_privileged test -e "$d"; then
             printf '    dir:         %s\n' "$d"
         fi
     done
@@ -428,9 +439,19 @@ _delete_le_cert() {
 }
 
 _purge_dirs() {
-    local id="$1" d
-    for d in "/etc/be-BOP/${id}" "/var/lib/be-BOP/${id}" "/var/lib/be-BOP-mongodb/${id}"; do
-        if run_privileged test -d "$d"; then
+    local id="$1" u d
+    # systemctl clean --what=state handles the StateDirectory pair
+    # (public symlink + /var/lib/private/<StateDirectory>) atomically —
+    # this is the primitive systemd exposes for exactly this job.
+    for u in "bebop@${id}.service" "phoenixd@${id}.service" "mongod@${id}.service"; do
+        _run run_privileged systemctl clean --what=state "$u" 2>/dev/null || true
+    done
+    # Belt-and-suspenders: explicit rm on both the symlink and the private
+    # target, plus the /etc/… config dirs (not managed by StateDirectory).
+    for d in "/etc/be-BOP/${id}" "/etc/be-BOP-mongodb/${id}" "/etc/phoenixd/${id}" \
+             "/var/lib/be-BOP/${id}" "/var/lib/be-BOP-mongodb/${id}" "/var/lib/phoenixd/${id}" \
+             "/var/lib/private/be-BOP/${id}" "/var/lib/private/be-BOP-mongodb/${id}" "/var/lib/private/phoenixd/${id}"; do
+        if run_privileged test -e "$d"; then
             log_info "rm -rf ${d}"
             _run run_privileged rm -rf "$d"
         fi
