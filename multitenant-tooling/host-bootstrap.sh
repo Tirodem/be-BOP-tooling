@@ -697,7 +697,7 @@ step_install_tooling_libs_and_scripts() {
     fi
     log_info "Installing per-tenant scripts to /usr/local/bin/..."
     local script
-    for script in add-tenant.sh remove-tenant.sh migrate-tenant.sh upgrade-tenant.sh upgrade-all.sh list-tenants.sh find-orphans.sh tenant-cli.sh gh-rate-limit.sh certbot-renew-check.sh backup-tenants.sh restore-tenant.sh freeze-tenant.sh bebop-exit-handler.sh bebop-mongo-preflight.sh test-tenant-reaper.sh; do
+    for script in add-tenant.sh remove-tenant.sh migrate-tenant.sh upgrade-tenant.sh upgrade-all.sh list-tenants.sh find-orphans.sh mail-relay-ctl.sh tenant-cli.sh gh-rate-limit.sh certbot-renew-check.sh backup-tenants.sh restore-tenant.sh freeze-tenant.sh bebop-exit-handler.sh bebop-mongo-preflight.sh test-tenant-reaper.sh; do
         if [[ -f "${SCRIPT_DIR}/${script}" ]]; then
             maybe_run run_privileged install -m 0755 "${SCRIPT_DIR}/${script}" "/usr/local/bin/${script}"
         else
