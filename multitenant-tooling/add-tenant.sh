@@ -1096,9 +1096,17 @@ phase_bebop_service() {
     log_info "phase 12: bebop@${TENANT_ID}.service..."
     apply_smtp_prefill
     apply_runtime_config_overrides
-    run_privileged systemctl enable --now "bebop@${TENANT_ID}.service"
+    # Register the undo BEFORE the enable — if `systemctl enable --now` fails
+    # (e.g. ExecStartPre error), `set -e` triggers exit immediately and the
+    # rollback loop must know about the unit to disable it. Registering after
+    # the enable would leave the failed unit enabled and stuck in a
+    # Restart=on-failure loop referencing files that phase-earlier rollbacks
+    # have already removed.
     txn_register_undo "bebop@${TENANT_ID}.service" \
-        "run_privileged systemctl disable --now 'bebop@${TENANT_ID}.service' 2>/dev/null || true"
+        "run_privileged systemctl disable --now 'bebop@${TENANT_ID}.service' 2>/dev/null || true; \
+         run_privileged rm -f '/etc/systemd/system/multi-user.target.wants/bebop@${TENANT_ID}.service' 2>/dev/null || true; \
+         run_privileged systemctl daemon-reload 2>/dev/null || true"
+    run_privileged systemctl enable --now "bebop@${TENANT_ID}.service"
 }
 
 # Phase 13: HTTP healthcheck
