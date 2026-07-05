@@ -109,6 +109,7 @@ readonly RESERVED_TENANT_IDS=(
     root system bebop phoenixd mongod
     dashboard panel saas ops
     deploy
+    tooling
 )
 # Hard cap on the number of *active* tenants per host. Overridable via the
 # BEBOP_TENANT_CAP env var (or secrets.env). Lifted via the `absent` →

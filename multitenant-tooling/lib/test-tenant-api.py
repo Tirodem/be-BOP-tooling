@@ -87,6 +87,7 @@ RESERVED_TENANT_IDS = {
     "s3", "garage", "www", "admin", "api", "mail", "mx", "ns", "dns",
     "root", "system", "bebop", "phoenixd", "mongod",
     "dashboard", "panel", "saas", "ops", "deploy",
+    "tooling",
 }
 
 # Registry read for collision detection. We shell-free-read the TSV rather
