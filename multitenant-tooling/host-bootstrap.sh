@@ -1276,29 +1276,42 @@ step_setup_test_tenant_deploy_api() {
 }
 
 # === tooling MongoDB ====================================================
-# A dedicated mongod@tooling instance holds the state used by tools whose
-# scope is host-wide (not per-tenant). Today that means the mail-relay
-# (tenants creds, send_log, alert_state). Runs on a fixed port well above
-# the per-tenant range so it can never collide with allocations.
+# A dedicated `bebop-tooling-mongodb.service` instance holds the state
+# used by tools whose scope is host-wide (not per-tenant). Today that
+# means the mail-relay (tenants creds, send_log, alert_state). Runs on
+# a fixed port well above the per-tenant range so it can never collide
+# with allocations.
 #
-# The instance reuses the existing mongod@.service template (same
-# hardening, same StateDirectory pattern), so we only have to seed its
-# port.env and let systemd do the rest. RS init happens at first
-# bebop-mail-relay start via bebop-mail-relay-preflight.sh.
+# Explicitly NOT `mongod@tooling.service` — using the per-tenant template
+# would let any code that scans by `mongod@<X>` (find-orphans, list-
+# tenants, backup-tenants) confuse this host infrastructure with a
+# tenant. The distinct service name closes that boundary permanently.
+#
+# Also migrates away from a previous iteration that DID use
+# `mongod@tooling.service`: disables it, removes its port.env, and drops
+# its data dir — no merchant data ever landed there.
 step_setup_tooling_mongodb() {
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[dry-run] would enable mongod@tooling on 127.0.0.1:27100"
+        log_info "[dry-run] would install bebop-tooling-mongodb.service and migrate any old mongod@tooling"
         return 0
     fi
-    log_info "Provisioning mongod@tooling..."
-    run_privileged install -d -m 0755 /etc/be-BOP-mongodb/tooling
-    local tmp
-    tmp=$(mktemp)
-    printf 'MONGO_PORT=27100\n' > "$tmp"
-    run_privileged install -m 0640 "$tmp" /etc/be-BOP-mongodb/tooling/port.env
-    rm -f "$tmp"
-    run_privileged systemctl enable --now mongod@tooling.service
-    log_info "mongod@tooling listening on 127.0.0.1:27100 (db=bebop_tooling)"
+    if run_privileged systemctl list-unit-files 'mongod@tooling.service' \
+            --no-legend 2>/dev/null | grep -q '^mongod@tooling.service' \
+       || run_privileged systemctl is-enabled --quiet mongod@tooling.service 2>/dev/null \
+       || run_privileged systemctl is-active --quiet mongod@tooling.service 2>/dev/null; then
+        log_info "Migrating away from mongod@tooling.service..."
+        run_privileged systemctl disable --now mongod@tooling.service 2>/dev/null || true
+        run_privileged rm -f /etc/systemd/system/multi-user.target.wants/mongod@tooling.service
+        run_privileged rm -rf /etc/be-BOP-mongodb/tooling /var/lib/be-BOP-mongodb/tooling
+        run_privileged systemctl daemon-reload
+    fi
+    log_info "Provisioning bebop-tooling-mongodb.service..."
+    run_privileged install -m 0644 \
+        "${BEBOP_TOOLING_TEMPLATE_DIR}/bebop-tooling-mongodb.service" \
+        /etc/systemd/system/bebop-tooling-mongodb.service
+    run_privileged systemctl daemon-reload
+    run_privileged systemctl enable --now bebop-tooling-mongodb.service
+    log_info "bebop-tooling-mongodb listening on 127.0.0.1:27100 (db=bebop_tooling)"
 }
 
 # === mail-relay =========================================================

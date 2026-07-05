@@ -119,16 +119,11 @@ collect_stage() {
                 | xargs -0 -r -I{} install -m 0600 "{}" "${stage}{}"
         done < <(find "$base" -mindepth 1 -maxdepth 1 -type d)
     done
-    # mongodump of the tooling database. The dump lands under a stable
-    # relative path inside the archive so restore-tooling can find it.
-    local mongo_port=27100
-    [[ -r /etc/be-BOP-mongodb/tooling/port.env ]] && {
-        # shellcheck disable=SC1091
-        source /etc/be-BOP-mongodb/tooling/port.env
-        mongo_port="${MONGO_PORT:-27100}"
-    }
+    # mongodump of the tooling database (bebop-tooling-mongodb, port
+    # 27100 by design). Dump lands under a stable relative path inside
+    # the archive so restore-tooling can find it.
     install -d -m 0755 "${stage}/mongodump-tooling"
-    mongodump --quiet --port "$mongo_port" --db bebop_tooling \
+    mongodump --quiet --port 27100 --db bebop_tooling \
         --out "${stage}/mongodump-tooling" \
         || die "mongodump of bebop_tooling failed"
     printf '%s' "$stage"

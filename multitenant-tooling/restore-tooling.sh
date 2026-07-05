@@ -159,13 +159,7 @@ if [[ -d "${STAGE}/mongodump-tooling/bebop_tooling" ]]; then
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[dry-run] would mongorestore bebop_tooling from ${STAGE}/mongodump-tooling"
     else
-        local_port=27100
-        [[ -r /etc/be-BOP-mongodb/tooling/port.env ]] && {
-            # shellcheck disable=SC1091
-            source /etc/be-BOP-mongodb/tooling/port.env
-            local_port="${MONGO_PORT:-27100}"
-        }
-        mongorestore --quiet --port "$local_port" --drop \
+        mongorestore --quiet --port 27100 --drop \
             --nsInclude 'bebop_tooling.*' \
             "${STAGE}/mongodump-tooling" \
             || die "mongorestore of bebop_tooling failed"

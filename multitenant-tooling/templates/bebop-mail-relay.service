@@ -6,16 +6,17 @@
 # to the transactional provider (Scaleway TEM in V1). Provider-agnostic by
 # design: swap the outbound side without changing anything tenant-side.
 #
-# State (tenants creds + send_log + alert_state) lives in mongod@tooling on
-# 127.0.0.1:27100 (dedicated tooling instance provisioned by
-# host-bootstrap step_setup_tooling_mongodb). ExecStartPre guarantees the
-# instance is up + replica-set-initialised before the daemon starts.
+# State (tenants creds + send_log + alert_state) lives in
+# bebop-tooling-mongodb.service on 127.0.0.1:27100 (dedicated host-wide
+# instance provisioned by host-bootstrap step_setup_tooling_mongodb).
+# ExecStartPre guarantees the instance is up + replica-set-initialised
+# before the daemon starts.
 
 [Unit]
 Description=be-BOP — mail relay (fake SMTP shim, forwards to transactional provider)
 Documentation=https://be-bop.io/
-After=network-online.target mongod@tooling.service
-Wants=network-online.target mongod@tooling.service
+After=network-online.target bebop-tooling-mongodb.service
+Wants=network-online.target bebop-tooling-mongodb.service
 
 [Service]
 Type=simple

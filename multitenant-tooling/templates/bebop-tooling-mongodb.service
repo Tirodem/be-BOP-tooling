@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# Dedicated MongoDB instance for host-wide tooling state. Deliberately
+# NOT instantiated from the mongod@.service template — using the
+# `mongod@<name>` naming would make this instance indistinguishable from
+# per-tenant mongods to any code that scans by that convention
+# (find-orphans, list-tenants, backup-tenants…). A distinct service name
+# keeps that boundary crystal clear: `mongod@<X>` = per-tenant,
+# `bebop-tooling-mongodb` = host infrastructure.
+#
+# Currently hosts the mail-relay state (tenants creds, send_log,
+# alert_state) in database `bebop_tooling`. Any future host-wide tool
+# that needs a bit of state should land here rather than spinning up
+# yet another datastore.
+
+[Unit]
+Description=be-BOP — tooling MongoDB (host-wide state for mail-relay and other tools)
+Documentation=https://docs.mongodb.com/manual/
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=be-BOP-tooling-mongodb
+StateDirectoryMode=0700
+ExecStart=/usr/bin/mongod \
+    --dbpath /var/lib/be-BOP-tooling-mongodb \
+    --bind_ip 127.0.0.1 \
+    --port 27100 \
+    --replSet rs0 \
+    --logpath /var/lib/be-BOP-tooling-mongodb/mongod.log \
+    --logappend
+Restart=always
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=60
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bebop-tooling-mongodb
+
+# Hardening — same posture as mongod@.service.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

@@ -18,7 +18,8 @@
 set -eEuo pipefail
 
 readonly SCRIPT_NAME="bebop-mail-relay-preflight"
-readonly TOOLING_INSTANCE="tooling"
+readonly TOOLING_SERVICE="bebop-tooling-mongodb.service"
+readonly TOOLING_PORT=27100
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -43,23 +44,15 @@ source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
 # shellcheck source=lib/mongo.sh
 source "$BEBOP_TOOLING_LIB_DIR/mongo.sh"
 
-# Port is authoritative in port.env (same convention as tenant mongods).
-PORT_ENV_FILE="/etc/be-BOP-mongodb/${TOOLING_INSTANCE}/port.env"
-if [[ -r "$PORT_ENV_FILE" ]]; then
-    # shellcheck disable=SC1090
-    source "$PORT_ENV_FILE"
-fi
-: "${MONGO_PORT:=27100}"
-
-if ! systemctl is-active --quiet "mongod@${TOOLING_INSTANCE}.service"; then
-    log_info "starting mongod@${TOOLING_INSTANCE}.service..."
-    systemctl start "mongod@${TOOLING_INSTANCE}.service" \
-        || die "could not start mongod@${TOOLING_INSTANCE}"
+if ! systemctl is-active --quiet "$TOOLING_SERVICE"; then
+    log_info "starting ${TOOLING_SERVICE}..."
+    systemctl start "$TOOLING_SERVICE" \
+        || die "could not start ${TOOLING_SERVICE}"
 fi
 
-mongo_wait_ready "$MONGO_PORT" 30 1 \
-    || die "mongod@${TOOLING_INSTANCE} did not become ready on 127.0.0.1:${MONGO_PORT}"
+mongo_wait_ready "$TOOLING_PORT" 30 1 \
+    || die "${TOOLING_SERVICE} did not become ready on 127.0.0.1:${TOOLING_PORT}"
 
-mongo_init_rs "$MONGO_PORT"
+mongo_init_rs "$TOOLING_PORT"
 
-log_info "mail-relay preflight OK (mongod@${TOOLING_INSTANCE} port=${MONGO_PORT})"
+log_info "mail-relay preflight OK (${TOOLING_SERVICE} port=${TOOLING_PORT})"
