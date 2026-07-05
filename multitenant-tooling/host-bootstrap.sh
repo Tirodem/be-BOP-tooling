@@ -249,7 +249,8 @@ step_install_apt_packages() {
         nginx apache2-utils
         certbot
         python3-venv python3-pip
-        python3-aiosmtpd        # ingress + egress SMTP for the mail-relay daemon
+        python3-aiosmtpd        # ingress SMTP (accept from tenants)
+        python3-aiosmtplib      # egress SMTP (forward to Scaleway TEM)
         python3-bcrypt          # tenant password hashing for the mail-relay
         docker.io
         netdata

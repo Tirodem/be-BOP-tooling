@@ -4,23 +4,33 @@
 #
 # mail-relay.py — fake SMTP shim for be-BOP tenant outbound mail.
 #
-# Milestone 1 (this file): accepts SMTP connections on 127.0.0.1:2525,
-# enforces AUTH LOGIN/PLAIN before MAIL FROM, logs each accepted delivery
-# to SQLite, and returns 250 OK. NO forwarding yet, NO TLS, NO rate limits.
+# Milestones covered by this file:
+#   1. AUTH LOGIN/PLAIN + SQLite state (tenants / send_log / alert_state)
+#   3. Sync forwarding to the upstream transactional provider (Scaleway TEM
+#      by config; provider-agnostic by design), retry policy 5s / 15s / 30s
+#      on 4xx or connection errors, 5xx propagated directly to be-BOP.
 #
 # Design decisions locked in the design phase (see project discussion):
 #   - Per-VDS colocated relay (127.0.0.1 loopback only, one relay per VDS)
 #   - Python + aiosmtpd (consistency with lib/test-tenant-api.py)
 #   - SQLite state under /var/lib/be-BOP/mail-relay/state.db
-#   - Master provider credential in /etc/be-BOP-tooling/secrets.env
-#   - Provider-agnostic: this daemon knows nothing specific about Scaleway
-#     until milestone 3 (forwarding), and even then Scaleway is one config
-#     value away from Mailgun/Postmark.
+#   - Upstream credential in /etc/be-BOP-tooling/secrets.env
+#   - Provider-agnostic: swap MAIL_RELAY_UPSTREAM_* to change target.
 #
 # The auth model: each tenant has a row in `tenants` (id, bcrypt_pass,
 # quotas, mail_status). SMTP AUTH LOGIN/PLAIN checks the presented user +
 # password against that row. Cross-tenant impersonation is closed by the
-# `authed_user == From subdomain` enforcement (added in milestone 4).
+# `authed_user == From subdomain` enforcement (milestone 4).
+#
+# Failure semantics — be-BOP does NOT retry (verified against
+# src/lib/server/locks/email-notifications.ts). Any error we surface to
+# be-BOP is terminal for that message. Consequences:
+#   * Transient upstream 4xx / connection errors → we retry INTERNALLY
+#     up to 3 times with back-off (5s, 15s, 30s), total budget ~50s.
+#     Well within nodemailer's default socketTimeout (~600s).
+#   * Upstream 5xx → passed through unchanged; be-BOP marks failed.
+#   * All retries exhausted → last error surfaced to be-BOP; the message
+#     is lost from be-BOP's point of view. Ops sees it in /admin/email.
 
 from __future__ import annotations
 
@@ -49,6 +59,13 @@ except ImportError:
           file=sys.stderr)
     sys.exit(1)
 
+try:
+    import aiosmtplib
+except ImportError:
+    print("mail-relay: python3-aiosmtplib is required (apt install python3-aiosmtplib)",
+          file=sys.stderr)
+    sys.exit(1)
+
 
 # --- Paths & config ---------------------------------------------------------
 
@@ -69,6 +86,25 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%SZ",
 )
+
+# --- Upstream provider (Scaleway TEM by config) ----------------------------
+
+UPSTREAM_HOST = os.environ.get("MAIL_RELAY_UPSTREAM_HOST", "").strip()
+UPSTREAM_PORT = int(os.environ.get("MAIL_RELAY_UPSTREAM_PORT", "587"))
+UPSTREAM_USER = os.environ.get("MAIL_RELAY_UPSTREAM_USER", "").strip()
+UPSTREAM_PASSWORD = os.environ.get("MAIL_RELAY_UPSTREAM_PASSWORD", "")
+
+
+def _truthy(s: str) -> bool:
+    return s.strip().lower() in ("true", "1", "yes", "on")
+
+
+UPSTREAM_SMTPS = _truthy(os.environ.get("MAIL_RELAY_UPSTREAM_SMTPS", ""))
+UPSTREAM_CONFIGURED = bool(UPSTREAM_HOST and UPSTREAM_USER and UPSTREAM_PASSWORD)
+
+# Retry policy (see design decisions). back-off in SECONDS between attempts;
+# the total wall-clock ceiling is sum() + per-connection latency.
+RETRY_BACKOFFS = (5, 15, 30)  # attempts 2, 3, and 4 wait these before firing
 
 
 # --- SQLite schema ---------------------------------------------------------
@@ -181,15 +217,83 @@ def auth_check(server, session, envelope, mechanism, auth_data) -> AuthResult:
     return AuthResult(success=True, handled=True, auth_data=tenant_id)
 
 
+# --- Upstream forwarding ---------------------------------------------------
+
+class UpstreamResult:
+    """Discriminated result of a single forwarding attempt. `code` is the
+    SMTP reply code as reported by aiosmtplib (int) or None on transport
+    failure. `retryable` = should we try again per policy."""
+    __slots__ = ("code", "message", "retryable")
+
+    def __init__(self, code: int | None, message: str, retryable: bool):
+        self.code = code
+        self.message = message
+        self.retryable = retryable
+
+
+async def _forward_once(envelope) -> UpstreamResult:
+    """Single attempt at handing the message to the upstream provider."""
+    try:
+        # aiosmtplib.send() opens, EHLOs, STARTTLS if requested, AUTHs,
+        # sends, and QUITs — all in one call. Cheaper than pooling for
+        # our expected QPS.
+        response = await aiosmtplib.send(
+            envelope.original_content or b"",
+            sender=envelope.mail_from,
+            recipients=envelope.rcpt_tos,
+            hostname=UPSTREAM_HOST,
+            port=UPSTREAM_PORT,
+            username=UPSTREAM_USER,
+            password=UPSTREAM_PASSWORD,
+            start_tls=(not UPSTREAM_SMTPS),
+            use_tls=UPSTREAM_SMTPS,
+            timeout=45,
+        )
+        # aiosmtplib.send returns (errors_dict, response_str). Success ==
+        # empty errors dict.
+        errors, msg = response
+        if errors:
+            # Per-recipient rejections. We treat any per-rcpt error as a
+            # message-level failure (be-BOP sends one recipient per row
+            # anyway — verified against email.ts).
+            worst = max((code for code, _ in errors.values()), default=550)
+            retryable = 400 <= worst < 500
+            return UpstreamResult(worst, f"per-recipient errors: {errors}", retryable)
+        return UpstreamResult(250, msg or "OK", retryable=False)
+    except aiosmtplib.SMTPResponseException as exc:
+        retryable = 400 <= exc.code < 500
+        return UpstreamResult(exc.code, exc.message, retryable=retryable)
+    except (aiosmtplib.SMTPConnectError, aiosmtplib.SMTPServerDisconnected,
+            aiosmtplib.SMTPTimeoutError, ConnectionError, OSError, asyncio.TimeoutError) as exc:
+        # Transport-level failures — treat as retryable temp fails.
+        return UpstreamResult(None, f"{type(exc).__name__}: {exc}", retryable=True)
+
+
+async def forward_with_retry(envelope) -> UpstreamResult:
+    """Retry policy: try once, then each entry in RETRY_BACKOFFS is the wait
+    BEFORE the next attempt. Stops on first non-retryable result (2xx or
+    5xx), or when out of budget."""
+    last = await _forward_once(envelope)
+    for wait in RETRY_BACKOFFS:
+        if not last.retryable:
+            return last
+        LOG.warning(
+            "upstream forward failed (retryable): code=%s msg=%s — retrying in %ds",
+            last.code, last.message, wait,
+        )
+        await asyncio.sleep(wait)
+        last = await _forward_once(envelope)
+    return last
+
+
 # --- SMTP handler ----------------------------------------------------------
 
 class RelayHandler:
-    """Milestone 1 behaviour: on DATA, log the message metadata to send_log
-    with status='accepted' and return 250 OK. No forwarding, no size limit
-    beyond aiosmtpd defaults.
-
-    All the interesting logic (quotas, From-subdomain check, forwarding to
-    Scaleway) lands in later milestones. This is the plumbing skeleton."""
+    """Accepts messages after AUTH, forwards synchronously to the upstream
+    provider (Scaleway TEM in V1), logs the outcome per recipient in
+    send_log. If MAIL_RELAY_UPSTREAM_* is not configured (empty in
+    secrets.env), the handler runs in log-only mode: sends are accepted
+    and recorded but not forwarded, useful for pre-provider dev."""
 
     async def handle_MAIL(self, server, session, envelope, address, mail_options):
         if session.auth_data is None:
@@ -208,18 +312,54 @@ class RelayHandler:
             return "530 5.7.0 Authentication required"
         tenant_id = session.auth_data
         size = len(envelope.original_content or b"")
-        LOG.info(
-            "mail accepted (milestone 1: no forwarding) tenant=%s from=%s to=%r size=%d",
-            tenant_id, envelope.mail_from, envelope.rcpt_tos, size,
-        )
+
+        if not UPSTREAM_CONFIGURED:
+            # Log-only fallback (pre-provider onboarding). Same semantic
+            # as milestone 1: accept, record, return 250. Ops sees this
+            # in journalctl and adds provider creds in secrets.env when
+            # ready.
+            LOG.info(
+                "log-only (no upstream) tenant=%s from=%s to=%r size=%d",
+                tenant_id, envelope.mail_from, envelope.rcpt_tos, size,
+            )
+            self._insert_send_log(tenant_id, envelope, size, "log-only")
+            return "250 OK"
+
+        result = await forward_with_retry(envelope)
+        # Map internal result to SMTP wire status returned to be-BOP.
+        if result.code is not None and 200 <= result.code < 300:
+            status = "sent-upstream"
+            reply = "250 OK"
+            LOG.info(
+                "forwarded tenant=%s from=%s to=%r size=%d code=%s",
+                tenant_id, envelope.mail_from, envelope.rcpt_tos, size, result.code,
+            )
+        elif result.code is not None and 500 <= result.code < 600:
+            status = "failed-upstream-5xx"
+            reply = f"{result.code} {result.message[:200]}"
+            LOG.warning(
+                "5xx from upstream tenant=%s code=%s msg=%s",
+                tenant_id, result.code, result.message,
+            )
+        else:
+            status = "failed-upstream-4xx" if result.code else "failed-upstream-transport"
+            code_out = result.code or 451  # 451 = "requested action aborted, try later"
+            reply = f"{code_out} {result.message[:200]}"
+            LOG.warning(
+                "upstream failed after retries tenant=%s code=%s msg=%s",
+                tenant_id, result.code, result.message,
+            )
+        self._insert_send_log(tenant_id, envelope, size, status)
+        return reply
+
+    def _insert_send_log(self, tenant_id, envelope, size, status):
         with db_conn() as conn:
             for rcpt in envelope.rcpt_tos:
                 conn.execute(
                     "INSERT INTO send_log (tenant_id, recipient, size_bytes, status) "
-                    "VALUES (?, ?, ?, 'accepted')",
-                    (tenant_id, rcpt, size),
+                    "VALUES (?, ?, ?, ?)",
+                    (tenant_id, rcpt, size, status),
                 )
-        return "250 OK"
 
 
 # --- Controller wiring -----------------------------------------------------
@@ -240,8 +380,18 @@ class AuthController(Controller):
 
 
 async def _run_forever(controller: AuthController) -> None:
-    LOG.info("listening on %s:%d (milestone 1: no TLS, no forwarding)",
-             LISTEN_HOST, LISTEN_PORT)
+    if UPSTREAM_CONFIGURED:
+        LOG.info(
+            "listening on %s:%d — upstream: %s:%d (%s) as %s",
+            LISTEN_HOST, LISTEN_PORT, UPSTREAM_HOST, UPSTREAM_PORT,
+            "SMTPS" if UPSTREAM_SMTPS else "STARTTLS", UPSTREAM_USER,
+        )
+    else:
+        LOG.warning(
+            "listening on %s:%d — MAIL_RELAY_UPSTREAM_* not configured, "
+            "running in log-only mode (sends recorded but NOT forwarded)",
+            LISTEN_HOST, LISTEN_PORT,
+        )
     stop = asyncio.Event()
 
     def _signal(*_):
