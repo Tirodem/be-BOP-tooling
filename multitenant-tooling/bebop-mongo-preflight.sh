@@ -64,9 +64,26 @@ source "$BEBOP_TOOLING_LIB_DIR/registry.sh"
 # shellcheck source=lib/mongo.sh
 source "$BEBOP_TOOLING_LIB_DIR/mongo.sh"
 
-MONGO_PORT=$(registry_get_field "$TENANT_ID" mongo_port)
-if [[ -z "$MONGO_PORT" ]]; then
-    die "no mongo_port for tenant '${TENANT_ID}' in ${REGISTRY_PATH}"
+# Resolution order for the tenant's mongod port:
+#   1. /etc/be-BOP-mongodb/<tid>/port.env — written at add-tenant phase 4,
+#      i.e. BEFORE phase 12 that triggers this preflight. This is the
+#      authoritative source, aligned with mongod@.service's own
+#      EnvironmentFile.
+#   2. Fallback to the registry, for callers that only ever wrote the
+#      port there (older provisioning paths, or hand-maintained rows).
+# We intentionally do NOT rely on the registry as primary source because
+# registry_add runs at phase 14 (after service start), so a fresh
+# provisioning would fail here on a stale registry read.
+PORT_ENV_FILE="/etc/be-BOP-mongodb/${TENANT_ID}/port.env"
+if [[ -r "$PORT_ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$PORT_ENV_FILE"
+fi
+if [[ -z "${MONGO_PORT:-}" ]]; then
+    MONGO_PORT=$(registry_get_field "$TENANT_ID" mongo_port)
+fi
+if [[ -z "${MONGO_PORT:-}" ]]; then
+    die "no mongo_port for tenant '${TENANT_ID}' (checked ${PORT_ENV_FILE} and ${REGISTRY_PATH})"
 fi
 
 # 1. Ensure mongod@<tenant> is up. `is-active` short-circuits to a no-op
