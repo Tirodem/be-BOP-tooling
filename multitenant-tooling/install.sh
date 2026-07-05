@@ -116,7 +116,9 @@ chmod 0755 \
     "${INSTALL_DIR}/gh-rate-limit.sh" \
     "${INSTALL_DIR}/certbot-renew-check.sh" \
     "${INSTALL_DIR}/backup-tenants.sh" \
+    "${INSTALL_DIR}/backup-tooling.sh" \
     "${INSTALL_DIR}/restore-tenant.sh" \
+    "${INSTALL_DIR}/restore-tooling.sh" \
     "${INSTALL_DIR}/freeze-tenant.sh" \
     "${INSTALL_DIR}/bebop-exit-handler.sh" \
     "${INSTALL_DIR}/bebop-mongo-preflight.sh" \
