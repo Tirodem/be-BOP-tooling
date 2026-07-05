@@ -249,6 +249,8 @@ step_install_apt_packages() {
         nginx apache2-utils
         certbot
         python3-venv python3-pip
+        python3-aiosmtpd        # ingress + egress SMTP for the mail-relay daemon
+        python3-bcrypt          # tenant password hashing for the mail-relay
         docker.io
         netdata
     )
@@ -1271,6 +1273,24 @@ step_setup_test_tenant_deploy_api() {
     log_info "Reaper sweeping every 5 min (TTL=${BEBOP_TEST_TENANT_TTL_SECONDS:-7200}s)"
 }
 
+# === mail-relay =========================================================
+# The fake SMTP shim that be-BOP tenants use for outbound mail. Loopback-
+# only; forwards to the configured transactional provider (Scaleway TEM
+# in V1). Idempotent — safe to re-run on updates.
+step_setup_mail_relay() {
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[dry-run] would install bebop-mail-relay systemd unit"
+        return 0
+    fi
+    log_info "Installing bebop-mail-relay systemd unit..."
+    run_privileged install -m 0644 \
+        "${BEBOP_TOOLING_TEMPLATE_DIR}/bebop-mail-relay.service" \
+        /etc/systemd/system/bebop-mail-relay.service
+    run_privileged systemctl daemon-reload
+    run_privileged systemctl enable --now bebop-mail-relay.service
+    log_info "bebop-mail-relay listening on 127.0.0.1:2525"
+}
+
 # === Summary ===========================================================
 step_print_summary() {
     local title="be-BOP multi-tenant host bootstrap COMPLETE"
@@ -1380,6 +1400,7 @@ main() {
     step_setup_nightly_upgrade
 
     step_setup_test_tenant_deploy_api
+    step_setup_mail_relay
 
     step_print_summary
 }
