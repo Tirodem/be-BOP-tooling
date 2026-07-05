@@ -58,6 +58,8 @@ source "$BEBOP_TOOLING_LIB_DIR/notify.sh"
 source "$BEBOP_TOOLING_LIB_DIR/uptime-kuma.sh"
 # shellcheck source=lib/phoenixd.sh
 source "$BEBOP_TOOLING_LIB_DIR/phoenixd.sh"
+# shellcheck source=lib/scaleway.sh
+source "$BEBOP_TOOLING_LIB_DIR/scaleway.sh"
 
 # === CLI ================================================================
 SECRETS_FILE=/etc/be-BOP-tooling/secrets.env
@@ -182,6 +184,41 @@ delete_dns_records() {
 # Requires load_tenant_from_registry to have populated DOMAIN + ZONE.
 is_external_tenant() {
     [[ -n "$DOMAIN" && "$DOMAIN" != "${TENANT_ID}.${ZONE}" ]]
+}
+
+# Drop the tenant's mail-relay footprint: SQLite row (creds + send_log +
+# alert_state via mail-relay-ctl delete) plus the Scaleway TEM sending
+# domain (lookup + delete). Also clears the OVH TXT records
+# (SPF/DKIM/DMARC) posted at signup. All steps are best-effort — we
+# never want a partial cleanup to block a purge from completing.
+drop_mail_relay_resources() {
+    log_info "dropping mail-relay resources for ${TENANT_ID}..."
+    if command -v mail-relay-ctl.sh >/dev/null 2>&1; then
+        mail-relay-ctl.sh delete "$TENANT_ID" 2>/dev/null \
+            || log_warn "drop_mail_relay: mail-relay-ctl delete '${TENANT_ID}' returned non-zero"
+    else
+        log_debug "drop_mail_relay: mail-relay-ctl.sh not on PATH, skipping SQLite cleanup"
+    fi
+    # Scaleway TEM domain (soft failure — if the API is unreachable, we
+    # log and move on; a stale entry costs nothing on Scaleway's side).
+    if [[ -n "${SCALEWAY_TEM_API_KEY:-}" && -n "${SCALEWAY_TEM_PROJECT_ID:-}" ]]; then
+        local subdomain="${TENANT_ID}.${OVH_DNS_ZONE:-}"
+        local domain_id
+        domain_id=$(scaleway_tem_domain_find "$subdomain" 2>/dev/null || true)
+        if [[ -n "$domain_id" ]]; then
+            scaleway_tem_domain_delete "$domain_id" \
+                || log_warn "drop_mail_relay: scaleway domain delete failed for '${subdomain}'"
+        fi
+    fi
+    # OVH TXT records for SPF / DKIM / DMARC. is_external_tenant tenants
+    # never had these (their DNS lives elsewhere), so skip them.
+    if ! is_external_tenant && [[ -n "${OVH_DNS_ZONE:-}" ]]; then
+        local id
+        for host in "$TENANT_ID" "scw._domainkey.${TENANT_ID}" "_dmarc.${TENANT_ID}"; do
+            id=$(ovh_dns_record_find "$host" TXT 2>/dev/null || true)
+            [[ -n "$id" ]] && ovh_dns_record_delete "$id" 2>/dev/null || true
+        done
+    fi
 }
 
 # has_local_s3_tenant — true iff this tenant was provisioned WITH a local
@@ -505,6 +542,7 @@ run_archive() {
     delete_certificate
     delete_nginx_vhost
     delete_dns_records
+    drop_mail_relay_resources
     drop_mongo_resources
     drop_garage_resources
     purge_local_filesystem
@@ -576,6 +614,7 @@ run_purge() {
     delete_certificate
     delete_nginx_vhost
     delete_dns_records
+    drop_mail_relay_resources
     drop_mongo_resources
     drop_garage_resources
     purge_local_filesystem

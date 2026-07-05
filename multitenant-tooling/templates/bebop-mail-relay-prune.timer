@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# Daily at 03:15 UTC. Persistent=true so a missed run on a stopped VDS
+# catches up on next boot.
+
+[Unit]
+Description=Nightly send_log prune for the mail-relay
+Documentation=https://be-bop.io/
+
+[Timer]
+OnCalendar=*-*-* 03:15:00 UTC
+Persistent=true
+Unit=bebop-mail-relay-prune.service
+
+[Install]
+WantedBy=timers.target
