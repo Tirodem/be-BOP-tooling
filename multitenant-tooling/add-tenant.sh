@@ -128,6 +128,13 @@ TENANT_ID=""
 ADMIN_EMAIL=""
 EXTERNAL_DOMAIN=""    # set by --external-domain <fqdn>; empty = internal tenant
 NO_LOCAL_S3=false     # set by --no-local-s3; true = skip Garage/S3 plumbing
+# Let's Encrypt staging mode. Use for repeated test provisionings so we
+# don't burn through prod's "5 duplicate certs per exact identifiers per
+# week" rate limit. Set via --staging on the CLI or BEBOP_LE_STAGING=true
+# in secrets.env. Staging certs are NOT trusted by browsers — do not
+# enable on tenants that will actually serve real traffic.
+: "${BEBOP_LE_STAGING:=false}"
+LE_STAGING="$BEBOP_LE_STAGING"
 ENABLE_PHOENIXD=true
 BEBOP_VERSION="latest"
 REACTIVATE=false
@@ -179,6 +186,10 @@ Optional:
                           via the be-BOP UI. Implies: no s3.<tenant>.<zone>
                           DNS record, no S3 cert, no S3 nginx server block.
   --reactivate            restore a soft-deleted tenant (preserves data)
+  --staging               issue certs against Let's Encrypt STAGING (untrusted
+                          by browsers). Use for repeated test provisionings
+                          to avoid burning through prod's rate limits. Also
+                          settable via BEBOP_LE_STAGING=true in secrets.env.
   --runtime-config KEY=VALUE
                           upsert {_id:KEY, data:VALUE} into the tenant's
                           runtimeConfig collection just before bebop starts.
@@ -212,6 +223,7 @@ while (( $# )); do
         --external-domain) EXTERNAL_DOMAIN="$2"; shift 2 ;;
         --no-local-s3)     NO_LOCAL_S3=true; shift ;;
         --reactivate)      REACTIVATE=true; shift ;;
+        --staging)         LE_STAGING=true; shift ;;
         --runtime-config)        parse_runtime_config_flag "false" "$2"; shift 2 ;;
         --runtime-config-locked) parse_runtime_config_flag "true"  "$2"; shift 2 ;;
         --secrets-file)    SECRETS_FILE="$2"; shift 2 ;;
@@ -941,25 +953,74 @@ phase_certificate() {
 # vhost itself must also serve the webroot. The catch-all is now a
 # bootstrap-only fallback; the vhost template carries the load-bearing
 # webroot location.
+# Wraps `certbot` with two guarantees the raw invocation lacks:
+#   1. --server injection when LE_STAGING=true, so retries against the
+#      staging endpoint don't burn the production rate-limit window.
+#   2. stderr+stdout captured; on non-zero exit we extract the actionable
+#      ACME failure (rateLimited, badNonce, DNS problem, etc.) instead of
+#      letting certbot's misleading "AttributeError: can't set attribute"
+#      cover the real cause (upstream josepy+py3.11 bug in certbot 2.1.0).
+_certbot_run() {
+    local -a args=("$@")
+    if [[ "$LE_STAGING" == "true" ]]; then
+        args=("${args[@]}" --server "https://acme-staging-v02.api.letsencrypt.org/directory")
+        log_info "certbot: using Let's Encrypt STAGING (certs are untrusted by browsers)"
+    fi
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[dry-run] would run: certbot ${args[*]}"
+        return 0
+    fi
+    local out rc=0
+    out=$(run_privileged certbot "${args[@]}" 2>&1) || rc=$?
+    if (( rc == 0 )); then
+        # Success — echo the useful lines (usually the "Certificate is
+        # saved at:" block) so ops keeps visibility.
+        printf '%s\n' "$out" | grep -E '^(Successfully|Certificate is saved|Key is saved|This certificate expires)' >&2 || true
+        return 0
+    fi
+    # Failure — extract the actionable ACME error (or the fallback line).
+    # certbot 2.x prints "Error: urn:ietf:params:acme:error:<kind> ::…"
+    # somewhere in the traceback; the letsencrypt.log has the fully-
+    # formatted line. Both are worth surfacing.
+    local acme_line
+    acme_line=$(printf '%s\n' "$out" | grep -oE 'urn:ietf:params:acme:error:[^"]+' | head -n1 || true)
+    if [[ -n "$acme_line" ]]; then
+        log_error "certbot: ACME error → ${acme_line}"
+    fi
+    # Rate-limit specific advice: pull the retry-after date if present.
+    if [[ "$acme_line" == *rateLimited* ]] || [[ "$out" == *rateLimited* ]]; then
+        local retry
+        retry=$(printf '%s\n' "$out" | grep -oE 'retry after [^ ]+ [^ ]+ [^ ]+' | head -n1 || true)
+        log_error "certbot: Let's Encrypt rate-limited (5 duplicate certs / 168h max on the SAME set of identifiers)."
+        [[ -n "$retry" ]] && log_error "certbot: next retry window opens at ${retry}."
+        log_error "certbot: for repeated test provisionings, re-run add-tenant.sh with --staging (or set BEBOP_LE_STAGING=true in secrets.env)."
+    fi
+    # Full letsencrypt.log tail — 30 lines is enough to catch the real
+    # stack without spamming the journal.
+    local log_tail
+    log_tail=$(run_privileged tail -n 30 /var/log/letsencrypt/letsencrypt.log 2>/dev/null || true)
+    if [[ -n "$log_tail" ]]; then
+        log_error "certbot: last 30 lines of /var/log/letsencrypt/letsencrypt.log:"
+        printf '%s\n' "$log_tail" | while IFS= read -r line; do
+            log_error "  ${line}"
+        done
+    fi
+    return "$rc"
+}
+
 _issue_cert_http01() {
     local cert_name="$1" domain="$2" email="$3"
     if run_privileged test -d "/etc/letsencrypt/live/${cert_name}"; then
         log_info "cert ${cert_name} already issued — skipping certbot"
         return 0
     fi
-    local certbot_args=(
-        certonly
-        --webroot --webroot-path /var/lib/letsencrypt
-        --non-interactive --agree-tos
-        --email "$email"
-        --cert-name "$cert_name"
+    _certbot_run \
+        certonly \
+        --webroot --webroot-path /var/lib/letsencrypt \
+        --non-interactive --agree-tos \
+        --email "$email" \
+        --cert-name "$cert_name" \
         -d "$domain"
-    )
-    if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[dry-run] would run: certbot ${certbot_args[*]}"
-    else
-        run_privileged certbot "${certbot_args[@]}"
-    fi
     txn_register_undo "Let's Encrypt cert ${cert_name}" \
         "run_privileged certbot delete --non-interactive --cert-name '${cert_name}' 2>/dev/null || true"
 }
@@ -972,22 +1033,16 @@ _issue_cert_dns01() {
         log_info "cert ${cert_name} already issued — skipping certbot"
         return 0
     fi
-    local certbot_args=(
-        certonly
-        --manual
-        --preferred-challenges dns-01
-        --manual-auth-hook "${hooks_dir}/certbot-ovh-auth.sh"
-        --manual-cleanup-hook "${hooks_dir}/certbot-ovh-cleanup.sh"
-        --non-interactive --agree-tos
-        --email "$email"
-        --cert-name "$cert_name"
+    _certbot_run \
+        certonly \
+        --manual \
+        --preferred-challenges dns-01 \
+        --manual-auth-hook "${hooks_dir}/certbot-ovh-auth.sh" \
+        --manual-cleanup-hook "${hooks_dir}/certbot-ovh-cleanup.sh" \
+        --non-interactive --agree-tos \
+        --email "$email" \
+        --cert-name "$cert_name" \
         -d "$domain"
-    )
-    if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[dry-run] would run: certbot ${certbot_args[*]}"
-    else
-        run_privileged certbot "${certbot_args[@]}"
-    fi
     txn_register_undo "Let's Encrypt cert ${cert_name}" \
         "run_privileged certbot delete --non-interactive --cert-name '${cert_name}' 2>/dev/null || true"
 }
@@ -1000,23 +1055,17 @@ _issue_cert_dns01_san() {
         log_info "cert ${cert_name} already issued — skipping certbot"
         return 0
     fi
-    local certbot_args=(
-        certonly
-        --manual
-        --preferred-challenges dns-01
-        --manual-auth-hook "${hooks_dir}/certbot-ovh-auth.sh"
-        --manual-cleanup-hook "${hooks_dir}/certbot-ovh-cleanup.sh"
-        --non-interactive --agree-tos
-        --email "$email"
-        --cert-name "$cert_name"
-        -d "$domain"
+    _certbot_run \
+        certonly \
+        --manual \
+        --preferred-challenges dns-01 \
+        --manual-auth-hook "${hooks_dir}/certbot-ovh-auth.sh" \
+        --manual-cleanup-hook "${hooks_dir}/certbot-ovh-cleanup.sh" \
+        --non-interactive --agree-tos \
+        --email "$email" \
+        --cert-name "$cert_name" \
+        -d "$domain" \
         -d "$s3_domain"
-    )
-    if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[dry-run] would run: certbot ${certbot_args[*]}"
-    else
-        run_privileged certbot "${certbot_args[@]}"
-    fi
     txn_register_undo "Let's Encrypt cert ${cert_name}" \
         "run_privileged certbot delete --non-interactive --cert-name '${cert_name}' 2>/dev/null || true"
 }
