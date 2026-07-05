@@ -142,19 +142,43 @@ BEBOP_VERSION=""
 
 # === Helpers ============================================================
 
-# Stop and disable a per-tenant systemd unit, ignoring "not found" errors.
+# Stop and disable a per-tenant systemd unit. Uses is-enabled / is-active
+# rather than list-unit-files because the latter does NOT match template
+# instances enabled via a .wants/ symlink — so a purge that only looked at
+# list-unit-files would leave orphan symlinks in place, which is exactly
+# the failure mode that produced the `automail` orphan reported to us. As
+# a last-resort defence, we also fall back to a direct symlink lookup for
+# the (rare) case where the symlink points to a template whose file has
+# been removed and systemctl refuses to touch it.
 stop_disable_unit() {
     local unit="$1"
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[dry-run] would: systemctl disable --now ${unit}"
         return 0
     fi
-    if run_privileged systemctl list-unit-files --no-legend "$unit" 2>/dev/null | grep -q .; then
+    local is_enabled=false is_active=false
+    if run_privileged systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+        is_enabled=true
+    fi
+    if run_privileged systemctl is-active --quiet "$unit" 2>/dev/null; then
+        is_active=true
+    fi
+    if [[ "$is_enabled" == "true" || "$is_active" == "true" ]]; then
         run_privileged systemctl disable --now "$unit" 2>/dev/null \
             || log_warn "stop_disable_unit: ${unit} disable returned non-zero (already inactive?)"
-    else
-        log_debug "stop_disable_unit: ${unit} not registered, nothing to do"
+        return 0
     fi
+    # Neither enabled nor active per systemctl — sweep any orphan
+    # .wants/ symlink left behind.
+    local sym
+    sym=$(run_privileged find /etc/systemd/system -maxdepth 3 -name "$unit" \
+              -type l -print -quit 2>/dev/null || true)
+    if [[ -n "$sym" ]]; then
+        log_info "stop_disable_unit: rm orphan symlink ${sym}"
+        run_privileged rm -f "$sym"
+        return 0
+    fi
+    log_debug "stop_disable_unit: ${unit} not present, nothing to do"
 }
 
 # Remove tenant DNS records (looked up by subdomain since registry doesn't
