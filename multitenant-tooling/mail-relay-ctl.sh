@@ -2,24 +2,25 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 be-bop.io contributors
 #
-# mail-relay-ctl.sh — operator CLI over the local mail-relay SQLite state.
+# mail-relay-ctl.sh — operator CLI over the tooling MongoDB state.
 #
-# Talks to /var/lib/be-BOP/mail-relay/state.db directly via sqlite3. The
-# relay reads the same table on every connection (short-lived conns), so
-# any change is picked up on the next SMTP AUTH — no restart, no signal.
+# Talks to the dedicated mongod@tooling instance on 127.0.0.1:27100
+# (database `bebop_tooling`) via mongosh. The relay reads the same
+# collections on every SMTP connection, so any change is picked up on the
+# next SMTP AUTH — no restart, no signal.
 #
 # Commands:
-#   create <tenant_id>              generate a random password, upsert the
-#                                    tenant row, print user + password to
+#   create <tenant_id>              generate a random password, insert the
+#                                    tenant doc, print user + password to
 #                                    stdout on ONE line (tab-separated) so
 #                                    add-tenant.sh can capture it
-#   delete <tenant_id>              remove the row + all its send_log +
+#   delete <tenant_id>              remove the doc + all its send_log +
 #                                    alert_state entries
 #   list [--all]                    list active tenants (or all statuses)
-#   show <tenant_id>                dump the tenant row + recent counters
-#                                    (10min / 24h / month)
+#   show <tenant_id>                dump the tenant doc + recent counters
+#                                    (10min / 24h / month) + last 10 sends
 #   set-quota <tenant_id> <window>=<hard>[,<soft>]  [<window>=<hard>[,<soft>]]...
-#                                    override quotas for one tenant; NULL
+#                                    override quotas for one tenant; "-"
 #                                    to reset to daemon defaults
 #   set-status <tenant_id> <status>  active | disabled
 #   set-upstream-id <tenant_id> <domain_id>|-
@@ -31,7 +32,7 @@
 #                                    recovery); prints new password on stdout
 #   prune-send-log [--older-than-days=90]
 #                                    delete send_log rows past retention
-#   retry-upstream <tenant_id|--all>  declare the tenant's sending domain
+#   retry-upstream <tenant_id>|--all  declare the tenant's sending domain
 #                                    upstream (via lib/scaleway.sh's
 #                                    adapter, which exposes a
 #                                    provider-agnostic mail_upstream_* API).
@@ -60,15 +61,18 @@ source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
 BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
 
-DB_PATH="${BEBOP_MAIL_RELAY_DB:-/var/lib/be-BOP/mail-relay/state.db}"
+MONGO_PORT="${BEBOP_TOOLING_MONGO_PORT:-27100}"
+MONGO_DB="${BEBOP_TOOLING_MONGO_DB:-bebop_tooling}"
 
 # The tenant slug rules must match add-tenant.sh / test-tenant-api.py.
-# Enforced here as a defence-in-depth against `mail-relay-ctl create '; DROP …'`.
+# Enforced here as a defence-in-depth: any tenant_id we let through to
+# mongosh gets interpolated into a JS single-quoted string literal, so a
+# stray apostrophe would be a real risk without this whitelist.
 readonly TENANT_REGEX='^[a-z0-9][a-z0-9-]{0,31}$'
 
 usage() {
     cat <<EOF
-mail-relay-ctl.sh — manage the local be-BOP mail-relay SQLite state.
+mail-relay-ctl.sh — manage the tooling MongoDB state used by the mail-relay.
 
 Usage:
   mail-relay-ctl create <tenant_id>
@@ -97,28 +101,22 @@ _check_tenant_id() {
         || die "invalid tenant_id '${id}': must match ${TENANT_REGEX}"
 }
 
-# sqlite3 wrapper: forces sudo when needed, always in autocommit mode. We
-# route via -cmd '.timeout 10000' so a long-lived relai lock doesn't wedge
-# the CLI (WAL mode reads should not block writes here, but belt+suspenders).
-_sq() {
-    run_privileged sqlite3 -bail -cmd '.timeout 10000' "$DB_PATH" "$@"
+# Run a mongosh JS snippet against the tooling database. All output goes to
+# stdout; mongosh's status logs are silenced via --quiet.
+_mongo() {
+    local js="$1"
+    run_privileged mongosh --quiet --port "$MONGO_PORT" \
+        --eval "$js" "$MONGO_DB"
 }
 
-# All string values are single-quote-escaped before being passed into
-# sqlite3 statements; the DB path itself is trusted (root-owned).
-_sqlq() { printf "%s" "$1" | sed "s/'/''/g"; }
-
-# Random password using /dev/urandom (base64, 32 chars). Aligned with the
-# strength of the tenant-side runtimeConfig persistence — a compromise on
-# either side would be catastrophic regardless of relay password entropy.
+# Random password using /dev/urandom (base64-safe alphabet, 32 chars).
 _gen_password() {
     tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32
     printf '\n'
 }
 
 # bcrypt hashing runs in Python (aligned with the daemon's verifier). Cost
-# 12 chosen to keep AUTH under ~200ms on modest hardware; adjust if you
-# hit issues with high login rates.
+# 12 chosen to keep AUTH under ~200ms on modest hardware.
 _bcrypt_hash() {
     local pw="$1"
     python3 - <<PYEOF
@@ -131,15 +129,14 @@ PYEOF
 cmd_create() {
     local tenant_id="${1:-}"
     _check_tenant_id "$tenant_id"
-    local existing
-    existing=$(_sq "SELECT tenant_id FROM tenants WHERE tenant_id='$(_sqlq "$tenant_id")';" 2>/dev/null || true)
-    [[ -n "$existing" ]] && die "tenant '${tenant_id}' already exists — use reset-tenant to rotate its password"
-    local password
+    local exists
+    exists=$(_mongo "print(db.tenants.countDocuments({_id:'${tenant_id}'}));")
+    [[ "$exists" != "0" ]] \
+        && die "tenant '${tenant_id}' already exists — use reset-tenant to rotate its password"
+    local password hash
     password=$(_gen_password)
-    local hash
     hash=$(printf '%s' "$password" | _bcrypt_hash "$password")
-    _sq "INSERT INTO tenants (tenant_id, pass_hash) VALUES ('$(_sqlq "$tenant_id")', '$(_sqlq "$hash")');"
-    # Tab-separated so add-tenant.sh can parse with `cut -f1,2`.
+    _mongo "db.tenants.insertOne({_id:'${tenant_id}', pass_hash:'${hash}', mail_status:'active', upstream_domain_id:null, created_at:new Date()});" >/dev/null
     printf '%s\t%s\n' "$tenant_id" "$password"
     log_info "created tenant '${tenant_id}' (password printed to stdout)"
 }
@@ -147,61 +144,66 @@ cmd_create() {
 cmd_delete() {
     local tenant_id="${1:-}"
     _check_tenant_id "$tenant_id"
-    local rc
-    rc=$(_sq "SELECT changes() FROM (SELECT 1 FROM tenants WHERE tenant_id='$(_sqlq "$tenant_id")');" 2>/dev/null || echo 0)
-    _sq \
-        "DELETE FROM alert_state WHERE tenant_id='$(_sqlq "$tenant_id")';" \
-        "DELETE FROM send_log WHERE tenant_id='$(_sqlq "$tenant_id")';" \
-        "DELETE FROM tenants WHERE tenant_id='$(_sqlq "$tenant_id")';"
-    log_info "deleted tenant '${tenant_id}' (was ${rc:+present})"
+    _mongo "
+        db.alert_state.deleteMany({'_id.tenant':'${tenant_id}'});
+        db.send_log.deleteMany({tenant_id:'${tenant_id}'});
+        var r = db.tenants.deleteOne({_id:'${tenant_id}'});
+        print(r.deletedCount);
+    " >/dev/null
+    log_info "deleted tenant '${tenant_id}'"
 }
 
 cmd_list() {
-    local status_filter=""
-    [[ "${1:-}" != "--all" ]] && status_filter="WHERE mail_status='active'"
-    _sq -header -column \
-        "SELECT tenant_id, mail_status, \
-                CASE WHEN upstream_domain_id IS NULL THEN 'no' ELSE 'yes' END AS upstream_declared, \
-                created_at \
-         FROM tenants ${status_filter} ORDER BY tenant_id;"
+    local filter='{}'
+    [[ "${1:-}" != "--all" ]] && filter="{mail_status:'active'}"
+    _mongo "
+        var docs = db.tenants.find(${filter}, {mail_status:1, upstream_domain_id:1, created_at:1}).sort({_id:1}).toArray();
+        print('tenant_id                        mail_status  upstream  created_at');
+        docs.forEach(function(d) {
+            var up = d.upstream_domain_id ? 'yes' : 'no';
+            var created = d.created_at ? d.created_at.toISOString() : '';
+            print(d._id.padEnd(32) + ' ' + (d.mail_status || '').padEnd(11) + '  ' + up.padEnd(8) + '  ' + created);
+        });
+    "
 }
 
 cmd_show() {
     local tenant_id="${1:-}"
     _check_tenant_id "$tenant_id"
-    local q="$(_sqlq "$tenant_id")"
-    echo "== Tenant row =="
-    _sq -header -column \
-        "SELECT tenant_id, mail_status, upstream_domain_id, hard_cap_10min, hard_cap_24h, hard_cap_month, soft_alert_10min, soft_alert_24h, soft_alert_month, created_at FROM tenants WHERE tenant_id='${q}';"
-    echo
-    echo "== Send counters (accepted only) =="
-    _sq -header -column "
-        SELECT '10min' AS window, COUNT(*) AS accepted FROM send_log
-            WHERE tenant_id='${q}' AND status='accepted'
-              AND sent_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-10 minutes')
-        UNION ALL
-        SELECT '24h', COUNT(*) FROM send_log
-            WHERE tenant_id='${q}' AND status='accepted'
-              AND sent_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-1 day')
-        UNION ALL
-        SELECT 'month', COUNT(*) FROM send_log
-            WHERE tenant_id='${q}' AND status='accepted'
-              AND sent_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-30 days');
+    _mongo "
+        var t = db.tenants.findOne({_id:'${tenant_id}'});
+        if (!t) { print('tenant \'${tenant_id}\' not found'); quit(1); }
+        print('== Tenant doc ==');
+        printjson(t);
+        print('');
+        print('== Send counters (accepted only) ==');
+        var now = new Date();
+        var windows = [
+            {name:'10min', ms: 10*60*1000},
+            {name:'24h',   ms: 24*60*60*1000},
+            {name:'month', ms: 30*24*60*60*1000},
+        ];
+        windows.forEach(function(w) {
+            var n = db.send_log.countDocuments({
+                tenant_id:'${tenant_id}',
+                status:{\$in:['sent-upstream','log-only']},
+                sent_at:{\$gte: new Date(now.getTime() - w.ms)},
+            });
+            print(w.name + '\t' + n);
+        });
+        print('');
+        print('== Last 10 sends ==');
+        db.send_log.find({tenant_id:'${tenant_id}'}).sort({sent_at:-1}).limit(10).forEach(function(d) {
+            print(d.sent_at.toISOString() + '  ' + d.status + '  ' + d.size_bytes + '  ' + d.recipient);
+        });
     "
-    echo
-    echo "== Last 10 sends =="
-    _sq -header -column \
-        "SELECT sent_at, recipient, size_bytes, status FROM send_log WHERE tenant_id='${q}' ORDER BY id DESC LIMIT 10;"
 }
 
-cmd_set_quota() {
-    local tenant_id="${1:-}"
-    _check_tenant_id "$tenant_id"
-    shift
-    (( $# > 0 )) || die "at least one <window>=<hard>[,<soft>] required"
-    local q="$(_sqlq "$tenant_id")"
-    local sets=()
-    local arg window rest hard soft col_hard col_soft
+# Compose the $set portion of the update from window=hard[,soft] args.
+# Emits JS object fragments that get spliced into the mongosh command.
+_quota_sets_js() {
+    local -a sets=()
+    local arg window rest hard soft field_hard field_soft
     for arg in "$@"; do
         [[ "$arg" =~ ^([A-Za-z0-9]+)=(.*)$ ]] || die "malformed quota arg '${arg}'"
         window="${BASH_REMATCH[1]}"
@@ -210,32 +212,44 @@ cmd_set_quota() {
         soft=""
         [[ "$rest" == *","* ]] && soft="${rest#*,}"
         case "$window" in
-            10min) col_hard=hard_cap_10min; col_soft=soft_alert_10min ;;
-            24h)   col_hard=hard_cap_24h;   col_soft=soft_alert_24h ;;
-            month) col_hard=hard_cap_month; col_soft=soft_alert_month ;;
+            10min) field_hard=hard_cap_10min; field_soft=soft_alert_10min ;;
+            24h)   field_hard=hard_cap_24h;   field_soft=soft_alert_24h ;;
+            month) field_hard=hard_cap_month; field_soft=soft_alert_month ;;
             *) die "unknown window '${window}' (want 10min|24h|month)" ;;
         esac
-        if [[ "$hard" == "-" ]]; then
-            sets+=("${col_hard}=NULL")
+        if [[ -z "$hard" ]]; then
+            :
+        elif [[ "$hard" == "-" ]]; then
+            sets+=("'${field_hard}':null")
         elif [[ "$hard" =~ ^[0-9]+$ ]]; then
-            sets+=("${col_hard}=${hard}")
-        elif [[ -n "$hard" ]]; then
+            sets+=("'${field_hard}':${hard}")
+        else
             die "hard cap for '${window}' must be an integer or '-' (got '${hard}')"
         fi
         if [[ -n "$soft" ]]; then
             if [[ "$soft" == "-" ]]; then
-                sets+=("${col_soft}=NULL")
+                sets+=("'${field_soft}':null")
             elif [[ "$soft" =~ ^[0-9]+$ ]]; then
-                sets+=("${col_soft}=${soft}")
+                sets+=("'${field_soft}':${soft}")
             else
                 die "soft alert for '${window}' must be an integer or '-' (got '${soft}')"
             fi
         fi
     done
-    local joined
-    joined=$(IFS=,; echo "${sets[*]}")
-    _sq "UPDATE tenants SET ${joined} WHERE tenant_id='${q}';"
-    log_info "quotas updated for '${tenant_id}': ${joined}"
+    local IFS=,
+    echo "${sets[*]}"
+}
+
+cmd_set_quota() {
+    local tenant_id="${1:-}"
+    _check_tenant_id "$tenant_id"
+    shift
+    (( $# > 0 )) || die "at least one <window>=<hard>[,<soft>] required"
+    local sets_js
+    sets_js=$(_quota_sets_js "$@")
+    [[ -z "$sets_js" ]] && die "no quota fields to update"
+    _mongo "db.tenants.updateOne({_id:'${tenant_id}'}, {\$set:{${sets_js}}});" >/dev/null
+    log_info "quotas updated for '${tenant_id}': {${sets_js}}"
 }
 
 cmd_set_status() {
@@ -246,7 +260,7 @@ cmd_set_status() {
         active|disabled) ;;
         *) die "status must be one of: active | disabled" ;;
     esac
-    _sq "UPDATE tenants SET mail_status='$(_sqlq "$status")' WHERE tenant_id='$(_sqlq "$tenant_id")';"
+    _mongo "db.tenants.updateOne({_id:'${tenant_id}'}, {\$set:{mail_status:'${status}'}});" >/dev/null
     log_info "tenant '${tenant_id}' status → ${status}"
 }
 
@@ -256,10 +270,14 @@ cmd_set_upstream_id() {
     _check_tenant_id "$tenant_id"
     [[ -z "$domain_id" ]] && die "set-upstream-id needs a domain id (or '-' to clear)"
     if [[ "$domain_id" == "-" ]]; then
-        _sq "UPDATE tenants SET upstream_domain_id=NULL WHERE tenant_id='$(_sqlq "$tenant_id")';"
-        log_info "tenant '${tenant_id}' upstream_domain_id → NULL"
+        _mongo "db.tenants.updateOne({_id:'${tenant_id}'}, {\$set:{upstream_domain_id:null}});" >/dev/null
+        log_info "tenant '${tenant_id}' upstream_domain_id → null"
     else
-        _sq "UPDATE tenants SET upstream_domain_id='$(_sqlq "$domain_id")' WHERE tenant_id='$(_sqlq "$tenant_id")';"
+        # The domain id comes from the provider adapter; validate it's
+        # printable ASCII to keep JS-string interpolation safe.
+        [[ "$domain_id" =~ ^[A-Za-z0-9._-]+$ ]] \
+            || die "upstream_domain_id contains unexpected characters: '${domain_id}'"
+        _mongo "db.tenants.updateOne({_id:'${tenant_id}'}, {\$set:{upstream_domain_id:'${domain_id}'}});" >/dev/null
         log_info "tenant '${tenant_id}' upstream_domain_id → ${domain_id}"
     fi
 }
@@ -267,14 +285,13 @@ cmd_set_upstream_id() {
 cmd_reset_tenant() {
     local tenant_id="${1:-}"
     _check_tenant_id "$tenant_id"
-    local existing
-    existing=$(_sq "SELECT tenant_id FROM tenants WHERE tenant_id='$(_sqlq "$tenant_id")';" 2>/dev/null || true)
-    [[ -z "$existing" ]] && die "tenant '${tenant_id}' does not exist"
-    local password
+    local exists
+    exists=$(_mongo "print(db.tenants.countDocuments({_id:'${tenant_id}'}));")
+    [[ "$exists" == "0" ]] && die "tenant '${tenant_id}' does not exist"
+    local password hash
     password=$(_gen_password)
-    local hash
     hash=$(printf '%s' "$password" | _bcrypt_hash "$password")
-    _sq "UPDATE tenants SET pass_hash='$(_sqlq "$hash")' WHERE tenant_id='$(_sqlq "$tenant_id")';"
+    _mongo "db.tenants.updateOne({_id:'${tenant_id}'}, {\$set:{pass_hash:'${hash}'}});" >/dev/null
     printf '%s\t%s\n' "$tenant_id" "$password"
     log_warn "password rotated for '${tenant_id}' — reseed runtimeConfig.smtp on the tenant side"
 }
@@ -288,9 +305,13 @@ cmd_prune_send_log() {
         esac
     done
     [[ "$days" =~ ^[0-9]+$ ]] || die "--older-than-days must be an integer"
-    local deleted
-    deleted=$(_sq "DELETE FROM send_log WHERE sent_at < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', '-${days} days'); SELECT changes();")
-    log_info "prune-send-log: deleted ${deleted} row(s) older than ${days} days"
+    local out
+    out=$(_mongo "
+        var cutoff = new Date(Date.now() - ${days}*24*60*60*1000);
+        var r = db.send_log.deleteMany({sent_at:{\$lt: cutoff}});
+        print(r.deletedCount);
+    ")
+    log_info "prune-send-log: deleted ${out} row(s) older than ${days} days"
 }
 
 cmd_retry_upstream() {
@@ -298,17 +319,15 @@ cmd_retry_upstream() {
     # provider (Scaleway TEM in V1, whatever else later). The provider
     # specifics live inside lib/scaleway.sh — the adapter exposes a
     # provider-agnostic mail_upstream_* surface (is_configured,
-    # setup_domain, teardown_domain). This function knows only that
-    # surface.
+    # setup_domain, teardown_domain). This function only knows that surface.
     #
     # Silent no-op if the operator hasn't set up an upstream yet — the
     # fake SMTP works standalone, and this sweep runs every 15 min via
-    # bebop-mail-relay-upstream-sync.timer so provisioned tenants get
-    # upstream declared as soon as credentials appear in secrets.env.
+    # bebop-mail-relay-retry.timer so provisioned tenants get upstream
+    # declared as soon as credentials appear in secrets.env.
     local target="${1:-}"
     [[ -z "$target" ]] && { usage; die "retry-upstream needs a tenant_id or --all"; }
 
-    # Source the current upstream adapter + OVH (for DNS record posting).
     # shellcheck source=lib/scaleway.sh
     source "${BEBOP_TOOLING_LIB_DIR}/scaleway.sh"
     # shellcheck source=lib/ovh.sh
@@ -322,7 +341,12 @@ cmd_retry_upstream() {
 
     if [[ "$target" == "--all" ]]; then
         local ids
-        ids=$(_sq "SELECT tenant_id FROM tenants WHERE upstream_domain_id IS NULL AND mail_status='active' ORDER BY tenant_id;")
+        ids=$(_mongo "
+            db.tenants.find(
+                {upstream_domain_id:null, mail_status:'active'},
+                {_id:1}
+            ).sort({_id:1}).forEach(function(d) { print(d._id); });
+        ")
         if [[ -z "$ids" ]]; then
             log_debug "retry-upstream --all: no tenants pending upstream declaration"
             return 0
@@ -349,14 +373,19 @@ _do_upstream_setup() {
         log_warn "retry-upstream: setup failed for '${tid}' — will retry"
         return 1
     fi
-    _sq "UPDATE tenants SET upstream_domain_id='$(_sqlq "$domain_id")' WHERE tenant_id='$(_sqlq "$tid")';"
+    cmd_set_upstream_id "$tid" "$domain_id"
     log_info "retry-upstream: '${tid}' declared (id=${domain_id})"
 }
 
 main() {
     (( $# == 0 )) && { usage; exit 1; }
     require_privileges
-    [[ -f "$DB_PATH" ]] || die "relay DB not found at ${DB_PATH} — is bebop-mail-relay running?"
+    # Verify mongod@tooling is reachable before running any command; a
+    # clean error beats a mongosh connection stack trace.
+    if ! run_privileged mongosh --quiet --port "$MONGO_PORT" \
+            --eval 'db.runCommand({ping:1}).ok' "$MONGO_DB" >/dev/null 2>&1; then
+        die "cannot reach mongod@tooling on 127.0.0.1:${MONGO_PORT} — is it running?"
+    fi
     local cmd="$1"; shift
     case "$cmd" in
         create)          cmd_create "$@" ;;
@@ -365,6 +394,7 @@ main() {
         show)            cmd_show "$@" ;;
         set-quota)       cmd_set_quota "$@" ;;
         set-status)      cmd_set_status "$@" ;;
+        set-upstream-id) cmd_set_upstream_id "$@" ;;
         reset-tenant)    cmd_reset_tenant "$@" ;;
         prune-send-log)  cmd_prune_send_log "$@" ;;
         retry-upstream)  cmd_retry_upstream "$@" ;;

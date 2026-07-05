@@ -5,7 +5,7 @@
 # mail-relay.py — fake SMTP shim for be-BOP tenant outbound mail.
 #
 # Milestones covered by this file:
-#   1. AUTH LOGIN/PLAIN + SQLite state (tenants / send_log / alert_state)
+#   1. AUTH LOGIN/PLAIN + Mongo-backed state (tenants / send_log / alert_state)
 #   3. Sync forwarding to the upstream transactional provider (the transactional provider
 #      by config; provider-agnostic by design), retry policy 5s / 15s / 30s
 #      on 4xx or connection errors, 5xx propagated directly to be-BOP.
@@ -13,7 +13,7 @@
 # Design decisions locked in the design phase (see project discussion):
 #   - Per-VDS colocated relay (127.0.0.1 loopback only, one relay per VDS)
 #   - Python + aiosmtpd (consistency with lib/test-tenant-api.py)
-#   - SQLite state under /var/lib/be-BOP/mail-relay/state.db
+#   - Mongo state on mongod@tooling (127.0.0.1:27100, db bebop_tooling)
 #   - Upstream credential in /etc/be-BOP-tooling/secrets.env
 #   - Provider-agnostic: swap MAIL_RELAY_UPSTREAM_* to change target.
 #
@@ -40,15 +40,12 @@ import json
 import logging
 import os
 import signal
-import sqlite3
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from contextlib import contextmanager
-from datetime import datetime, timezone
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
 
 try:
     import bcrypt
@@ -72,13 +69,27 @@ except ImportError:
           file=sys.stderr)
     sys.exit(1)
 
+try:
+    from pymongo import MongoClient, ASCENDING, DESCENDING
+    from pymongo.errors import PyMongoError
+except ImportError:
+    print("mail-relay: python3-pymongo is required (apt install python3-pymongo)",
+          file=sys.stderr)
+    sys.exit(1)
 
-# --- Paths & config ---------------------------------------------------------
 
-# StateDirectory=be-BOP/mail-relay in the systemd unit maps to this path
-# and belongs to the DynamicUser. We can therefore assume RW access.
-STATE_DIR = Path(os.environ.get("STATE_DIRECTORY", "/var/lib/be-BOP/mail-relay"))
-DB_PATH = STATE_DIR / "state.db"
+# --- MongoDB (tooling instance) --------------------------------------------
+
+# Dedicated mongod@tooling instance runs on 127.0.0.1:27100 (fixed, out of
+# the per-tenant 27018+ range) with database `bebop_tooling`. This replaces
+# the earlier local sqlite so the tooling state lives on the same tech as
+# the rest of the platform — one datastore to backup, one to monitor, one
+# to reason about.
+MONGO_URL = os.environ.get(
+    "BEBOP_TOOLING_MONGO_URL",
+    "mongodb://127.0.0.1:27100/bebop_tooling?replicaSet=rs0",
+)
+MONGO_DB_NAME = os.environ.get("BEBOP_TOOLING_MONGO_DB", "bebop_tooling")
 
 # Loopback-only listen socket. Any process running on the same VDS can
 # reach this — cross-tenant safety is guaranteed by SMTP AUTH + (later)
@@ -171,106 +182,74 @@ ZULIP_TOPIC = os.environ.get("ZULIP_TOPIC", "mail-relay").strip()
 ZULIP_CONFIGURED = bool(ZULIP_SITE and ZULIP_BOT_EMAIL and ZULIP_BOT_API_KEY and ZULIP_STREAM)
 
 
-# --- SQLite schema ---------------------------------------------------------
+# --- MongoDB collections ---------------------------------------------------
+#
+# The daemon uses a single mongo client, established once at startup. All
+# reads and writes go through the module-level `_db` handle set by
+# init_schema().
+#
+# Collections and canonical document shapes:
+#   tenants:
+#     { _id: <tenant_id>, pass_hash: <bcrypt bytes>, mail_status: "active",
+#       hard_cap_10min: null|int, hard_cap_24h, hard_cap_month,
+#       soft_alert_10min, soft_alert_24h, soft_alert_month,
+#       upstream_domain_id: null|str, created_at: datetime }
+#   send_log:
+#     { tenant_id: str, sent_at: datetime, recipient: str,
+#       size_bytes: int, status: "sent-upstream" | "log-only" |
+#       "rejected-quota-<window>" | "failed-upstream-<kind>" }
+#     (server-generated ObjectId as _id)
+#   alert_state:
+#     { _id: {tenant: <tid>, window: <kind>}, last_alert_at: datetime }
+#     (composite _id so we get natural upserts on the pair)
 
-# One row per tenant. mail_status matches the values written by add-tenant.sh
-# in the registry (`active` / `pending` / `failed` per milestone 5 design).
-# Quotas can be overridden per tenant via CLI (milestone 2); when NULL, the
-# daemon falls back to the compiled-in defaults below.
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS tenants (
-    tenant_id           TEXT PRIMARY KEY,
-    pass_hash           TEXT NOT NULL,
-    hard_cap_10min      INTEGER,
-    hard_cap_24h        INTEGER,
-    hard_cap_month      INTEGER,
-    soft_alert_10min    INTEGER,
-    soft_alert_24h      INTEGER,
-    soft_alert_month    INTEGER,
-    mail_status         TEXT NOT NULL DEFAULT 'active',
-    -- Upstream provider's domain id, once registration succeeds. NULL
-    -- means "not yet declared upstream" — the tenant is fully operational
-    -- against THIS relay (accepts AUTH, records sends, forwards if the
-    -- upstream SMTP is configured), and the retry timer will attempt the
-    -- upstream declaration in the background. Decoupling the two states
-    -- means a tenant provisioned before upstream credentials exist still
-    -- gets a working SMTP config out of the box.
-    upstream_domain_id  TEXT,
-    created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
-);
-
--- Migration for state.db files created before upstream_domain_id existed.
--- SQLite is happy re-running ALTER TABLE against an already-present column
--- provided we ignore the "duplicate column" error.
+_client = None
+_db = None
 
 
-CREATE TABLE IF NOT EXISTS send_log (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    tenant_id   TEXT NOT NULL,
-    sent_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    recipient   TEXT NOT NULL,
-    size_bytes  INTEGER NOT NULL DEFAULT 0,
-    status      TEXT NOT NULL,       -- accepted | rejected-quota | rejected-upstream
-    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
-);
-
-CREATE INDEX IF NOT EXISTS idx_send_log_tenant_sent
-    ON send_log (tenant_id, sent_at);
-
--- One row per (tenant, window) tracking when we last raised a soft alert on
--- that window. Used in milestone 4 to implement the cool-down: don't spam
--- Zulip while a tenant sits above the soft threshold.
-CREATE TABLE IF NOT EXISTS alert_state (
-    tenant_id   TEXT NOT NULL,
-    window_kind TEXT NOT NULL,       -- 10min | 24h | month
-    last_alert_at TEXT,
-    PRIMARY KEY (tenant_id, window_kind),
-    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
-);
-"""
-
-
-@contextmanager
-def db_conn():
-    """Short-lived connection. isolation_level=None → autocommit; each
-    statement is its own tx. Enough for a low-QPS shim; we can revisit if
-    contention shows up in metrics."""
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH), isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode = WAL;")
-    conn.execute("PRAGMA foreign_keys = ON;")
-    try:
-        yield conn
-    finally:
-        conn.close()
+def _get_db():
+    """Lazily initialise the mongo client on first access and return the
+    database handle. Kept module-global rather than passed around because
+    the aiosmtpd handler hooks aren't easy to inject dependencies into."""
+    global _client, _db
+    if _db is None:
+        # Timeouts are short — a 30s socketTimeout would freeze an SMTP
+        # session for half a minute if mongo hiccups. We'd rather fail
+        # fast and return a 4xx to the client.
+        _client = MongoClient(MONGO_URL, serverSelectionTimeoutMS=5000)
+        _db = _client[MONGO_DB_NAME]
+    return _db
 
 
 def init_schema() -> None:
-    with db_conn() as conn:
-        conn.executescript(SCHEMA)
-        # In-place migration for existing state.db files. IF NOT EXISTS
-        # isn't supported by ALTER TABLE in SQLite < 3.35, so we brute-
-        # force via try/except and swallow "duplicate column name".
-        try:
-            conn.execute("ALTER TABLE tenants ADD COLUMN upstream_domain_id TEXT")
-        except sqlite3.OperationalError as exc:
-            if "duplicate column name" not in str(exc):
-                raise
-    LOG.info("state db ready at %s", DB_PATH)
+    """Idempotent: create the indexes we depend on. MongoDB creates
+    collections on first write; no explicit CREATE is needed."""
+    db = _get_db()
+    # Fail fast if mongo isn't reachable so the daemon doesn't come up
+    # thinking it's healthy.
+    db.command("ping")
+    db["send_log"].create_index([("tenant_id", ASCENDING), ("sent_at", DESCENDING)])
+    db["send_log"].create_index([("sent_at", ASCENDING)])  # prune scan
+    LOG.info("tooling mongo ready at %s (db=%s)", MONGO_URL, MONGO_DB_NAME)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(tz=timezone.utc)
 
 
 # --- Auth backend ----------------------------------------------------------
 
 def _lookup_tenant_pass_hash(tenant_id: str) -> bytes | None:
-    with db_conn() as conn:
-        row = conn.execute(
-            "SELECT pass_hash FROM tenants WHERE tenant_id = ? AND mail_status = 'active'",
-            (tenant_id,),
-        ).fetchone()
-    if row is None:
+    doc = _get_db()["tenants"].find_one(
+        {"_id": tenant_id, "mail_status": "active"},
+        {"pass_hash": 1},
+    )
+    if doc is None or "pass_hash" not in doc:
         return None
-    return row["pass_hash"].encode("utf-8")
+    ph = doc["pass_hash"]
+    # Documents inserted by mail-relay-ctl store the bcrypt hash as string;
+    # if someone stored raw bytes, be forgiving.
+    return ph.encode("utf-8") if isinstance(ph, str) else bytes(ph)
 
 
 def _peer_key(session) -> str:
@@ -373,37 +352,47 @@ def check_from_ownership(authed_tenant: str, from_addr: str) -> bool:
 
 # --- Quota bookkeeping -----------------------------------------------------
 
-def _load_tenant_row(tenant_id: str) -> sqlite3.Row | None:
-    with db_conn() as conn:
-        return conn.execute(
-            "SELECT * FROM tenants WHERE tenant_id = ?", (tenant_id,)
-        ).fetchone()
+# Convert WINDOW_DEFS offset strings ("-10 minutes", "-1 day", "-30 days")
+# into timedelta so we can compare against pymongo BSON datetime values.
+_WINDOW_DELTAS = {
+    "10min": timedelta(minutes=10),
+    "24h":   timedelta(days=1),
+    "month": timedelta(days=30),
+}
+
+
+def _load_tenant_doc(tenant_id: str) -> dict | None:
+    return _get_db()["tenants"].find_one({"_id": tenant_id})
 
 
 def get_window_counters(tenant_id: str) -> dict[str, int]:
     """Return {'10min': n, '24h': n, 'month': n} — number of accepted
-    sends (status includes 'sent-upstream' and log-only) in each window."""
+    sends (status includes 'sent-upstream' and 'log-only') in each window."""
+    now = _utcnow()
     counts: dict[str, int] = {}
-    with db_conn() as conn:
-        for name, offset, *_ in WINDOW_DEFS:
-            row = conn.execute(
-                "SELECT COUNT(*) AS n FROM send_log "
-                "WHERE tenant_id = ? "
-                "  AND status IN ('sent-upstream', 'log-only') "
-                "  AND sent_at >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)",
-                (tenant_id, offset),
-            ).fetchone()
-            counts[name] = row["n"] if row else 0
+    coll = _get_db()["send_log"]
+    for name, _off, *_ in WINDOW_DEFS:
+        cutoff = now - _WINDOW_DELTAS[name]
+        counts[name] = coll.count_documents({
+            "tenant_id": tenant_id,
+            "status": {"$in": ["sent-upstream", "log-only"]},
+            "sent_at": {"$gte": cutoff},
+        })
     return counts
 
 
-def effective_thresholds(row: sqlite3.Row | None) -> dict[str, tuple[int, int]]:
+def effective_thresholds(doc: dict | None) -> dict[str, tuple[int, int]]:
     """Merge per-tenant overrides with daemon defaults. Returns
-    {window: (hard, soft)}."""
+    {window: (hard, soft)}. Missing / None fields fall back to defaults."""
     out: dict[str, tuple[int, int]] = {}
     for name, _off, def_hard, def_soft, _cd, hard_col, soft_col in WINDOW_DEFS:
-        hard = row[hard_col] if row and row[hard_col] is not None else def_hard
-        soft = row[soft_col] if row and row[soft_col] is not None else def_soft
+        hard = def_hard
+        soft = def_soft
+        if doc:
+            if doc.get(hard_col) is not None:
+                hard = doc[hard_col]
+            if doc.get(soft_col) is not None:
+                soft = doc[soft_col]
         out[name] = (hard, soft)
     return out
 
@@ -477,33 +466,33 @@ def _cooldown_for(window: str) -> int:
     return COOLDOWN_10MIN_SECONDS
 
 
+def _try_claim_alert(tenant_id: str, marker: str, cooldown_seconds: int) -> bool:
+    """Compound-key upsert on alert_state. Returns True iff we should fire
+    the alert now (i.e. no prior alert or the previous one is outside the
+    cool-down). The find-and-update is not atomic against a concurrent
+    daemon, but there is only ever one relay per VDS so that's fine."""
+    now = _utcnow()
+    cutoff = now - timedelta(seconds=cooldown_seconds)
+    coll = _get_db()["alert_state"]
+    doc_id = {"tenant": tenant_id, "window": marker}
+    existing = coll.find_one({"_id": doc_id})
+    if existing and existing.get("last_alert_at") and existing["last_alert_at"] > cutoff:
+        return False
+    coll.update_one(
+        {"_id": doc_id},
+        {"$set": {"last_alert_at": now}},
+        upsert=True,
+    )
+    return True
+
+
 def _maybe_alert_soft(tenant_id: str, window: str,
                        current_count: int, hard: int, soft: int) -> None:
     """Fire a Zulip soft-alert notif if this (tenant, window) hasn't been
     alerted within its cool-down. Uses alert_state as source of truth so
     a daemon restart doesn't re-flood."""
-    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    cutoff_delta = _cooldown_for(window)
-    with db_conn() as conn:
-        row = conn.execute(
-            "SELECT last_alert_at FROM alert_state "
-            "WHERE tenant_id = ? AND window_kind = ?",
-            (tenant_id, window),
-        ).fetchone()
-        if row and row["last_alert_at"]:
-            try:
-                last = datetime.strptime(row["last_alert_at"], "%Y-%m-%dT%H:%M:%SZ")
-                last = last.replace(tzinfo=timezone.utc)
-                if (datetime.now(timezone.utc) - last).total_seconds() < cutoff_delta:
-                    return
-            except ValueError:
-                pass  # malformed timestamp — treat as no prior alert
-        conn.execute(
-            "INSERT INTO alert_state (tenant_id, window_kind, last_alert_at) "
-            "VALUES (?, ?, ?) "
-            "ON CONFLICT(tenant_id, window_kind) DO UPDATE SET last_alert_at = excluded.last_alert_at",
-            (tenant_id, window, now_iso),
-        )
+    if not _try_claim_alert(tenant_id, window, _cooldown_for(window)):
+        return
     site_url = f"https://{tenant_id}.{ZONE}/" if ZONE else f"(tenant {tenant_id})"
     subject = f"[be-BOP mail-relay] soft alert {window} — tenant '{tenant_id}'"
     body = (
@@ -515,32 +504,10 @@ def _maybe_alert_soft(tenant_id: str, window: str,
 
 
 def _alert_hard_cap(tenant_id: str, window: str, current_count: int, hard: int) -> None:
-    """Fire a Zulip alert once when the hard cap kicks in. Uses a distinct
-    marker so we don't collide with soft-alert cool-downs."""
-    marker = f"{window}:hard"
-    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    with db_conn() as conn:
-        row = conn.execute(
-            "SELECT last_alert_at FROM alert_state "
-            "WHERE tenant_id = ? AND window_kind = ?",
-            (tenant_id, marker),
-        ).fetchone()
-        if row and row["last_alert_at"]:
-            try:
-                last = datetime.strptime(row["last_alert_at"], "%Y-%m-%dT%H:%M:%SZ")
-                last = last.replace(tzinfo=timezone.utc)
-                # Re-alert on hard cap at most once per hour — enough to
-                # keep ops looking without being noisy.
-                if (datetime.now(timezone.utc) - last).total_seconds() < 3600:
-                    return
-            except ValueError:
-                pass
-        conn.execute(
-            "INSERT INTO alert_state (tenant_id, window_kind, last_alert_at) "
-            "VALUES (?, ?, ?) "
-            "ON CONFLICT(tenant_id, window_kind) DO UPDATE SET last_alert_at = excluded.last_alert_at",
-            (tenant_id, marker, now_iso),
-        )
+    """Fire a Zulip alert when the hard cap kicks in, at most once per hour
+    per (tenant, window) so ops isn't flooded during a bulk rejection."""
+    if not _try_claim_alert(tenant_id, f"{window}:hard", 3600):
+        return
     site_url = f"https://{tenant_id}.{ZONE}/" if ZONE else f"(tenant {tenant_id})"
     subject = f"[be-BOP mail-relay] HARD CAP {window} — tenant '{tenant_id}'"
     body = (
@@ -657,8 +624,8 @@ class RelayHandler:
         # 1. Rate-limit / quota check BEFORE forwarding. We snapshot the
         # counters both to reject the message on hard-breach and to detect
         # soft-alert crossings once the send completes.
-        row = _load_tenant_row(tenant_id)
-        caps = effective_thresholds(row)
+        doc = _load_tenant_doc(tenant_id)
+        caps = effective_thresholds(doc)
         counts_before = get_window_counters(tenant_id)
         breached = find_first_hard_breach(counts_before, caps)
         if breached is not None:
@@ -716,13 +683,19 @@ class RelayHandler:
         return reply
 
     def _insert_send_log(self, tenant_id, envelope, size, status):
-        with db_conn() as conn:
-            for rcpt in envelope.rcpt_tos:
-                conn.execute(
-                    "INSERT INTO send_log (tenant_id, recipient, size_bytes, status) "
-                    "VALUES (?, ?, ?, ?)",
-                    (tenant_id, rcpt, size, status),
-                )
+        now = _utcnow()
+        docs = [
+            {
+                "tenant_id": tenant_id,
+                "sent_at": now,
+                "recipient": rcpt,
+                "size_bytes": size,
+                "status": status,
+            }
+            for rcpt in envelope.rcpt_tos
+        ]
+        if docs:
+            _get_db()["send_log"].insert_many(docs)
 
     def _check_soft_alerts(self, tenant_id, counts_before, caps):
         """Called after a successful accept (log-only or sent-upstream) to

@@ -252,6 +252,7 @@ step_install_apt_packages() {
         python3-aiosmtpd        # ingress SMTP (accept from tenants)
         python3-aiosmtplib      # egress SMTP (forward to Scaleway TEM)
         python3-bcrypt          # tenant password hashing for the mail-relay
+        python3-pymongo         # mail-relay reads/writes its state in mongod@tooling
         docker.io
         netdata
     )
@@ -698,7 +699,7 @@ step_install_tooling_libs_and_scripts() {
     fi
     log_info "Installing per-tenant scripts to /usr/local/bin/..."
     local script
-    for script in add-tenant.sh remove-tenant.sh migrate-tenant.sh upgrade-tenant.sh upgrade-all.sh list-tenants.sh find-orphans.sh mail-relay-ctl.sh tenant-cli.sh gh-rate-limit.sh certbot-renew-check.sh backup-tenants.sh backup-tooling.sh restore-tenant.sh restore-tooling.sh freeze-tenant.sh bebop-exit-handler.sh bebop-mongo-preflight.sh test-tenant-reaper.sh; do
+    for script in add-tenant.sh remove-tenant.sh migrate-tenant.sh upgrade-tenant.sh upgrade-all.sh list-tenants.sh find-orphans.sh mail-relay-ctl.sh tenant-cli.sh gh-rate-limit.sh certbot-renew-check.sh backup-tenants.sh backup-tooling.sh restore-tenant.sh restore-tooling.sh freeze-tenant.sh bebop-exit-handler.sh bebop-mongo-preflight.sh bebop-mail-relay-preflight.sh test-tenant-reaper.sh; do
         if [[ -f "${SCRIPT_DIR}/${script}" ]]; then
             maybe_run run_privileged install -m 0755 "${SCRIPT_DIR}/${script}" "/usr/local/bin/${script}"
         else
@@ -1274,10 +1275,37 @@ step_setup_test_tenant_deploy_api() {
     log_info "Reaper sweeping every 5 min (TTL=${BEBOP_TEST_TENANT_TTL_SECONDS:-7200}s)"
 }
 
+# === tooling MongoDB ====================================================
+# A dedicated mongod@tooling instance holds the state used by tools whose
+# scope is host-wide (not per-tenant). Today that means the mail-relay
+# (tenants creds, send_log, alert_state). Runs on a fixed port well above
+# the per-tenant range so it can never collide with allocations.
+#
+# The instance reuses the existing mongod@.service template (same
+# hardening, same StateDirectory pattern), so we only have to seed its
+# port.env and let systemd do the rest. RS init happens at first
+# bebop-mail-relay start via bebop-mail-relay-preflight.sh.
+step_setup_tooling_mongodb() {
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[dry-run] would enable mongod@tooling on 127.0.0.1:27100"
+        return 0
+    fi
+    log_info "Provisioning mongod@tooling..."
+    run_privileged install -d -m 0755 /etc/be-BOP-mongodb/tooling
+    local tmp
+    tmp=$(mktemp)
+    printf 'MONGO_PORT=27100\n' > "$tmp"
+    run_privileged install -m 0640 "$tmp" /etc/be-BOP-mongodb/tooling/port.env
+    rm -f "$tmp"
+    run_privileged systemctl enable --now mongod@tooling.service
+    log_info "mongod@tooling listening on 127.0.0.1:27100 (db=bebop_tooling)"
+}
+
 # === mail-relay =========================================================
 # The fake SMTP shim that be-BOP tenants use for outbound mail. Loopback-
-# only; forwards to the configured transactional provider (Scaleway TEM
-# in V1). Idempotent — safe to re-run on updates.
+# only; forwards to the configured transactional provider (Scaleway TEM in
+# V1). State lives on mongod@tooling (see step_setup_tooling_mongodb).
+# Idempotent — safe to re-run on updates.
 step_setup_mail_relay() {
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[dry-run] would install bebop-mail-relay + retry timer systemd units"
@@ -1411,6 +1439,7 @@ main() {
     step_setup_nightly_upgrade
 
     step_setup_test_tenant_deploy_api
+    step_setup_tooling_mongodb
     step_setup_mail_relay
 
     step_print_summary

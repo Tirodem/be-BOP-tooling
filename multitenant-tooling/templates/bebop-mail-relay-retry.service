@@ -3,7 +3,7 @@
 #
 # Periodic sweep that declares tenants' sending domains upstream (i.e.
 # with whichever transactional provider is configured — Scaleway TEM in
-# V1). Scans the mail-relay SQLite for rows with upstream_domain_id IS
+# V1). Scans the mail-relay's tooling MongoDB for docs with upstream_domain_id IS
 # NULL and delegates each to lib/scaleway.sh's mail_upstream_setup_domain.
 # Silent no-op if the operator hasn't provided upstream credentials — the
 # fake SMTP runs standalone whether upstream is configured or not.

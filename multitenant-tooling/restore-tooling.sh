@@ -133,8 +133,12 @@ unzip -qq "$DEC" -d "$STAGE"
 
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 count=0
+# Config files are laid out with their absolute paths inside the archive.
+# The mongodump sits at ${STAGE}/mongodump-tooling/ and gets restored
+# separately with mongorestore below.
 while IFS= read -r -d '' src; do
     dst="${src#${STAGE}}"
+    [[ "$dst" == /mongodump-tooling/* ]] && continue
     if [[ "$DRY_RUN" == "true" ]]; then
         log_info "[dry-run] would restore ${dst}"
         continue
@@ -147,4 +151,26 @@ while IFS= read -r -d '' src; do
     (( count++ )) || true
 done < <(find "$STAGE" -type f -print0)
 
-log_info "restore-tooling: restored ${count} file(s) from ${ARCHIVE_NAME} (backups suffix .bak.${TS})"
+# mongorestore of the tooling database. Uses --drop so a partial restore
+# doesn't leave stale documents alongside the restored ones. Assumes
+# mongod@tooling is already up (host-bootstrap sets it up before this
+# script would ever be run in a rebuild sequence).
+if [[ -d "${STAGE}/mongodump-tooling/bebop_tooling" ]]; then
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[dry-run] would mongorestore bebop_tooling from ${STAGE}/mongodump-tooling"
+    else
+        local_port=27100
+        [[ -r /etc/be-BOP-mongodb/tooling/port.env ]] && {
+            # shellcheck disable=SC1091
+            source /etc/be-BOP-mongodb/tooling/port.env
+            local_port="${MONGO_PORT:-27100}"
+        }
+        mongorestore --quiet --port "$local_port" --drop \
+            --nsInclude 'bebop_tooling.*' \
+            "${STAGE}/mongodump-tooling" \
+            || die "mongorestore of bebop_tooling failed"
+        log_info "restore-tooling: bebop_tooling restored via mongorestore"
+    fi
+fi
+
+log_info "restore-tooling: restored ${count} config file(s) from ${ARCHIVE_NAME} (backups suffix .bak.${TS})"

@@ -8,12 +8,14 @@
 # — Mongo dump, Garage bucket, phoenixd seed). This one covers the
 # host-wide state needed to rebuild a VDS from scratch:
 #
-#   - /var/lib/be-BOP/mail-relay/state.db      (relay SQLite: tenant creds,
-#                                                send_log, alert_state)
+#   - mongodump of the tooling database (bebop_tooling on mongod@tooling:
+#     mail-relay's tenants creds, send_log, alert_state — anything a future
+#     host-wide tool stores in the same instance)
 #   - /var/lib/be-BOP/tenants.tsv              (tenant registry)
 #   - /etc/be-BOP-tooling/secrets.env          (provider credentials)
 #   - /etc/be-BOP/<tenant>/config.env          (per-tenant node env)
 #   - /etc/be-BOP-mongodb/<tenant>/port.env    (per-tenant mongod port)
+#   - /etc/be-BOP-mongodb/tooling/port.env     (tooling mongod port)
 #   - /etc/phoenixd/<tenant>/port.env          (per-tenant phoenixd port)
 #
 # Bundled into a single .zip, encrypted with BACKUP_ENCRYPTION_KEY from
@@ -93,11 +95,10 @@ _run() { if [[ "$DRY_RUN" == "true" ]]; then log_info "[dry-run] $*"; else "$@";
 collect_stage() {
     local stage="${WORK}/stage"
     install -d -m 0755 "$stage"
-    # We stage under the same paths (with /) so tar preserves absolute
-    # layout for a straight-forward restore.
+    # Config files staged under their absolute paths so tar/zip preserves
+    # the layout — a restore drops each back where it came from.
     local src
     for src in \
-            /var/lib/be-BOP/mail-relay/state.db \
             /var/lib/be-BOP/tenants.tsv \
             /etc/be-BOP-tooling/secrets.env; do
         if [[ -f "$src" ]]; then
@@ -105,7 +106,8 @@ collect_stage() {
             install -m 0600 "$src" "${stage}${src}"
         fi
     done
-    # Per-tenant dirs (config.env only — data lives in backup-tenants).
+    # Per-tenant + tooling dirs (config.env / port.env only — merchant
+    # data lives in backup-tenants).
     local base
     for base in /etc/be-BOP /etc/be-BOP-mongodb /etc/phoenixd; do
         [[ -d "$base" ]] || continue
@@ -117,6 +119,18 @@ collect_stage() {
                 | xargs -0 -r -I{} install -m 0600 "{}" "${stage}{}"
         done < <(find "$base" -mindepth 1 -maxdepth 1 -type d)
     done
+    # mongodump of the tooling database. The dump lands under a stable
+    # relative path inside the archive so restore-tooling can find it.
+    local mongo_port=27100
+    [[ -r /etc/be-BOP-mongodb/tooling/port.env ]] && {
+        # shellcheck disable=SC1091
+        source /etc/be-BOP-mongodb/tooling/port.env
+        mongo_port="${MONGO_PORT:-27100}"
+    }
+    install -d -m 0755 "${stage}/mongodump-tooling"
+    mongodump --quiet --port "$mongo_port" --db bebop_tooling \
+        --out "${stage}/mongodump-tooling" \
+        || die "mongodump of bebop_tooling failed"
     printf '%s' "$stage"
 }
 

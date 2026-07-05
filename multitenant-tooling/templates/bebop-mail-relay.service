@@ -6,23 +6,23 @@
 # to the transactional provider (Scaleway TEM in V1). Provider-agnostic by
 # design: swap the outbound side without changing anything tenant-side.
 #
-# Runs sandboxed (DynamicUser). State (SQLite: creds + send log + quotas)
-# lives under /var/lib/be-BOP/mail-relay/ via StateDirectory. Master provider
-# credential comes from /etc/be-BOP-tooling/secrets.env.
+# State (tenants creds + send_log + alert_state) lives in mongod@tooling on
+# 127.0.0.1:27100 (dedicated tooling instance provisioned by
+# host-bootstrap step_setup_tooling_mongodb). ExecStartPre guarantees the
+# instance is up + replica-set-initialised before the daemon starts.
 
 [Unit]
 Description=be-BOP — mail relay (fake SMTP shim, forwards to transactional provider)
 Documentation=https://be-bop.io/
-After=network-online.target
-Wants=network-online.target
+After=network-online.target mongod@tooling.service
+Wants=network-online.target mongod@tooling.service
 
 [Service]
 Type=simple
 DynamicUser=yes
-StateDirectory=be-BOP/mail-relay
-StateDirectoryMode=0700
 EnvironmentFile=/etc/be-BOP-tooling/secrets.env
 EnvironmentFile=-/etc/be-BOP-tooling/mail-relay.env
+ExecStartPre=+/usr/local/bin/bebop-mail-relay-preflight.sh
 ExecStart=/usr/bin/python3 /usr/local/share/be-BOP-tooling/lib/mail-relay.py
 Restart=always
 RestartSec=5

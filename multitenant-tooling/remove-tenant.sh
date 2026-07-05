@@ -187,7 +187,7 @@ is_external_tenant() {
 }
 
 # Drop the tenant's mail-relay footprint. Two independent pieces:
-#   1. Local SQLite row (creds + send_log + alert_state) via
+#   1. Local tooling MongoDB row (creds + send_log + alert_state) via
 #      mail-relay-ctl delete.
 #   2. Upstream provider footprint (domain declaration + our DNS records
 #      pointing at it) via lib/scaleway.sh's provider-agnostic
@@ -201,7 +201,7 @@ drop_mail_relay_resources() {
         mail-relay-ctl.sh delete "$TENANT_ID" 2>/dev/null \
             || log_warn "drop_mail_relay: mail-relay-ctl delete '${TENANT_ID}' returned non-zero"
     else
-        log_debug "drop_mail_relay: mail-relay-ctl.sh not on PATH, skipping SQLite cleanup"
+        log_debug "drop_mail_relay: mail-relay-ctl.sh not on PATH, skipping tooling MongoDB cleanup"
     fi
     if ! is_external_tenant && [[ -n "${OVH_DNS_ZONE:-}" ]]; then
         mail_upstream_teardown_domain "$TENANT_ID" "${TENANT_ID}.${OVH_DNS_ZONE}"

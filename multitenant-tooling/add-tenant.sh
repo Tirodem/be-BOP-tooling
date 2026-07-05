@@ -737,7 +737,7 @@ phase_phoenixd() {
 
 # Phase 8b: mail-relay tenant registration (LOCAL ONLY).
 #
-# Creates the tenant's row in the local mail-relay SQLite and seeds its
+# Creates the tenant's row in the tooling MongoDB (mail-relay state) and seeds its
 # runtimeConfig.smtp so bebop@<tenant> starts with a working SMTP config
 # against 127.0.0.1:2525. That's it — this phase touches ZERO upstream
 # provider. The tenant can send from day one (relay accepts AUTH and

@@ -3,7 +3,7 @@
 #
 # Nightly prune of the mail-relay send_log. Rows older than 90 days are
 # deleted — enough to keep 3 months of audit trail while stopping the
-# SQLite from growing unboundedly. The 30-day sliding-month counter
+# tooling MongoDB from growing unboundedly. The 30-day sliding-month counter
 # window is well within retention.
 
 [Unit]
