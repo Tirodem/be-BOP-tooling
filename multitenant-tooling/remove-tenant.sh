@@ -241,14 +241,46 @@ has_local_s3_tenant() {
 
 # Stop and remove the per-tenant mongod instance + its data dir.
 # Used by archive/purge paths only — soft-delete just stops the unit.
+#
+# Belt-and-braces against the "purged tenant retains data" class of bug:
+#   1. stop_disable_unit (already fixed to use is-enabled / is-active)
+#   2. Verify mongod really let go: is-active must be false AND no process
+#      still listening on MONGO_PORT. If either holds, kill it.
+#   3. rm -rf the dirs.
+#   4. Verify the dirs are gone. If not, die — never report "purge complete"
+#      while data survives on disk.
 drop_mongo_resources() {
     log_info "dropping local mongod for ${TENANT_ID} (port=${MONGO_PORT})..."
     stop_disable_unit "mongod@${TENANT_ID}.service"
-    if [[ "$DRY_RUN" != "true" ]]; then
-        run_privileged rm -rf \
-            "/var/lib/be-BOP-mongodb/${TENANT_ID}" \
-            "/etc/be-BOP-mongodb/${TENANT_ID}"
+    [[ "$DRY_RUN" == "true" ]] && return 0
+
+    # 2. Guarantee the process is really gone. systemctl might have said
+    # "OK" while an out-of-cgroup double-forked child still holds the
+    # dbPath. Look for pids on our port and SIGKILL any survivors.
+    local pids
+    pids=$( { run_privileged ss -H -tlnp "sport = :${MONGO_PORT}" 2>/dev/null \
+        | grep -oP 'users:\(\("mongod",pid=\K[0-9]+' \
+        | sort -u; } || true )
+    if [[ -n "$pids" ]]; then
+        log_warn "drop_mongo: mongod still holding port ${MONGO_PORT} (pids: ${pids//$'\n'/,}) — killing"
+        # shellcheck disable=SC2086
+        run_privileged kill -9 $pids 2>/dev/null || true
+        sleep 1
     fi
+
+    # 3. Remove data + config dirs.
+    run_privileged rm -rf \
+        "/var/lib/be-BOP-mongodb/${TENANT_ID}" \
+        "/etc/be-BOP-mongodb/${TENANT_ID}"
+
+    # 4. Refuse to declare success if anything survived.
+    local survivor
+    for survivor in "/var/lib/be-BOP-mongodb/${TENANT_ID}" \
+                    "/etc/be-BOP-mongodb/${TENANT_ID}"; do
+        if run_privileged test -e "$survivor"; then
+            die "drop_mongo: '${survivor}' still exists after rm -rf — refusing to report purge complete"
+        fi
+    done
     log_info "mongod state purged for ${TENANT_ID}"
 }
 
@@ -356,6 +388,20 @@ purge_local_filesystem() {
         "/etc/be-BOP/${TENANT_ID}" \
         "/var/lib/phoenixd/${TENANT_ID}" \
         "/etc/phoenixd/${TENANT_ID}"
+    # Post-rm verification. Any survivor here means a purge that reports
+    # "complete" while data lingers on disk — a real data-hygiene bug
+    # (verified: this is how a purged+recreated tenant could inherit its
+    # predecessor's superadmin). We refuse to declare success on such a
+    # state; the operator has to investigate.
+    local survivor
+    for survivor in "/var/lib/be-BOP/${TENANT_ID}" \
+                    "/etc/be-BOP/${TENANT_ID}" \
+                    "/var/lib/phoenixd/${TENANT_ID}" \
+                    "/etc/phoenixd/${TENANT_ID}"; do
+        if run_privileged test -e "$survivor"; then
+            die "purge_local_filesystem: '${survivor}' still exists after rm -rf — refusing to report purge complete"
+        fi
+    done
 }
 
 # Read tenant fields from the registry into globals.

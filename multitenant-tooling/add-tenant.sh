@@ -667,6 +667,23 @@ phase_garage() {
 # /etc/ trees that hold port.env / config.env.
 phase_directories() {
     log_info "phase 6: directory skeleton for tenant..."
+    # Refuse to create a fresh tenant on top of stale data. A leftover
+    # /var/lib/be-BOP-mongodb/<id> would let the "new" tenant inherit the
+    # previous merchant's DB — including their superadmin credentials —
+    # which is exactly the failure mode this guard exists to close.
+    # Operators purge the resid with `find-orphans.sh --purge <tid>` and
+    # re-run.
+    local residual
+    for residual in "/var/lib/be-BOP/${TENANT_ID}" \
+                    "/var/lib/be-BOP-mongodb/${TENANT_ID}" \
+                    "/var/lib/phoenixd/${TENANT_ID}" \
+                    "/etc/be-BOP/${TENANT_ID}" \
+                    "/etc/be-BOP-mongodb/${TENANT_ID}" \
+                    "/etc/phoenixd/${TENANT_ID}"; do
+        if run_privileged test -e "$residual"; then
+            die "phase_directories: residual '${residual}' exists — a previous purge left data behind. Clean with: sudo find-orphans.sh --purge ${TENANT_ID}"
+        fi
+    done
     run_privileged install -d -m 0755 "/var/lib/be-BOP/${TENANT_ID}"
     run_privileged install -d -m 0755 "/var/lib/be-BOP/${TENANT_ID}/releases"
     run_privileged install -d -m 0755 "/etc/be-BOP/${TENANT_ID}"
