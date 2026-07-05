@@ -679,43 +679,12 @@ phase_garage() {
 # /etc/ trees that hold port.env / config.env.
 phase_directories() {
     log_info "phase 6: directory skeleton for tenant..."
-    # Auto-heal residual data from a previous incomplete purge. On the
-    # fresh path we know the registry says absent, so anything on disk
-    # is stale by definition. We call find-orphans.sh --purge <tid> --yes,
-    # which uses systemctl clean --what=state (handles the DynamicUser +
-    # StateDirectory pairs — both the public symlink and the private
-    # /var/lib/private/… target) plus explicit rm on the config dirs.
-    _has_residual() {
-        local r
-        for r in "/var/lib/be-BOP/${TENANT_ID}" \
-                 "/var/lib/be-BOP-mongodb/${TENANT_ID}" \
-                 "/var/lib/phoenixd/${TENANT_ID}" \
-                 "/var/lib/private/be-BOP/${TENANT_ID}" \
-                 "/var/lib/private/be-BOP-mongodb/${TENANT_ID}" \
-                 "/var/lib/private/phoenixd/${TENANT_ID}" \
-                 "/etc/be-BOP/${TENANT_ID}" \
-                 "/etc/be-BOP-mongodb/${TENANT_ID}" \
-                 "/etc/phoenixd/${TENANT_ID}"; do
-            run_privileged test -e "$r" && { echo "$r"; return 0; }
-        done
-        return 1
-    }
-    local first_residual
-    if first_residual=$(_has_residual); then
-        log_warn "phase_directories: residual data detected ('${first_residual}') — auto-purging via find-orphans.sh"
-        if command -v find-orphans.sh >/dev/null 2>&1; then
-            find-orphans.sh --purge "$TENANT_ID" --yes 2>&1 || true
-        else
-            log_warn "phase_directories: find-orphans.sh not on PATH — cannot auto-purge"
-        fi
-        # Re-check. If a survivor persists after the auto-purge, the bug
-        # is deeper than stale StateDirectory (permissions, external mount,
-        # …) — die so an operator investigates.
-        if first_residual=$(_has_residual); then
-            die "phase_directories: '${first_residual}' still exists after find-orphans auto-purge — investigate manually"
-        fi
-        log_info "phase_directories: residual data cleaned"
-    fi
+    # Residual-data cleanup for prior-run leftovers is deliberately NOT
+    # done here — `preflight_purge_orphans` at the top of main() runs
+    # BEFORE any phase creates legitimate current-tenant state, and it
+    # already sweeps /var/lib/private/… via find-orphans. Doing the same
+    # check here would (and did, in commit 3618886) wipe the mongod state
+    # that phase_mongo just created for the current tenant.
     run_privileged install -d -m 0755 "/var/lib/be-BOP/${TENANT_ID}"
     run_privileged install -d -m 0755 "/var/lib/be-BOP/${TENANT_ID}/releases"
     run_privileged install -d -m 0755 "/etc/be-BOP/${TENANT_ID}"
