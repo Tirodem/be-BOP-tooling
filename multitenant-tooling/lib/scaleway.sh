@@ -92,8 +92,13 @@ scaleway_tem_domain_create() {
         --arg dn "$full_domain" \
         --arg pid "$SCALEWAY_TEM_PROJECT_ID" \
         '{domain_name: $dn, project_id: $pid, autoconfig: false}')
-    if resp=$(_scaleway_api POST \
-            "/regions/${SCALEWAY_TEM_REGION}/domains" "$body"); then
+    # Same $? trap as scaleway_tem_domain_delete: capture rc immediately
+    # (assignment failure via `local rc=$?` right after `if ...; fi`
+    # returns 0 for a non-taken then-branch and hid every 409 conflict).
+    resp=$(_scaleway_api POST \
+            "/regions/${SCALEWAY_TEM_REGION}/domains" "$body")
+    local rc=$?
+    if (( rc == 0 )); then
         local id
         id=$(printf '%s' "$resp" | jq -r '.id // empty')
         [[ -z "$id" ]] && die "scaleway_tem_domain_create: response missing id: ${resp:0:300}"
@@ -102,7 +107,7 @@ scaleway_tem_domain_create() {
         return 0
     fi
     # Conflict → domain already exists in this project. Look it up.
-    if [[ $? -eq 49 ]]; then
+    if (( rc == 49 )); then
         local existing
         existing=$(scaleway_tem_domain_find "$full_domain")
         [[ -z "$existing" ]] && die "scaleway_tem_domain_create: 409 but domain not found on lookup"
@@ -179,21 +184,30 @@ scaleway_tem_domain_status() {
 }
 
 # scaleway_tem_domain_delete <domain_id>
-# Best-effort: 404 is treated as success (already deleted).
+# Best-effort: 404 is treated as success (already gone).
+#
+# The verb on Scaleway's TEM API is `revoke`, not `delete` (the /delete
+# path returns 404). Revoke marks the domain as gone and — per Scaleway
+# doc — releases the slot in the plan's domain quota.
 scaleway_tem_domain_delete() {
     local id="$1"
     [[ -z "$id" ]] && { log_warn "scaleway_tem_domain_delete: empty id, skipping"; return 0; }
-    if _scaleway_api POST \
-            "/regions/${SCALEWAY_TEM_REGION}/domains/${id}/delete" >/dev/null; then
-        log_info "scaleway: domain id=${id} deleted"
+    # Capturing $? via `local rc=$?` AFTER an `if cmd; then ...; fi`
+    # block yields 0 when cmd failed and no branch executed (bash
+    # returns 0 for a "successfully evaluated but false" if statement),
+    # which used to swallow every non-2xx as if it were a success.
+    # Capture rc immediately from the command instead.
+    _scaleway_api POST "/regions/${SCALEWAY_TEM_REGION}/domains/${id}/revoke" "" >/dev/null
+    local rc=$?
+    if (( rc == 0 )); then
+        log_info "scaleway: domain id=${id} revoked"
         return 0
     fi
-    local rc=$?
     if (( rc == 44 )); then
         log_info "scaleway: domain id=${id} already gone (404)"
         return 0
     fi
-    log_warn "scaleway: delete of id=${id} failed (rc=${rc}); leaving to next reconcile"
+    log_warn "scaleway: revoke of id=${id} failed (rc=${rc}); leaving to next reconcile"
     return "$rc"
 }
 
