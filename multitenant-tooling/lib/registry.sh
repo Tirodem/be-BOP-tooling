@@ -109,10 +109,17 @@ _registry_migrate_schema_if_needed() {
     local current_header
     current_header=$(head -n1 "$REGISTRY_PATH" 2>/dev/null || true)
     if [[ "$current_header" == "$REGISTRY_HEADER" ]]; then
+        # Header is current; still check for rows damaged by the earlier
+        # buggy 10→12 migration (column shift bug — 2026-07 incident).
+        _registry_repair_shifted_rows
         return 0
     fi
     if [[ "$current_header" == "$REGISTRY_LEGACY_HEADER_10COLS" ]]; then
         _registry_migrate_10_to_12
+        # Same-run repair pass: in mixed-schema files (header=10 but some
+        # rows already had NF=11 from an even older drift), the migration
+        # would have shifted rows even with the new per-row detection.
+        _registry_repair_shifted_rows
         return 0
     fi
     if [[ "$current_header" == "$REGISTRY_LEGACY_HEADER_11COLS" ]]; then
@@ -120,6 +127,50 @@ _registry_migrate_schema_if_needed() {
         return 0
     fi
     die "registry: unknown header in $REGISTRY_PATH (expected 10/11-col legacy or 12-col current, got: '${current_header}')"
+}
+
+# Repair rows corrupted by the buggy 10→12 migration shipped in commit
+# b1839ea (which assumed NF=10 for every data row and inserted a
+# duplicate mongo_port when the header was 10-col but some rows had
+# already drifted to NF=11 including mongo_port). Fingerprint of a
+# damaged row:
+#
+#   - $5 numeric AND $5 == $6  (duplicate port from insert-then-shift)
+#   - $11 matches ISO 8601      (was created_at, ended up as status)
+#
+# Reversal: drop the duplicate at $6, shift $7..$11 down by one to their
+# semantic positions, and backfill $11 (status) to "active". The original
+# status value was overwritten during the buggy migration and cannot be
+# recovered — operators who had soft-deleted / archived tenants at the
+# time of migration must re-set their status by hand after this pass.
+#
+# Idempotent: the fingerprint no longer matches after a repair (the new
+# $5 is still numeric but the new $6 is a database name, not a port), so
+# subsequent runs are no-ops.
+_registry_repair_shifted_rows() {
+    local tmp count_file
+    tmp=$(mktemp)
+    count_file=$(mktemp)
+    # Sync count via a scratch file — the earlier `2> >(...)` process
+    # substitution races the parent read and yields empty results.
+    awk -F'\t' -v OFS='\t' -v countfile="$count_file" '
+        NR == 1 { print; next }
+        $5 ~ /^[0-9]+$/ && $5 == $6 && $11 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/ {
+            print $1, $2, $3, $4, $5, $7, $8, $9, $10, $11, "active", $12
+            repaired++
+            next
+        }
+        { print }
+        END { print repaired+0 > countfile }
+    ' "$REGISTRY_PATH" > "$tmp"
+    local count
+    count=$(cat "$count_file" 2>/dev/null || echo 0)
+    rm -f "$count_file"
+    if [[ "${count:-0}" -gt 0 ]]; then
+        run_privileged install -m 0644 "$tmp" "$REGISTRY_PATH"
+        log_warn "registry: repaired ${count} row(s) damaged by the 10→12 migration shift bug — status backfilled to 'active' (the original value was overwritten and cannot be recovered; re-set to soft-deleted/archived by hand if needed)"
+    fi
+    rm -f "$tmp"
 }
 
 _registry_migrate_11_to_12() {
@@ -139,30 +190,46 @@ _registry_migrate_10_to_12() {
     log_info "registry: migrating $REGISTRY_PATH from 10-col (pre-mongo_port) to 12-col schema"
     local tmp
     tmp=$(mktemp)
-    # Write the new header first.
     printf '%s\n' "$REGISTRY_HEADER" > "$tmp"
-    # Iterate data rows and reconstruct with the two missing columns
-    # inserted. Column 5 (mongo_port) is backfilled from
-    # /etc/be-BOP-mongodb/<tid>/port.env if present; column 12 (external)
-    # is set to 0 (internal).
-    local row tid port_env mongo_port
+    # Per-row NF detection: the header can legitimately say 10 cols
+    # while some data rows have already drifted to 11 (mongo_port
+    # present in the row but not in the header — the schema drift that
+    # caused the 2026-07 shift-bug incident). Handle each row on its
+    # actual NF instead of forcing a rewrite based on the header.
+    local row tid nf port_env mongo_port
     while IFS= read -r row; do
-        # Skip empty lines (defensive).
         [[ -z "$row" ]] && continue
         tid=$(printf '%s' "$row" | cut -f1)
-        port_env="/etc/be-BOP-mongodb/${tid}/port.env"
-        mongo_port=""
-        if [[ -f "$port_env" ]]; then
-            mongo_port=$(grep -Eo '^MONGO_PORT=[0-9]+' "$port_env" 2>/dev/null | cut -d= -f2 | head -1)
-        fi
-        if [[ -z "$mongo_port" ]]; then
-            log_warn "registry: could not backfill mongo_port for tenant '${tid}' (no ${port_env}); leaving empty — expect breakage on any port-dependent op, purge the tenant or fix the row"
-        fi
-        # awk with an insert-at-position pattern: fields 1..4 → same,
-        # insert mongo_port, then fields 5..10 → same, then external=0.
-        printf '%s' "$row" | awk -F'\t' -v OFS='\t' -v mp="$mongo_port" '
-            { print $1, $2, $3, $4, mp, $5, $6, $7, $8, $9, $10, 0 }
-        ' >> "$tmp"
+        nf=$(printf '%s' "$row" | awk -F'\t' '{print NF}')
+        case "$nf" in
+            10)
+                # True 10-col row: insert backfilled mongo_port at pos 5,
+                # append external=0 at pos 12.
+                port_env="/etc/be-BOP-mongodb/${tid}/port.env"
+                mongo_port=""
+                if [[ -f "$port_env" ]]; then
+                    mongo_port=$(grep -Eo '^MONGO_PORT=[0-9]+' "$port_env" 2>/dev/null | cut -d= -f2 | head -1)
+                fi
+                [[ -z "$mongo_port" ]] && log_warn "registry: could not backfill mongo_port for tenant '${tid}' (no ${port_env}); leaving empty"
+                printf '%s' "$row" | awk -F'\t' -v OFS='\t' -v mp="$mongo_port" '
+                    { print $1, $2, $3, $4, mp, $5, $6, $7, $8, $9, $10, 0 }
+                ' >> "$tmp"
+                ;;
+            11)
+                # Drift row: mongo_port already at pos 5 despite header
+                # not advertising it. Just append external=0.
+                log_info "registry: tenant '${tid}' row already had mongo_port (NF=11 under 10-col header); appending external=0 only"
+                printf '%s\t0\n' "$row" >> "$tmp"
+                ;;
+            12)
+                log_info "registry: tenant '${tid}' row already 12 cols; keeping as-is"
+                printf '%s\n' "$row" >> "$tmp"
+                ;;
+            *)
+                log_warn "registry: unexpected NF=${nf} for tenant '${tid}', keeping row as-is (manual repair likely needed)"
+                printf '%s\n' "$row" >> "$tmp"
+                ;;
+        esac
     done < <(tail -n +2 "$REGISTRY_PATH")
     run_privileged install -m 0644 "$tmp" "$REGISTRY_PATH"
     rm -f "$tmp"
