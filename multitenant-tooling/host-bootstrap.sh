@@ -76,6 +76,8 @@ source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
 source "$BEBOP_TOOLING_LIB_DIR/registry.sh"
 # shellcheck source=lib/dns_provider.sh
 source "$BEBOP_TOOLING_LIB_DIR/dns_provider.sh"
+# shellcheck source=lib/nginx.sh
+source "$BEBOP_TOOLING_LIB_DIR/nginx.sh"
 
 BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
@@ -557,87 +559,9 @@ step_provision_garage_layout() {
     fi
 }
 
-# Pre-flight for every `nginx -t` we run in host-bootstrap.sh: scan
-# sites-enabled/ symlinks for vhosts referencing SSL cert files that
-# don't exist on disk (typical after an interrupted migrate-tenant.sh
-# or a manual `certbot delete` without a corresponding vhost update).
-# Any such vhost would make `nginx -t` fail and block the entire infra
-# update — so we quarantine them by removing the symlink from
-# sites-enabled/ (the file in sites-available/ stays intact so the
-# operator can trace what was removed). Idempotent + non-destructive:
-# on a healthy host it does nothing and logs nothing.
-#
-# Rationale: infra updates must NEVER be blocked by tenant-specific
-# broken state. An operator with one busted tenant should still be able
-# to run `install.sh` to deploy new tooling code (including the fix
-# for whatever broke that tenant). Loud log_warn per quarantined
-# tenant so the operator sees exactly which ones need repair via
-# `add-tenant.sh <tid> --admin-email <addr>`.
-_nginx_quarantine_broken_vhosts() {
-    local sites_enabled=/etc/nginx/sites-enabled
-    [[ -d "$sites_enabled" ]] || return 0
-    local link vhost_file cert_path missing_cert quarantined=0
-    for link in "$sites_enabled"/*; do
-        [[ -L "$link" || -f "$link" ]] || continue
-        vhost_file=$(readlink -f "$link" 2>/dev/null || echo "$link")
-        [[ -r "$vhost_file" ]] || continue
-        missing_cert=""
-        while IFS= read -r cert_path; do
-            [[ -z "$cert_path" ]] && continue
-            if [[ ! -e "$cert_path" ]]; then
-                missing_cert="$cert_path"
-                break
-            fi
-        done < <(grep -E '^[[:space:]]*ssl_certificate(_key)?[[:space:]]+' "$vhost_file" \
-                 | awk '{print $2}' \
-                 | tr -d ';')
-        if [[ -n "$missing_cert" ]]; then
-            log_warn "nginx: quarantining vhost '$(basename "$link")' — cert '${missing_cert}' missing on disk. Re-run \`add-tenant.sh <tid> --admin-email <addr>\` to restore. Symlink removed from sites-enabled; file preserved in sites-available for reference."
-            maybe_run run_privileged rm -f "$link"
-            (( quarantined++ ))
-        fi
-    done
-    if (( quarantined > 0 )); then
-        log_warn "nginx: ${quarantined} broken vhost(s) quarantined so this infra update can proceed"
-    fi
-
-    # Second pass: run `nginx -t` to detect vhosts that fail on syntax
-    # rather than on a missing cert. Extract the failing file from the
-    # stderr (nginx prints `... in <path>:<line>`), quarantine it, retry.
-    # Bounded loop — stop after each sites-enabled/ vhost has had one
-    # chance to be quarantined. If nginx -t still fails after the loop,
-    # we let it propagate (unrelated infra corruption, operator should
-    # see the raw error).
-    local max_iter iter=0 nginx_err offender
-    if [[ "${DRY_RUN:-false}" == "true" ]]; then
-        return 0
-    fi
-    max_iter=$(find "$sites_enabled" -maxdepth 1 -mindepth 1 2>/dev/null | wc -l)
-    while (( iter < max_iter )); do
-        nginx_err=$(run_privileged nginx -t 2>&1) && return 0
-        # Find the FIRST sites-enabled/ path mentioned by nginx in its
-        # error. Match `/etc/nginx/sites-enabled/<basename>` — nginx
-        # reports the file it was reading when it choked.
-        offender=$(printf '%s\n' "$nginx_err" \
-            | grep -oE "${sites_enabled}/[^ :]+" \
-            | head -1)
-        if [[ -z "$offender" || ! -e "$offender" ]]; then
-            # nginx -t is failing for a reason we can't isolate to a
-            # vhost file (bad main config, bad included file outside
-            # sites-enabled/, etc.). Bail — let the caller surface it.
-            log_warn "nginx -t failed but couldn't identify a sites-enabled/ vhost to quarantine; full error follows"
-            printf '%s\n' "$nginx_err" | while IFS= read -r line; do log_warn "nginx: ${line}"; done
-            return 0
-        fi
-        log_warn "nginx: quarantining vhost '$(basename "$offender")' — syntax rejected by nginx -t. Symlink removed from sites-enabled; file preserved in sites-available for reference."
-        maybe_run run_privileged rm -f "$offender"
-        (( iter++ ))
-        (( quarantined++ ))
-    done
-    if (( quarantined > 0 )); then
-        log_warn "nginx: total ${quarantined} vhost(s) quarantined (cert-missing + syntax combined)"
-    fi
-}
+# _nginx_quarantine_broken_vhosts moved to lib/nginx.sh so add-tenant.sh
+# can also call it before its own `nginx -t` in phase_nginx. Old callers
+# keep working via a compatibility alias inside lib/nginx.sh.
 
 # === nginx default catch-all + ACME HTTP-01 webroot =====================
 # The default vhost has TWO responsibilities, both load-bearing:

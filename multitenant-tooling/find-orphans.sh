@@ -180,14 +180,31 @@ discover_nginx_ids() {
     done
 }
 
+# Cert names owned by the infra layer (not tenants). Anything in this
+# list must be excluded from discover_le_ids — otherwise find-orphans
+# extracts an "id" from them, doesn't find that id in the tenant
+# registry, treats it as orphan, and `certbot delete` wipes an infra
+# cert. Observed on 2026-07 when bebop-deploy-api got shredded, breaking
+# nginx -t for every subsequent add-tenant.sh.
+#
+# Names here should exactly match the `--cert-name` values used in
+# host-bootstrap.sh's certbot invocations. Keep in sync manually — a
+# dedicated helper wasn't worth the plumbing for the ~3 known names.
+readonly INFRA_LE_CERT_IDS=$'deploy-api'
+
 # Let's Encrypt live dirs: bebop-<id> and bebop-<id>-s3.
+# `deploy-api` (and any other name in INFRA_LE_CERT_IDS) is excluded
+# because those live-dirs are bebop-<name> per host-bootstrap.sh
+# convention but the "name" is infrastructure, not a tenant id.
 discover_le_ids() {
     run_privileged test -d /etc/letsencrypt/live || return 0
     run_privileged find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d \
         -name 'bebop-*' -printf '%f\n' 2>/dev/null \
         | sed -nE 's/^bebop-(.+)$/\1/p' \
         | sed -E 's/-s3$//' \
-        | grep -v '^$' || true
+        | grep -v '^$' \
+        | grep -vxF "$INFRA_LE_CERT_IDS" \
+        || true
 }
 
 # Union of all discovered ids, deduplicated and sorted.

@@ -44,6 +44,8 @@ source "$BEBOP_TOOLING_LIB_DIR/transaction.sh"
 source "$BEBOP_TOOLING_LIB_DIR/registry.sh"
 # shellcheck source=lib/dns_provider.sh
 source "$BEBOP_TOOLING_LIB_DIR/dns_provider.sh"
+# shellcheck source=lib/nginx.sh
+source "$BEBOP_TOOLING_LIB_DIR/nginx.sh"
 # shellcheck source=lib/scaleway.sh
 source "$BEBOP_TOOLING_LIB_DIR/scaleway.sh"
 # shellcheck source=lib/mongo.sh
@@ -1128,6 +1130,13 @@ phase_nginx() {
     txn_register_undo "nginx vhost bebop-${TENANT_ID}" \
         "run_privileged rm -f '${enabled}' '${available}' && run_privileged systemctl reload nginx"
     if [[ "$DRY_RUN" != "true" ]]; then
+        # Quarantine any pre-existing broken vhost (cert missing or
+        # syntax invalid) before `nginx -t` — otherwise a completely
+        # valid tenant deploy fails just because ANOTHER vhost is
+        # broken. Observed 2026-07 when find-orphans deleted the
+        # bebop-deploy-api cert; every subsequent add-tenant.sh rolled
+        # back at phase 11.
+        nginx_quarantine_broken_vhosts
         if ! run_privileged nginx -t; then
             die "nginx -t failed after writing vhost — check /etc/nginx/sites-available/bebop-${TENANT_ID}.conf"
         fi
