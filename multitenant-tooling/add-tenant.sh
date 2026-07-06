@@ -860,53 +860,7 @@ phase_mail_relay() {
         --argjson fake false \
         '{host: $host, port: $port, user: $user, password: $pass, from: $from, fake: $fake}')
     RUNTIME_CONFIG_OVERRIDES+=("false:smtp=${smtp_value}")
-    log_info "mail-relay: '${TENANT_ID}' relay row + runtimeConfig.smtp queued"
-}
-
-# Phase 8c: upstream sending-domain declaration (Scaleway TEM).
-#
-# We do this in-line right after phase_mail_relay instead of leaving it
-# entirely to the retry-upstream timer (which fires every 15 min) so that
-# a freshly deployed tenant can send email within seconds instead of
-# minutes. Non-fatal: any failure here is logged as a warning and the
-# deploy carries on — the timer will retry, matching the pre-existing
-# semantic. This keeps the tenant's local resources (mongo, garage,
-# nginx, cert, kuma) reachable even if Scaleway is temporarily down or
-# out of quota.
-#
-# Called AFTER phase_mail_relay (which creates the local relay row and
-# queues runtimeConfig.smtp) — the runtime-config apply happens in phase
-# 12 which is downstream of us. Order matters because
-# mail_upstream_setup_domain publishes the SPF/DKIM/DMARC/MX records at
-# the DNS provider — the DNS zone must already exist by phase 3 and DNS
-# records are additive, so this is safe here.
-phase_mail_relay_upstream() {
-    if is_external_mode; then
-        log_info "phase 8c: --external-domain tenant — upstream declaration still uses <tid>.<BEBOP_DNS_ZONE>"
-    else
-        log_info "phase 8c: mail-relay upstream declaration (Scaleway TEM)..."
-    fi
-    if ! mail_upstream_is_configured; then
-        log_warn "phase 8c: upstream provider not configured (SCALEWAY_TEM_API_KEY/SCALEWAY_TEM_PROJECT_ID unset) — skipping. bebop-mail-relay-retry.timer picks it up as soon as creds appear in secrets.env"
-        return 0
-    fi
-    if [[ -z "${BEBOP_DNS_ZONE:-}" ]]; then
-        log_warn "phase 8c: BEBOP_DNS_ZONE unset — skipping upstream declaration"
-        return 0
-    fi
-    local full_domain="${TENANT_ID}.${BEBOP_DNS_ZONE}"
-    local domain_id
-    if ! domain_id=$(mail_upstream_setup_domain "$TENANT_ID" "$full_domain"); then
-        log_warn "phase 8c: upstream declaration for '${full_domain}' failed — the 15-min retry timer will retry. Not blocking the deploy."
-        return 0
-    fi
-    # Stamp the tenant's row so the timer skips it on future ticks
-    # (mirror what `mail-relay-ctl.sh retry-upstream` does on success).
-    if command -v mail-relay-ctl.sh >/dev/null 2>&1; then
-        mail-relay-ctl.sh set-upstream-id "$TENANT_ID" "$domain_id" >/dev/null 2>&1 \
-            || log_warn "phase 8c: could not stamp upstream_domain_id for '${TENANT_ID}' — the retry timer will attempt a recheck next tick"
-    fi
-    log_info "phase 8c: upstream declared for '${full_domain}' (id=${domain_id}) — Scaleway may still take a couple of minutes to validate the DNS records"
+    log_info "mail-relay: '${TENANT_ID}' relay row + runtimeConfig.smtp queued (upstream declaration handled off-band, see main())"
 }
 
 # Phase 9: per-tenant config.env
@@ -1364,7 +1318,6 @@ run_fresh_creation() {
     phase_release
     phase_phoenixd
     phase_mail_relay
-    phase_mail_relay_upstream
     phase_config_env
     phase_certificate
     phase_nginx
@@ -1376,7 +1329,46 @@ run_fresh_creation() {
     notify_success \
         "[be-BOP tooling] add-tenant ${TENANT_ID} OK" \
         "Tenant ${TENANT_ID} is now active at https://${DOMAIN}/ (be-BOP ${RESOLVED_VERSION})."
+    spawn_upstream_sync
     phase_summary
+}
+
+# Fire-and-forget: kick a detached systemd-run transient unit that runs
+# the upstream sync script (5 attempts × 60 s) in the background. The
+# main deploy critical path — including the API endpoint of
+# test-tenant-api.py — returns as soon as systemd-run has scheduled the
+# unit (sub-second). Nothing here waits on Scaleway's async validation.
+#
+# Skipped when the upstream provider isn't configured (the retry timer
+# has the same behavior — a no-op sweep). If systemd-run isn't
+# available for whatever reason, we log a WARN and let the 15-min timer
+# take the tenant on its next tick — never fatal.
+spawn_upstream_sync() {
+    if ! mail_upstream_is_configured || [[ -z "${BEBOP_DNS_ZONE:-}" ]]; then
+        log_info "upstream provider not configured — skipping background Scaleway sync (timer 15 min stays as safety net)"
+        return 0
+    fi
+    if ! command -v systemd-run >/dev/null 2>&1; then
+        log_warn "systemd-run not available — skipping background Scaleway sync spawn; timer 15 min will retry"
+        return 0
+    fi
+    local sync_bin="/usr/local/bin/mail-relay-upstream-sync.sh"
+    if [[ ! -x "$sync_bin" ]]; then
+        log_warn "background sync binary '${sync_bin}' not found — timer 15 min will retry"
+        return 0
+    fi
+    # --collect: systemd garbage-collects the transient unit after exit.
+    # Unique unit name per tenant so concurrent onboardings don't clash
+    # and an operator can inspect one at a time via `systemctl status`.
+    local unit="bebop-mail-relay-upstream-sync-${TENANT_ID}"
+    if run_privileged systemd-run --collect \
+            --unit="$unit" \
+            --description="Scaleway TEM sync for ${TENANT_ID} (5x60s)" \
+            "$sync_bin" "$TENANT_ID" >/dev/null 2>&1; then
+        log_info "background Scaleway sync spawned: systemd-run unit '${unit}' (journalctl -u ${unit} to follow, 5 attempts × 60 s)"
+    else
+        log_warn "failed to spawn background sync unit '${unit}' — timer 15 min will retry"
+    fi
 }
 
 run_reactivation() {

@@ -112,6 +112,7 @@ chmod 0755 \
     "${INSTALL_DIR}/list-tenants.sh" \
     "${INSTALL_DIR}/find-orphans.sh" \
     "${INSTALL_DIR}/mail-relay-ctl.sh" \
+    "${INSTALL_DIR}/mail-relay-upstream-sync.sh" \
     "${INSTALL_DIR}/tenant-cli.sh" \
     "${INSTALL_DIR}/gh-rate-limit.sh" \
     "${INSTALL_DIR}/certbot-renew-check.sh" \
