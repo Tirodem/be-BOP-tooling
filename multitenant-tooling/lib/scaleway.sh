@@ -209,23 +209,37 @@ mail_upstream_setup_domain() {
     local subdomain_label="$1" full_domain="$2"
     [[ -z "$subdomain_label" || -z "$full_domain" ]] \
         && { log_error "mail_upstream_setup_domain: both args required"; return 2; }
-    local domain_id
-    if ! domain_id=$(scaleway_tem_domain_create "$full_domain" 2>/dev/null); then
-        log_warn "mail_upstream_setup_domain: provider registration failed for '${full_domain}'"
+    # Capture stderr from the create call so we can surface the actual
+    # HTTP error (status + body) — swallowing it with 2>/dev/null used to
+    # hide 401 (bad API key), 403 (missing policy), 400 (invalid project
+    # id), etc. and leave the operator guessing.
+    local domain_id create_err
+    create_err=$(mktemp)
+    if ! domain_id=$(scaleway_tem_domain_create "$full_domain" 2>"$create_err"); then
+        local err_snippet
+        err_snippet=$(cat "$create_err")
+        rm -f "$create_err"
+        log_warn "mail_upstream_setup_domain: provider registration failed for '${full_domain}': ${err_snippet:-<no stderr>}"
         return 1
     fi
+    rm -f "$create_err"
     # DKIM key is populated by the provider a few seconds after creation.
-    local dkim_key attempt=0
+    local dkim_key attempt=0 dkim_err
+    dkim_err=$(mktemp)
     while (( attempt < 5 )); do
-        dkim_key=$(scaleway_tem_domain_dkim_public_key "$domain_id" 2>/dev/null || true)
+        dkim_key=$(scaleway_tem_domain_dkim_public_key "$domain_id" 2>"$dkim_err" || true)
         [[ -n "$dkim_key" ]] && break
         sleep 3
         (( ++attempt ))
     done
     if [[ -z "$dkim_key" ]]; then
-        log_warn "mail_upstream_setup_domain: DKIM key not populated for '${full_domain}' — will retry"
+        local dkim_snippet
+        dkim_snippet=$(cat "$dkim_err")
+        rm -f "$dkim_err"
+        log_warn "mail_upstream_setup_domain: DKIM key not populated for '${full_domain}' after 15s — will retry${dkim_snippet:+ (last error: ${dkim_snippet})}"
         return 1
     fi
+    rm -f "$dkim_err"
     # DNS records. The SPF include and DKIM selector are provider-specific;
     # they live here so nothing else in the tooling needs to know.
     dns_provider_dns_record_create "$subdomain_label" TXT \
