@@ -789,18 +789,30 @@ phase_mail_relay() {
         return 0
     fi
 
-    # Idempotent: `create` errors out if the row already exists. We treat
-    # "already exists" as success and continue to seed the runtimeConfig
-    # (in case the caller cleared it manually) — but skip password
-    # generation since we can't recover it.
-    local relay_creds password
-    if relay_creds=$(mail-relay-ctl.sh create "$TENANT_ID" 2>/dev/null); then
+    # Idempotent: `create` fails with a specific "already exists" message
+    # when the row is present (usually a purge that missed the relay
+    # cleanup). Any OTHER failure — mongod@tooling unreachable, mongosh
+    # missing, bcrypt broken — must NOT be silently absorbed: the tenant
+    # would then be created with runtimeConfig.smtp NEVER seeded, which
+    # is exactly the "runtimeConfig.smtp = null" symptom we're fixing.
+    local relay_creds password err_output tmp_err
+    tmp_err=$(mktemp)
+    if relay_creds=$(mail-relay-ctl.sh create "$TENANT_ID" 2>"$tmp_err"); then
+        rm -f "$tmp_err"
         password=$(printf '%s' "$relay_creds" | cut -f2)
+        if [[ -z "$password" ]]; then
+            die "mail-relay: create returned empty password for '${TENANT_ID}' (unexpected)"
+        fi
         txn_register_undo "mail-relay row for ${TENANT_ID}" \
             "mail-relay-ctl.sh delete '${TENANT_ID}' 2>/dev/null || true"
     else
-        log_info "mail-relay: '${TENANT_ID}' already has a relay row — skipping (use reset-tenant to rotate password)"
-        return 0
+        err_output=$(cat "$tmp_err" 2>/dev/null || true)
+        rm -f "$tmp_err"
+        if [[ "$err_output" == *"already exists"* ]]; then
+            log_info "mail-relay: '${TENANT_ID}' already has a relay row — skipping (use reset-tenant to rotate password)"
+            return 0
+        fi
+        die "mail-relay: mail-relay-ctl create failed for '${TENANT_ID}': ${err_output:-<no stderr>}"
     fi
 
     # Compose SMTP config and append to the generic runtimeConfig
