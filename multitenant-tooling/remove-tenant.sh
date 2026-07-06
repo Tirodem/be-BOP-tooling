@@ -222,8 +222,22 @@ is_external_tenant() {
 drop_mail_relay_resources() {
     log_info "dropping mail-relay resources for ${TENANT_ID}..."
     if command -v mail-relay-ctl.sh >/dev/null 2>&1; then
-        mail-relay-ctl.sh delete "$TENANT_ID" 2>/dev/null \
-            || log_warn "drop_mail_relay: mail-relay-ctl delete '${TENANT_ID}' returned non-zero"
+        # `mail-relay-ctl.sh delete` succeeds with deletedCount=0 when the
+        # row doesn't exist, so any non-zero exit here means a REAL error
+        # (mongod@tooling down, mongosh missing, permission problem, …).
+        # Muting via 2>/dev/null lets a purge report "complete" while
+        # the row survives — which then produces the "already exists"
+        # trap at the next add-tenant. Capture stderr and die on any
+        # real error.
+        local tmp_err
+        tmp_err=$(mktemp)
+        if ! mail-relay-ctl.sh delete "$TENANT_ID" 2>"$tmp_err"; then
+            local err_output
+            err_output=$(cat "$tmp_err" 2>/dev/null || true)
+            rm -f "$tmp_err"
+            die "drop_mail_relay: mail-relay-ctl delete '${TENANT_ID}' failed: ${err_output:-<no stderr>}"
+        fi
+        rm -f "$tmp_err"
     else
         log_debug "drop_mail_relay: mail-relay-ctl.sh not on PATH, skipping tooling MongoDB cleanup"
     fi

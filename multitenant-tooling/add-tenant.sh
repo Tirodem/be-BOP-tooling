@@ -789,30 +789,58 @@ phase_mail_relay() {
         return 0
     fi
 
-    # Idempotent: `create` fails with a specific "already exists" message
-    # when the row is present (usually a purge that missed the relay
-    # cleanup). Any OTHER failure — mongod@tooling unreachable, mongosh
-    # missing, bcrypt broken — must NOT be silently absorbed: the tenant
-    # would then be created with runtimeConfig.smtp NEVER seeded, which
-    # is exactly the "runtimeConfig.smtp = null" symptom we're fixing.
+    # Behaviour depends on DECISION_PATH:
+    #   fresh     — row is expected absent (purge should have cleaned it).
+    #               If it survived: integrity failure surfacing a bug in
+    #               orphan cleanup. We log_warn and recover by rotating
+    #               via `reset-tenant`, so the operator isn't blocked. We
+    #               do NOT register an undo for the pre-existing row (we
+    #               didn't create it).
+    #   reapply/reactivate — row is expected present. `create` failing
+    #               with "already exists" is normal; we skip the seed
+    #               entirely because the tenant is already using its
+    #               current runtimeConfig.smtp — rotating would
+    #               invalidate a live credential.
+    # Any OTHER failure of `create` (mongod@tooling unreachable, mongosh
+    # missing, bcrypt broken, …) is a real bug: die with the captured
+    # stderr instead of silently absorbing it, which would leave
+    # runtimeConfig.smtp = null.
     local relay_creds password err_output tmp_err
     tmp_err=$(mktemp)
+    local created_by_us=false
     if relay_creds=$(mail-relay-ctl.sh create "$TENANT_ID" 2>"$tmp_err"); then
         rm -f "$tmp_err"
         password=$(printf '%s' "$relay_creds" | cut -f2)
-        if [[ -z "$password" ]]; then
-            die "mail-relay: create returned empty password for '${TENANT_ID}' (unexpected)"
-        fi
+        [[ -z "$password" ]] && die "mail-relay: create returned empty password for '${TENANT_ID}' (unexpected)"
+        created_by_us=true
         txn_register_undo "mail-relay row for ${TENANT_ID}" \
             "mail-relay-ctl.sh delete '${TENANT_ID}' 2>/dev/null || true"
     else
         err_output=$(cat "$tmp_err" 2>/dev/null || true)
         rm -f "$tmp_err"
-        if [[ "$err_output" == *"already exists"* ]]; then
-            log_info "mail-relay: '${TENANT_ID}' already has a relay row — skipping (use reset-tenant to rotate password)"
-            return 0
+        if [[ "$err_output" != *"already exists"* ]]; then
+            die "mail-relay: mail-relay-ctl create failed for '${TENANT_ID}': ${err_output:-<no stderr>}"
         fi
-        die "mail-relay: mail-relay-ctl create failed for '${TENANT_ID}': ${err_output:-<no stderr>}"
+        case "${DECISION_PATH:-fresh}" in
+            reapply|reactivate)
+                log_info "mail-relay: '${TENANT_ID}' already has a relay row — preserving current credential (reapply)"
+                return 0
+                ;;
+            fresh|*)
+                log_warn "mail-relay: integrity — '${TENANT_ID}' relay row survived purge (orphan cleanup bug?). Recovering via reset-tenant."
+                local reset_out reset_err
+                reset_err=$(mktemp)
+                if reset_out=$(mail-relay-ctl.sh reset-tenant "$TENANT_ID" 2>"$reset_err"); then
+                    rm -f "$reset_err"
+                    password=$(printf '%s' "$reset_out" | cut -f2)
+                    [[ -z "$password" ]] && die "mail-relay: reset-tenant returned empty password for '${TENANT_ID}' (unexpected)"
+                else
+                    err_output=$(cat "$reset_err" 2>/dev/null || true)
+                    rm -f "$reset_err"
+                    die "mail-relay: reset-tenant failed for '${TENANT_ID}': ${err_output:-<no stderr>}"
+                fi
+                ;;
+        esac
     fi
 
     # Compose SMTP config and append to the generic runtimeConfig
@@ -1123,14 +1151,27 @@ apply_runtime_config_overrides() {
     if ! mongo_wait_ready "$MONGO_PORT" 60 1; then
         die "runtime-config: mongod@${TENANT_ID} not ready on port ${MONGO_PORT}"
     fi
-    local entry lock rest key value
+    local entry lock rest key value trimmed
     for entry in "${RUNTIME_CONFIG_OVERRIDES[@]}"; do
         lock="${entry%%:*}"
         rest="${entry#*:}"
         key="${rest%%=*}"
         value="${rest#*=}"
-        mongo_runtime_config_upsert "$MONGO_PORT" "$MONGO_DB_NAME" "$key" "$value" "$lock" \
-            || die "runtime-config: upsert failed for ${key}"
+        # Auto-detect JSON object/array literals so nested runtimeConfig
+        # entries (like `smtp`, which be-BOP reads via Object.assign and
+        # therefore MUST be a real object) are stored parsed rather than
+        # stringified. Scalar strings/numbers go through the string
+        # variant unchanged — backward compatible with
+        # `--runtime-config websiteTitle="ACME"`.
+        trimmed="${value#"${value%%[![:space:]]*}"}"
+        if [[ "$trimmed" == "{"* || "$trimmed" == "["* ]] \
+                && printf '%s' "$value" | jq -e . >/dev/null 2>&1; then
+            mongo_runtime_config_upsert_obj "$MONGO_PORT" "$MONGO_DB_NAME" "$key" "$value" "$lock" \
+                || die "runtime-config: upsert (object) failed for ${key}"
+        else
+            mongo_runtime_config_upsert "$MONGO_PORT" "$MONGO_DB_NAME" "$key" "$value" "$lock" \
+                || die "runtime-config: upsert failed for ${key}"
+        fi
     done
 }
 
