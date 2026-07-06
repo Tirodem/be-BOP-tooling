@@ -119,11 +119,17 @@ _gen_password() {
 
 # bcrypt hashing runs in Python (aligned with the daemon's verifier). Cost
 # 12 chosen to keep AUTH under ~200ms on modest hardware.
+#
+# The password is passed via env var — never argv (visible in `ps`), never
+# stdin. `python3 - <<HEREDOC` uses stdin to receive the Python source
+# itself, so any pipe attached upstream would be silently discarded and
+# `sys.stdin.read()` would return '' — which used to hash the empty
+# string for every tenant (see 2026-07 incident).
 _bcrypt_hash() {
     local pw="$1"
-    python3 - <<PYEOF
-import bcrypt, sys
-pw = sys.stdin.read().rstrip('\n').encode('utf-8')
+    BEBOP_MAIL_RELAY_PW="$pw" python3 - <<'PYEOF'
+import bcrypt, os, sys
+pw = os.environ['BEBOP_MAIL_RELAY_PW'].encode('utf-8')
 sys.stdout.write(bcrypt.hashpw(pw, bcrypt.gensalt(12)).decode('utf-8'))
 PYEOF
 }
@@ -137,7 +143,7 @@ cmd_create() {
         && die "tenant '${tenant_id}' already exists — use reset-tenant to rotate its password"
     local password hash
     password=$(_gen_password)
-    hash=$(printf '%s' "$password" | _bcrypt_hash "$password")
+    hash=$(_bcrypt_hash "$password")
     _mongo "db.tenants.insertOne({_id:'${tenant_id}', pass_hash:'${hash}', mail_status:'active', upstream_domain_id:null, created_at:new Date()});" >/dev/null
     printf '%s\t%s\n' "$tenant_id" "$password"
     log_info "created tenant '${tenant_id}' (password printed to stdout)"
@@ -292,7 +298,7 @@ cmd_reset_tenant() {
     [[ "$exists" == "0" ]] && die "tenant '${tenant_id}' does not exist"
     local password hash
     password=$(_gen_password)
-    hash=$(printf '%s' "$password" | _bcrypt_hash "$password")
+    hash=$(_bcrypt_hash "$password")
     _mongo "db.tenants.updateOne({_id:'${tenant_id}'}, {\$set:{pass_hash:'${hash}'}});" >/dev/null
     printf '%s\t%s\n' "$tenant_id" "$password"
     log_warn "password rotated for '${tenant_id}' — reseed runtimeConfig.smtp on the tenant side"
