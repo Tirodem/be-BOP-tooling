@@ -1246,11 +1246,13 @@ phase_kuma_and_registry() {
     now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     case "${DECISION_PATH:-fresh}" in
         fresh)
+            local external_flag=0
+            is_external_mode && external_flag=1
             registry_add \
                 "$TENANT_ID" "$DOMAIN" "$BEBOP_PORT" "$PHOENIXD_PORT" \
                 "$MONGO_PORT" "$MONGO_DB_NAME" \
                 "$GARAGE_BUCKET" "$GARAGE_KEY_NAME" \
-                "$RESOLVED_VERSION" "$now" "active"
+                "$RESOLVED_VERSION" "$now" "active" "$external_flag"
             ;;
         reactivate)
             registry_set_status "$TENANT_ID" active

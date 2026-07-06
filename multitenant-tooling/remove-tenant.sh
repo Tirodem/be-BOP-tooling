@@ -204,10 +204,23 @@ delete_dns_records() {
     dns_provider_dns_zone_refresh
 }
 
-# is_external_tenant — true iff the tenant's domain isn't <tenant>.<zone>.
-# Requires load_tenant_from_registry to have populated DOMAIN + ZONE.
+# is_external_tenant — true iff the tenant was registered with a custom
+# external domain (i.e. --external-domain was passed to add-tenant.sh).
+#
+# Reads the persisted `external` column of the registry — NOT a computed
+# comparison of DOMAIN vs `<tid>.<current-zone>`. The old comparison
+# silently reclassified every pre-existing tenant as "external" whenever
+# BEBOP_DNS_ZONE changed, which then made drop_mail_relay_resources skip
+# the Scaleway teardown and leak a slot in the TEM quota.
+#
+# Defensive read: if the row exists but the column is empty (row created
+# under an older schema before _registry_migrate_schema_if_needed had a
+# chance to run), we default to 0 (internal). Same default the migration
+# uses for backfilled rows.
 is_external_tenant() {
-    [[ -n "$DOMAIN" && "$DOMAIN" != "${TENANT_ID}.${ZONE}" ]]
+    local flag
+    flag=$(registry_get_field "$TENANT_ID" external 2>/dev/null || true)
+    [[ "$flag" == "1" ]]
 }
 
 # Drop the tenant's mail-relay footprint. Two independent pieces:
@@ -241,7 +254,16 @@ drop_mail_relay_resources() {
     else
         log_debug "drop_mail_relay: mail-relay-ctl.sh not on PATH, skipping tooling MongoDB cleanup"
     fi
-    if ! is_external_tenant && [[ -n "${BEBOP_DNS_ZONE:-}" ]]; then
+    # Upstream teardown runs unconditionally (no is_external_tenant gate
+    # here). Even a tenant registered with --external-domain has its
+    # Scaleway sending domain declared under <tid>.<BEBOP_DNS_ZONE>
+    # (mail_upstream_setup_domain always uses our zone), so both the
+    # revoke and the DNS-record cleanup are needed regardless of the
+    # main domain's DNS management. `mail_upstream_teardown_domain`
+    # die()s when SCALEWAY_TEM_* aren't configured — an explicit
+    # failure surfacing that the operator can't complete the purge
+    # without upstream creds.
+    if [[ -n "${BEBOP_DNS_ZONE:-}" ]]; then
         mail_upstream_teardown_domain "$TENANT_ID" "${TENANT_ID}.${BEBOP_DNS_ZONE}"
     fi
 }

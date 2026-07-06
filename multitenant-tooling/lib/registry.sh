@@ -3,7 +3,7 @@
 #
 # registry.sh — manage /var/lib/be-BOP/tenants.tsv (tab-separated tenant registry).
 #
-# Schema (header row, 11 columns):
+# Schema (header row, 12 columns):
 #   tenant_id       — slug, [a-z0-9][a-z0-9-]*, max 32 chars
 #   domain          — full FQDN, e.g. tenant1.be-bop.dev
 #   bebop_port      — local port for be-BOP HTTP (≥ 3001)
@@ -15,6 +15,12 @@
 #   bebop_version   — installed release tag (or empty until first install completes)
 #   created_at      — RFC 3339 UTC timestamp of initial activation
 #   status          — active | soft-deleted | archived
+#   external        — 0 for internal (<tid>.<BEBOP_DNS_ZONE>) tenants,
+#                     1 for --external-domain tenants (custom FQDN, DNS
+#                     managed by the operator). Persisted at create time
+#                     so that changing BEBOP_DNS_ZONE later doesn't
+#                     silently reclassify pre-existing tenants (would
+#                     leak Scaleway slots on teardown otherwise).
 #
 # Status semantics:
 #   active        — tenant is running; reserves its ports
@@ -40,7 +46,8 @@ readonly _BEBOP_REGISTRY_SOURCED=1
 : "${REGISTRY_PHOENIXD_PORT_MIN:=9741}"
 : "${REGISTRY_MONGO_PORT_MIN:=27018}"
 
-readonly REGISTRY_HEADER=$'tenant_id\tdomain\tbebop_port\tphoenixd_port\tmongo_port\tmongodb_database\tgarage_bucket\tgarage_key\tbebop_version\tcreated_at\tstatus'
+readonly REGISTRY_HEADER=$'tenant_id\tdomain\tbebop_port\tphoenixd_port\tmongo_port\tmongodb_database\tgarage_bucket\tgarage_key\tbebop_version\tcreated_at\tstatus\texternal'
+readonly REGISTRY_LEGACY_HEADER_11COLS=$'tenant_id\tdomain\tbebop_port\tphoenixd_port\tmongo_port\tmongodb_database\tgarage_bucket\tgarage_key\tbebop_version\tcreated_at\tstatus'
 
 _registry_col_index() {
     case "$1" in
@@ -55,6 +62,7 @@ _registry_col_index() {
         bebop_version)     echo 9 ;;
         created_at)        echo 10 ;;
         status)            echo 11 ;;
+        external)          echo 12 ;;
         *) die "registry: unknown field '$1'" ;;
     esac
 }
@@ -66,6 +74,7 @@ registry_init() {
         run_privileged chmod 0644 "$REGISTRY_PATH"
         log_info "registry: created $REGISTRY_PATH"
     else
+        _registry_migrate_schema_if_needed
         log_debug "registry: $REGISTRY_PATH already exists"
     fi
     if [[ ! -f "$REGISTRY_LOCK_PATH" ]]; then
@@ -73,6 +82,35 @@ registry_init() {
         run_privileged touch "$REGISTRY_LOCK_PATH"
         run_privileged chmod 0644 "$REGISTRY_LOCK_PATH"
     fi
+}
+
+# One-shot in-place migration from the pre-external 11-column schema to
+# the current 12-column one. Idempotent — no-op when the header already
+# has 12 columns. Existing rows get `external=0` (internal) backfilled,
+# which is the safe default: it makes the tooling always attempt the
+# upstream cleanup on teardown. Genuinely external tenants — if any
+# existed before the migration — will need to be flipped to `external=1`
+# by hand (single tab-separated column edit in tenants.tsv).
+_registry_migrate_schema_if_needed() {
+    local current_header
+    current_header=$(head -n1 "$REGISTRY_PATH" 2>/dev/null || true)
+    if [[ "$current_header" == "$REGISTRY_HEADER" ]]; then
+        return 0
+    fi
+    if [[ "$current_header" != "$REGISTRY_LEGACY_HEADER_11COLS" ]]; then
+        die "registry: unknown header in $REGISTRY_PATH (expected 11-col legacy or 12-col current, got: '${current_header}')"
+    fi
+    log_info "registry: migrating $REGISTRY_PATH from 11-col to 12-col schema (adding 'external' column, default=0)"
+    local tmp
+    tmp=$(mktemp)
+    # Rewrite header + append \t0 to each data row (backfilled to internal).
+    awk -F'\t' -v OFS='\t' -v new_hdr="$REGISTRY_HEADER" '
+        NR == 1 { print new_hdr; next }
+        { print $0 "\t0" }
+    ' "$REGISTRY_PATH" > "$tmp"
+    run_privileged install -m 0644 "$tmp" "$REGISTRY_PATH"
+    rm -f "$tmp"
+    log_info "registry: schema migration OK"
 }
 
 registry_lock() {
@@ -158,17 +196,21 @@ registry_allocate_port() {
 }
 
 # Append a new row. Caller must hold the lock.
-# Args (11): tenant_id domain bebop_port phoenixd_port mongo_port mongodb_database
-#            garage_bucket garage_key bebop_version created_at status
+# Args (12): tenant_id domain bebop_port phoenixd_port mongo_port mongodb_database
+#            garage_bucket garage_key bebop_version created_at status external
+# `external` must be 0 (internal, <tid>.<zone>) or 1 (--external-domain).
 registry_add() {
-    if (( $# != 11 )); then
-        die "registry_add: expected 11 args, got $#"
+    if (( $# != 12 )); then
+        die "registry_add: expected 12 args, got $#"
     fi
-    local tenant_id="$1" status="${11}"
+    local tenant_id="$1" status="${11}" external="${12}"
+    if [[ "$external" != "0" && "$external" != "1" ]]; then
+        die "registry_add: 'external' must be 0 or 1 (got '${external}')"
+    fi
     local row
     row="$(IFS=$'\t'; echo "$*")"
     printf '%s\n' "$row" | run_privileged tee -a "$REGISTRY_PATH" >/dev/null
-    log_info "registry: added tenant '$tenant_id' (status=$status)"
+    log_info "registry: added tenant '$tenant_id' (status=$status, external=$external)"
 }
 
 # Replace the value of <field> for <tenant_id>. Caller must hold the lock.
