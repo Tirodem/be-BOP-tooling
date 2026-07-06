@@ -245,13 +245,21 @@ _registry_migrate_10_to_12() {
     log_info "registry: schema migration 10→12 OK"
 }
 
+: "${REGISTRY_LOCK_TIMEOUT_SECONDS:=120}"
+
 registry_lock() {
     if [[ -n "${_REGISTRY_FD:-}" ]]; then
         die "registry: lock already held in this process"
     fi
     exec {_REGISTRY_FD}>"$REGISTRY_LOCK_PATH"
-    if ! flock -x -w 30 "$_REGISTRY_FD"; then
-        die "registry: could not acquire lock on $REGISTRY_LOCK_PATH within 30s"
+    # Timeout observed under concurrent onboarding via test-tenant-api :
+    # add-tenant.sh holds the lock for the FULL run (phases 1-14, ~40-60s)
+    # because critical section wasn't narrowed. 3 orders arriving within
+    # 30s made the 3rd time out at 30s. Bumped to 120s so 4-5 concurrent
+    # orders can queue safely without failing. Real fix (narrow critical
+    # section to registry writes only) tracked separately.
+    if ! flock -x -w "$REGISTRY_LOCK_TIMEOUT_SECONDS" "$_REGISTRY_FD"; then
+        die "registry: could not acquire lock on $REGISTRY_LOCK_PATH within ${REGISTRY_LOCK_TIMEOUT_SECONDS}s"
     fi
     log_debug "registry: lock acquired (fd=$_REGISTRY_FD)"
 }
