@@ -124,6 +124,25 @@ fi
 source "$SECRETS_FILE"
 [[ -n "${BEBOP_DNS_ZONE:-}" ]] || die "BEBOP_DNS_ZONE not set in $SECRETS_FILE"
 
+# Fail-fast on --admin-email before any state mutation. migrate mutates
+# registry.domain + deletes the cert + creates DNS records, THEN forks
+# add-tenant.sh which requires --admin-email for the new cert issuance.
+# Without this check, a missing email left the tenant mid-migrated (cert
+# gone, registry pointing at the new domain, but config.env / nginx /
+# service still on the old domain) and required a manual recovery step.
+#
+# Fallback: use LE_OPERATOR_EMAIL from secrets.env if present. That
+# variable is the fleet-wide LE account email; using it here is
+# consistent with add-tenant.sh's expectation that per-tenant
+# --admin-email is the LE contact for that tenant's cert.
+if [[ -z "$ADMIN_EMAIL" && -n "${LE_OPERATOR_EMAIL:-}" ]]; then
+    ADMIN_EMAIL="$LE_OPERATOR_EMAIL"
+    log_info "migrate: --admin-email not provided — falling back to LE_OPERATOR_EMAIL from ${SECRETS_FILE}"
+fi
+if [[ -z "$ADMIN_EMAIL" ]]; then
+    die "--admin-email is required (fork add-tenant.sh needs it to re-issue the Let's Encrypt cert). Alternatively, set LE_OPERATOR_EMAIL in ${SECRETS_FILE} as a fleet-wide fallback."
+fi
+
 require_privileges
 
 registry_init
