@@ -63,6 +63,17 @@ source "$BEBOP_TOOLING_LIB_DIR/mongo.sh"
 BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
 
+# retry-upstream needs SCALEWAY_TEM_* and provider DNS creds from
+# secrets.env. Without this source, mail_upstream_is_configured returns
+# false silently (all env vars empty), retry-upstream no-ops, and the
+# operator sees no output at all — worst possible UX. Other commands
+# don't need secrets but sourcing is cheap and idempotent.
+SECRETS_FILE="${SECRETS_FILE:-/etc/be-BOP-tooling/secrets.env}"
+if [[ -r "$SECRETS_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$SECRETS_FILE"
+fi
+
 MONGO_PORT="${BEBOP_TOOLING_MONGO_PORT:-27100}"
 MONGO_DB="${BEBOP_TOOLING_MONGO_DB:-bebop_tooling}"
 
@@ -329,10 +340,14 @@ cmd_retry_upstream() {
     # provider-agnostic mail_upstream_* surface (is_configured,
     # setup_domain, teardown_domain). This function only knows that surface.
     #
-    # Silent no-op if the operator hasn't set up an upstream yet — the
-    # fake SMTP works standalone, and this sweep runs every 15 min via
-    # bebop-mail-relay-retry.timer so provisioned tenants get upstream
-    # declared as soon as credentials appear in secrets.env.
+    # No-op if the operator hasn't set up an upstream yet — the fake SMTP
+    # works standalone. The timer (bebop-mail-relay-retry.timer) invokes
+    # this every 15 min so provisioned tenants get their upstream declared
+    # as soon as credentials appear in secrets.env. When invoked manually
+    # by an operator (from CLI, single tenant), we surface the no-op as
+    # log_warn so silence-with-no-output doesn't leave the operator
+    # wondering whether it worked. The timer path stays quiet via
+    # log_debug — no need to spam the journal at every tick.
     local target="${1:-}"
     [[ -z "$target" ]] && { usage; die "retry-upstream needs a tenant_id or --all"; }
 
@@ -342,7 +357,11 @@ cmd_retry_upstream() {
     source "${BEBOP_TOOLING_LIB_DIR}/dns_provider.sh"
 
     if ! mail_upstream_is_configured; then
-        log_debug "retry-upstream: no upstream provider configured — noop"
+        if [[ "$target" == "--all" ]]; then
+            log_debug "retry-upstream --all: no upstream provider configured — noop"
+        else
+            log_warn "retry-upstream: no upstream provider configured — set SCALEWAY_TEM_API_KEY + SCALEWAY_TEM_PROJECT_ID in ${SECRETS_FILE} and retry"
+        fi
         return 0
     fi
     [[ -z "${BEBOP_DNS_ZONE:-}" ]] && die "retry-upstream: BEBOP_DNS_ZONE unset — cannot compose sending domains"
