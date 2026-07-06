@@ -1158,6 +1158,10 @@ _deploy_api_install_systemd() {
     run_privileged systemctl daemon-reload
     run_privileged systemctl enable --now bebop-test-tenant-api.service
     run_privileged systemctl enable --now bebop-test-tenant-reaper.timer
+    # See mail-relay note: `enable --now` on an active unit does not
+    # re-exec the daemon. try-restart forces a re-exec when active,
+    # no-op otherwise. Ensures lib/test-tenant-api.py updates take effect.
+    run_privileged systemctl try-restart bebop-test-tenant-api.service
 }
 
 # Helper: provision the optional public exposure layer (DNS + cert + nginx
@@ -1351,6 +1355,12 @@ step_setup_mail_relay() {
     run_privileged systemctl enable --now bebop-mail-relay.service
     run_privileged systemctl enable --now bebop-mail-relay-retry.timer
     run_privileged systemctl enable --now bebop-mail-relay-prune.timer
+    # `enable --now` on an ALREADY active service is a no-op — it doesn't
+    # re-exec the daemon, so any change to lib/mail-relay.py that we just
+    # installed is NOT picked up. try-restart forces a re-exec when the
+    # unit is active, no-op otherwise (fresh install where enable --now
+    # just started it). Idempotent.
+    run_privileged systemctl try-restart bebop-mail-relay.service
     log_info "bebop-mail-relay listening on 127.0.0.1:2525"
     log_info "bebop-mail-relay-retry sweeping every 15 minutes"
     log_info "bebop-mail-relay-prune firing nightly (03:15 UTC, 90-day retention)"
