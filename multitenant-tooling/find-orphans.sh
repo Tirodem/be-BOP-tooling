@@ -504,6 +504,14 @@ _purge_one() {
     _remove_nginx_vhost "$id"
     _delete_le_cert "bebop-${id}"
     _delete_le_cert "bebop-${id}-s3"
+    # Drop the mail-relay's stored credentials for this tenant. Without
+    # this, a purged+recreated tenant would inherit the previous relay
+    # row → phase_mail_relay would skip → runtimeConfig.smtp would not be
+    # re-seeded with a fresh per-tenant password. mail-relay-ctl.sh is
+    # itself idempotent (no-op when the row doesn't exist).
+    if command -v mail-relay-ctl.sh >/dev/null 2>&1; then
+        _run run_privileged mail-relay-ctl.sh delete "$id" 2>/dev/null || true
+    fi
     _purge_dirs "$id"
     log_info "orphan '${id}' purged"
 }

@@ -1085,39 +1085,14 @@ phase_nginx() {
     fi
 }
 
-# Auto-prefill runtimeConfig.smtp from the host-wide SMTP_* env vars (as loaded
-# from secrets.env). be-BOP reads this entry as a nested object — be careful to
-# upsert an actual object, not a JSON-stringified scalar. No-op when SMTP_HOST
-# is empty (operator opted out / not configured yet).
-#
-# The host-wide SMTP_TO is intentionally NOT propagated: it's used for tooling-
-# alert recipients (notify.sh), not for the tenant's outbound shop mail flow.
-apply_smtp_prefill() {
-    if [[ -z "${SMTP_HOST:-}" ]]; then
-        log_debug "smtp prefill: SMTP_HOST empty in secrets.env → skipping"
-        return 0
-    fi
-    if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[dry-run] would prefill runtimeConfig.smtp from SMTP_* env vars"
-        return 0
-    fi
-    if ! mongo_wait_ready "$MONGO_PORT" 60 1; then
-        die "smtp prefill: mongod@${TENANT_ID} not ready on port ${MONGO_PORT}"
-    fi
-    local smtp_json
-    # `jq -n` builds the object; `port` is cast to a number because be-BOP's
-    # nodemailer config expects `port: 587` (number), not `port: "587"`.
-    smtp_json=$(jq -nc \
-        --arg h "$SMTP_HOST" \
-        --arg p "${SMTP_PORT:-587}" \
-        --arg u "${SMTP_USER:-}" \
-        --arg w "${SMTP_PASSWORD:-}" \
-        --arg f "${SMTP_FROM:-${SMTP_USER:-}}" \
-        '{host: $h, port: ($p | tonumber), user: $u, password: $w, from: $f, fake: false}'
-    )
-    mongo_runtime_config_upsert_obj "$MONGO_PORT" "$MONGO_DB_NAME" smtp "$smtp_json" false \
-        || die "smtp prefill: upsert failed"
-}
+# apply_smtp_prefill() intentionally removed. The host-wide SMTP_* env
+# vars in secrets.env belong to lib/notify.sh (tooling-side alerts) and
+# must never be replicated into a tenant's runtimeConfig.smtp — that
+# would surface ops-side mail credentials to a merchant and defeat the
+# whole per-tenant isolation of the fake-SMTP design. A tenant's
+# runtimeConfig.smtp is now populated ONLY by phase_mail_relay, which
+# generates a fresh per-tenant password via mail-relay-ctl.sh and
+# points at 127.0.0.1:2525 (the local fake SMTP).
 
 # Applies operator-supplied --runtime-config / --runtime-config-locked entries
 # to the tenant's runtimeConfig collection. Called right before bebop starts
@@ -1150,7 +1125,13 @@ apply_runtime_config_overrides() {
 # Phase 12: bebop service
 phase_bebop_service() {
     log_info "phase 12: bebop@${TENANT_ID}.service..."
-    apply_smtp_prefill
+    # NB: the host-wide SMTP_HOST/USER/PASSWORD in secrets.env are ONLY
+    # for lib/notify.sh's ops alerts (bug/incident notifications from the
+    # tooling itself). They MUST NEVER be replicated into a tenant's
+    # runtimeConfig.smtp — a tenant's smtp creds are generated on the fly
+    # by phase_mail_relay (mail-relay-ctl.sh create → unique password per
+    # tenant, pointing at the local fake SMTP on 127.0.0.1:2525, which
+    # then relays to the configured upstream provider).
     apply_runtime_config_overrides
     # Register the undo BEFORE the enable — if `systemctl enable --now` fails
     # (e.g. ExecStartPre error), `set -e` triggers exit immediately and the
@@ -1359,7 +1340,8 @@ run_reapply() {
     phase_certificate
     phase_nginx
     phase_mail_relay       # idempotent: no-op if the tenant already has a relay row
-    apply_smtp_prefill
+    # apply_smtp_prefill removed on purpose — never leak host-wide ops
+    # SMTP creds into a tenant's runtimeConfig. See phase_bebop_service.
     apply_runtime_config_overrides
     run_privileged systemctl restart "bebop@${TENANT_ID}.service"
     phase_healthcheck
