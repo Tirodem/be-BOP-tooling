@@ -6,23 +6,26 @@
 # /etc/nginx/sites-available/deploy.conf by host-bootstrap.sh when
 # BEBOP_DEPLOY_API_HOSTNAME is set in secrets.env.
 #
-# Source IP whitelist: the @allow_block@ token is replaced at render time by
-# a sequence of `allow <ip>;` directives followed by `deny all;`. host-
-# bootstrap.sh assembles the list from BEBOP_DEPLOY_API_ALLOWED_IPS (operator
-# override) or, when empty, defaults to 127.0.0.1 + the auto-detected VDS
-# public IP. The whitelist is enforced ONLY on /deploy-test-tenant — / and
-# /healthz return 444/200 respectively without IP gating.
+# Source IP whitelist: the allow_block placeholder (see below) is replaced
+# at render time by a sequence of `allow <ip>;` directives followed by
+# `deny all;`. host-bootstrap.sh assembles the list from
+# BEBOP_DEPLOY_API_ALLOWED_IPS (operator override) or, when empty,
+# defaults to 127.0.0.1 + the auto-detected VDS public IP. The whitelist
+# is enforced ONLY on /deploy-test-tenant — / and /healthz return 444/200
+# respectively without IP gating.
 #
 # Auth is end-to-end HMAC-SHA256 (see test-tenant-api.py). nginx does not
 # carry credentials.
 #
-# tooling-fingerprint: @template_revision@
+# tooling-fingerprint: template_revision (substituted below)
 #
-# Substitution placeholders:
-#   @deploy_hostname@      e.g. deploy.pvh-labs.com
-#   @daemon_port@          local Python daemon port (default 8820)
-#   @allow_block@          rendered allow/deny block (multi-line)
-#   @template_revision@    template fingerprint
+# Substitution placeholders (each spelled without the @@ bracketing here
+# so the render-time gsub doesn't clobber this doc block — only the real
+# call sites below get substituted):
+#   deploy_hostname      e.g. deploy.pvh-labs.com
+#   daemon_port          local Python daemon port (default 8820)
+#   allow_block          rendered allow/deny block (multi-line)
+#   template_revision    template fingerprint
 
 # --- HTTP -> HTTPS redirect + ACME webroot ---------------------------------
 server {
