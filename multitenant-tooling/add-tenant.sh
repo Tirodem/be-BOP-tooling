@@ -987,27 +987,34 @@ _certbot_run() {
         printf '%s\n' "$out" | grep -E '^(Successfully|Certificate is saved|Key is saved|This certificate expires)' >&2 || true
         return 0
     fi
-    # Failure — extract the actionable ACME error (or the fallback line).
-    # certbot 2.x prints "Error: urn:ietf:params:acme:error:<kind> ::…"
-    # somewhere in the traceback; the letsencrypt.log has the fully-
-    # formatted line. Both are worth surfacing.
+    # Failure — surface the actionable ACME error FIRST, then the raw
+    # log tail for context. certbot 2.1.0 swallows the real message
+    # via a josepy+py3.11 bug (only "AttributeError: can't set
+    # attribute" leaks to stderr), so the ACME error line is
+    # essentially always in /var/log/letsencrypt/letsencrypt.log, not
+    # in `$out`. We grep the log first, fall back to `$out` if the
+    # file isn't readable.
+    local log_tail
+    log_tail=$(run_privileged tail -n 30 /var/log/letsencrypt/letsencrypt.log 2>/dev/null || true)
+    local haystack="${log_tail}
+${out}"
     local acme_line
-    acme_line=$(printf '%s\n' "$out" | grep -oE 'urn:ietf:params:acme:error:[^"]+' | head -n1 || true)
+    acme_line=$(printf '%s\n' "$haystack" | grep -oE 'urn:ietf:params:acme:error:[^" ]+' | head -n1 || true)
     if [[ -n "$acme_line" ]]; then
         log_error "certbot: ACME error → ${acme_line}"
     fi
     # Rate-limit specific advice: pull the retry-after date if present.
-    if [[ "$acme_line" == *rateLimited* ]] || [[ "$out" == *rateLimited* ]]; then
+    if [[ "$haystack" == *rateLimited* ]]; then
         local retry
-        retry=$(printf '%s\n' "$out" | grep -oE 'retry after [^ ]+ [^ ]+ [^ ]+' | head -n1 || true)
-        log_error "certbot: Let's Encrypt rate-limited (5 duplicate certs / 168h max on the SAME set of identifiers)."
+        retry=$(printf '%s\n' "$haystack" \
+            | grep -oE 'retry after [0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]+ UTC' \
+            | head -n1 || true)
+        log_error "certbot: Let's Encrypt rate-limited (max 5 duplicate certs / 168h on the SAME set of identifiers)."
         [[ -n "$retry" ]] && log_error "certbot: next retry window opens at ${retry}."
         log_error "certbot: for repeated test provisionings, re-run add-tenant.sh with --staging (or set BEBOP_LE_STAGING=true in secrets.env)."
     fi
-    # Full letsencrypt.log tail — 30 lines is enough to catch the real
-    # stack without spamming the journal.
-    local log_tail
-    log_tail=$(run_privileged tail -n 30 /var/log/letsencrypt/letsencrypt.log 2>/dev/null || true)
+    # Full letsencrypt.log tail last — the actionable message above stays
+    # visible above the 30-line dump instead of being buried under it.
     if [[ -n "$log_tail" ]]; then
         log_error "certbot: last 30 lines of /var/log/letsencrypt/letsencrypt.log:"
         printf '%s\n' "$log_tail" | while IFS= read -r line; do
