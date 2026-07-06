@@ -151,31 +151,32 @@ _registry_repair_shifted_rows() {
     log_info "registry: scanning ${REGISTRY_PATH} for rows damaged by the 10→12 migration shift bug..."
     local tmp
     tmp=$(mktemp)
-    # In-line awk: single pass, both writes the fixed file to $tmp AND
-    # signals whether anything was repaired via its own exit code
-    # (0 = no changes, 1 = at least one row repaired). No sidecar count
-    # file, no process substitution — cannot race, cannot lose the
-    # signal.
-    if awk -F'\t' -v OFS='\t' '
-        BEGIN { repaired = 0 }
+    # Regex written WITHOUT interval expressions ({n}, {n,m}) for
+    # portability across mawk (Debian default) / gawk / busybox awk —
+    # `[0-9][0-9]...` universally understood.
+    #
+    # Detection: compare the awk output against the source file byte
+    # per byte. If they're identical, the awk touched nothing → clean.
+    # If they differ, at least one row was rewritten → install the
+    # patched file. cmp is used instead of an END-block sidecar counter
+    # or the awk exit code (both proved fragile in earlier iterations).
+    awk -F'\t' -v OFS='\t' '
         NR == 1 { print; next }
-        $5 ~ /^[0-9]+$/ && $5 == $6 && $11 ~ /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$/ {
+        $5 ~ /^[0-9]+$/ && $5 == $6 && $11 ~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z$/ {
             print $1, $2, $3, $4, $5, $7, $8, $9, $10, $11, "active", $12
-            repaired++
             next
         }
         { print }
-        END { exit (repaired == 0 ? 0 : 1) }
-    ' "$REGISTRY_PATH" > "$tmp"; then
-        # awk exit 0 → no damaged rows found; nothing to install
+    ' "$REGISTRY_PATH" > "$tmp"
+
+    if cmp -s "$REGISTRY_PATH" "$tmp"; then
         log_info "registry: scan clean, no rows needed repair"
         rm -f "$tmp"
         return 0
     fi
-    # awk exit 1 → at least one row rewritten; count via diff so the
-    # operator sees exactly how many were touched.
+
     local changed_rows
-    changed_rows=$(diff "$REGISTRY_PATH" "$tmp" | grep -c '^>' || true)
+    changed_rows=$(diff "$REGISTRY_PATH" "$tmp" 2>/dev/null | grep -c '^>' || true)
     run_privileged install -m 0644 "$tmp" "$REGISTRY_PATH"
     log_warn "registry: repaired ${changed_rows} row(s) damaged by the 10→12 migration shift bug — status backfilled to 'active' (original value overwritten by the bug and unrecoverable; re-set to soft-deleted/archived by hand if any of these tenants weren't active at the time)"
     rm -f "$tmp"
