@@ -131,7 +131,10 @@ def cmd_delete_monitor(args):
         api.login(args.user, args.password)
         existing = [m for m in api.get_monitors() if m.get("name") == args.name]
         if not existing:
-            print(f"kuma-cli: no monitor named '{args.name}' to delete; no-op")
+            # Silent success: this command is called from the orphan
+            # sweep on every fresh deploy, where "not present" is the
+            # expected state 99 % of the time. Logging a no-op on every
+            # add-tenant.sh was pure noise.
             return 0
         for m in existing:
             api.delete_monitor(m["id"])
@@ -148,15 +151,19 @@ def cmd_delete_monitor(args):
 
 
 def cmd_setup_notifications(args):
-    """Create host-wide SMTP + Zulip notification channels from env vars."""
+    """Create host-wide SMTP + Zulip notification channels from env vars.
+
+    SMTP and Zulip are wired independently: a failure to configure Zulip
+    (e.g. uptime-kuma-api version mismatch on the zulipBotEmail arg)
+    doesn't roll back or abort SMTP. Overall return is 0 if at least one
+    channel is set up (or all were correctly skipped for missing env),
+    non-zero only when a channel that SHOULD have been set up failed.
+    """
     api = _connect(args.url)
     try:
         api.login(args.user, args.password)
         existing = {n.get("name") for n in api.get_notifications()}
 
-        smtp_host = os.environ.get("SMTP_HOST", "").strip()
-        smtp_to = os.environ.get("SMTP_TO", "").strip()
-        smtp_from = os.environ.get("SMTP_FROM", "").strip()
         # Resolve a NotificationType that's safe across lib versions.
         # Pass the enum if available, otherwise fall back to the plain
         # string Kuma uses internally — both are accepted server-side.
@@ -165,29 +172,47 @@ def cmd_setup_notifications(args):
                 return getattr(NotificationType, name_str.upper())
             return name_str
 
+        overall_ok = True
+
+        # --- SMTP ---
+        smtp_host = os.environ.get("SMTP_HOST", "").strip()
+        smtp_to = os.environ.get("SMTP_TO", "").strip()
+        smtp_from = os.environ.get("SMTP_FROM", "").strip()
         if smtp_host and smtp_to and smtp_from:
             name = "be-bop-smtp"
             if name in existing:
                 print(f"kuma-cli: notification '{name}' already exists; no-op")
             else:
-                api.add_notification(
-                    name=name,
-                    type=nt("smtp"),
-                    isDefault=True,
-                    applyExisting=True,
-                    smtpHost=smtp_host,
-                    smtpPort=int(os.environ.get("SMTP_PORT", "587") or 587),
-                    smtpSecure=os.environ.get("SMTP_PORT", "") == "465",
-                    smtpIgnoreTLSError=False,
-                    smtpUsername=os.environ.get("SMTP_USER", ""),
-                    smtpPassword=os.environ.get("SMTP_PASSWORD", ""),
-                    smtpFrom=smtp_from,
-                    smtpTo=smtp_to,
-                )
-                print(f"kuma-cli: created SMTP notification '{name}'")
+                try:
+                    api.add_notification(
+                        name=name,
+                        type=nt("smtp"),
+                        isDefault=True,
+                        applyExisting=True,
+                        smtpHost=smtp_host,
+                        smtpPort=int(os.environ.get("SMTP_PORT", "587") or 587),
+                        smtpSecure=os.environ.get("SMTP_PORT", "") == "465",
+                        smtpIgnoreTLSError=False,
+                        smtpUsername=os.environ.get("SMTP_USER", ""),
+                        smtpPassword=os.environ.get("SMTP_PASSWORD", ""),
+                        smtpFrom=smtp_from,
+                        smtpTo=smtp_to,
+                    )
+                    print(f"kuma-cli: created SMTP notification '{name}'")
+                except Exception as e:
+                    overall_ok = False
+                    print(f"kuma-cli: SMTP notification setup failed: {e}", file=sys.stderr)
         else:
             print("kuma-cli: SMTP_HOST/SMTP_FROM/SMTP_TO not all set; skipping SMTP channel")
 
+        # --- Zulip ---
+        # Isolated try/except: the uptime-kuma-api Python library
+        # gates each notification type's kwargs and, depending on version,
+        # can reject `zulipBotEmail` (or a renamed variant like
+        # `zulip_bot_email`) as "unknown argument". Rather than fight
+        # that per-version, we let it raise here and just log — the
+        # SMTP channel above is our primary alerting path, Zulip is
+        # supplementary. Return code stays 0 if SMTP made it.
         zulip_site = os.environ.get("ZULIP_SITE", "").strip()
         zulip_email = os.environ.get("ZULIP_BOT_EMAIL", "").strip()
         zulip_key = os.environ.get("ZULIP_BOT_API_KEY", "").strip()
@@ -196,22 +221,28 @@ def cmd_setup_notifications(args):
             if name in existing:
                 print(f"kuma-cli: notification '{name}' already exists; no-op")
             else:
-                api.add_notification(
-                    name=name,
-                    type=nt("zulip"),
-                    isDefault=True,
-                    applyExisting=True,
-                    zulipBotEmail=zulip_email,
-                    zulipServerUrl=zulip_site,
-                    zulipAPIkey=zulip_key,
-                    zulipChannel=os.environ.get("ZULIP_STREAM", "bebop-tooling"),
-                    zulipTopic=os.environ.get("ZULIP_TOPIC", "kuma alerts"),
-                )
-                print(f"kuma-cli: created Zulip notification '{name}'")
+                try:
+                    api.add_notification(
+                        name=name,
+                        type=nt("zulip"),
+                        isDefault=True,
+                        applyExisting=True,
+                        zulipBotEmail=zulip_email,
+                        zulipServerUrl=zulip_site,
+                        zulipAPIkey=zulip_key,
+                        zulipChannel=os.environ.get("ZULIP_STREAM", "bebop-tooling"),
+                        zulipTopic=os.environ.get("ZULIP_TOPIC", "kuma alerts"),
+                    )
+                    print(f"kuma-cli: created Zulip notification '{name}'")
+                except Exception as e:
+                    # Do NOT flip overall_ok — SMTP is what we count on.
+                    # A Zulip failure here reduces to a non-fatal WARN
+                    # on the host-bootstrap side.
+                    print(f"kuma-cli: Zulip notification setup failed (non-fatal, SMTP still works): {e}", file=sys.stderr)
         else:
             print("kuma-cli: ZULIP_SITE/ZULIP_BOT_EMAIL/ZULIP_BOT_API_KEY not all set; skipping Zulip channel")
 
-        return 0
+        return 0 if overall_ok else 1
     except Exception as e:
         print(f"kuma-cli: setup-notifications failed: {e}", file=sys.stderr)
         return 1

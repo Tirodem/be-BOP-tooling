@@ -276,14 +276,17 @@ mail_upstream_setup_domain() {
     fi
     rm -f "$get_err"
 
-    # 3. For each of spf / dkim / dmarc: extract name+value from
+    # 3. For each of spf / dkim / dmarc / mx: extract name+value from
     # `.records.<type>`, strip trailing dot, strip the parent zone suffix
-    # to get the local label, publish as TXT via lib/dns_provider.sh.
-    # MX from Scaleway is ignored — the relay only sends outbound; we
-    # don't accept incoming mail on tenant subdomains.
+    # to get the local label, publish via lib/dns_provider.sh.
+    # SPF/DKIM/DMARC are TXT records; MX is an MX record (Scaleway
+    # publishes a null MX pointing at blackhole.tem.scaleway.com to
+    # advertise "this domain doesn't receive mail"). Publishing MX is
+    # what removes Scaleway's persistent `last_error: "mx: record not
+    # found"` warning even though the domain still validates without it.
     local zone="$BEBOP_DNS_ZONE"
-    local rtype rname rval label
-    for rtype in spf dkim dmarc; do
+    local rtype rname rval label dns_type
+    for rtype in spf dkim dmarc mx; do
         rname=$(printf '%s' "$dom_json" | jq -r ".records.${rtype}.name // empty")
         rval=$(printf '%s' "$dom_json" | jq -r ".records.${rtype}.value // empty")
         if [[ -z "$rname" || -z "$rval" ]]; then
@@ -305,7 +308,19 @@ mail_upstream_setup_domain() {
             continue
         fi
         label="${rname%.${zone}}"
-        dns_provider_dns_record_create "$label" TXT "$rval" 300 >/dev/null \
+        case "$rtype" in
+            mx) dns_type=MX ;;
+            *)  dns_type=TXT ;;
+        esac
+        # MX values from Scaleway may end with a trailing dot inside the
+        # target FQDN (e.g. "10 blackhole.tem.scaleway.com."). Most DNS
+        # providers accept it verbatim, but strip a trailing "." from the
+        # target field defensively to keep parity with the TXT paths
+        # (which never carry a trailing FQDN dot).
+        if [[ "$dns_type" == "MX" && "$rval" == *"." ]]; then
+            rval="${rval%.}"
+        fi
+        dns_provider_dns_record_create "$label" "$dns_type" "$rval" 300 >/dev/null \
             || { log_warn "mail_upstream_setup_domain: dns_provider_dns_record_create failed for ${rtype} (${label}.${zone})"; return 1; }
     done
     dns_provider_dns_zone_refresh
@@ -378,32 +393,41 @@ mail_upstream_teardown_domain() {
     # records in the zone. If upstream is unreachable / missing, fall
     # back to a best-effort SPF + DMARC cleanup on predictable labels
     # (the DKIM leaves behind an orphan we can't identify blindly).
-    local -a labels_to_delete=()
+    # Each entry: "<DNS_TYPE>:<label>". Encoded because SPF and MX share
+    # the SAME label (the tenant subdomain apex) but different types —
+    # searching TXT alone would leave the MX orphaned in the zone.
+    local -a records_to_delete=()
     local domain_id=""
     domain_id=$(scaleway_tem_domain_find "$full_domain" 2>/dev/null || true)
     if [[ -n "$domain_id" && -n "$zone" ]]; then
-        local dom_json rname rtype
+        local dom_json rname rtype dns_type
         if dom_json=$(scaleway_tem_domain_get "$domain_id" 2>/dev/null); then
-            for rtype in spf dkim dmarc; do
+            for rtype in spf dkim dmarc mx; do
                 rname=$(printf '%s' "$dom_json" | jq -r ".records.${rtype}.name // empty")
                 rname="${rname%.}"
                 [[ -z "$rname" || "$rname" != *".${zone}" ]] && continue
-                labels_to_delete+=("${rname%.${zone}}")
+                case "$rtype" in
+                    mx) dns_type=MX ;;
+                    *)  dns_type=TXT ;;
+                esac
+                records_to_delete+=("${dns_type}:${rname%.${zone}}")
             done
         fi
     fi
-    if (( ${#labels_to_delete[@]} == 0 )); then
-        log_warn "mail_upstream_teardown_domain: no upstream record map available for '${full_domain}' — best-effort SPF+DMARC cleanup only (DKIM record, if any, must be pruned manually)"
-        labels_to_delete=("$subdomain_label" "_dmarc.${subdomain_label}")
+    if (( ${#records_to_delete[@]} == 0 )); then
+        log_warn "mail_upstream_teardown_domain: no upstream record map available for '${full_domain}' — best-effort SPF+DMARC+MX cleanup on predictable labels only (DKIM record uses the project UUID as selector, unknown from here, and can't be pruned blindly)"
+        records_to_delete=("TXT:${subdomain_label}" "TXT:_dmarc.${subdomain_label}" "MX:${subdomain_label}")
     fi
 
     if [[ -n "$domain_id" ]]; then
         scaleway_tem_domain_delete "$domain_id" \
             || log_warn "mail_upstream_teardown_domain: provider delete failed for '${full_domain}'"
     fi
-    local host id
-    for host in "${labels_to_delete[@]}"; do
-        id=$(dns_provider_dns_record_find "$host" TXT 2>/dev/null || true)
+    local entry host dns_type id
+    for entry in "${records_to_delete[@]}"; do
+        dns_type="${entry%%:*}"
+        host="${entry#*:}"
+        id=$(dns_provider_dns_record_find "$host" "$dns_type" 2>/dev/null || true)
         [[ -n "$id" ]] && dns_provider_dns_record_delete "$id" 2>/dev/null || true
     done
 }

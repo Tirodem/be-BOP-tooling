@@ -23,7 +23,12 @@ garage_bucket_create() {
         log_info "garage: bucket '${bucket}' already exists"
         return 0
     fi
-    run_privileged garage bucket create "$bucket"
+    # `garage bucket create` (and every other mutation below) dumps a full
+    # BUCKET INFORMATION block on stdout — useful interactively, pure
+    # noise from a script that already logs the outcome. Redirect stdout
+    # to keep the deploy log readable; stderr stays so real errors still
+    # surface. Applied to bucket delete/allow/set-quotas + key delete.
+    run_privileged garage bucket create "$bucket" >/dev/null
     log_info "garage: created bucket '${bucket}'"
 }
 
@@ -35,7 +40,7 @@ garage_bucket_delete() {
         log_warn "garage: bucket '${bucket}' absent, nothing to delete"
         return 0
     fi
-    run_privileged garage bucket delete --yes "$bucket"
+    run_privileged garage bucket delete --yes "$bucket" >/dev/null
     log_info "garage: deleted bucket '${bucket}'"
 }
 
@@ -43,7 +48,7 @@ garage_bucket_delete() {
 # Pass "none" as max_size to remove the limit.
 garage_bucket_set_quota() {
     local bucket="$1" max_size="$2"
-    run_privileged garage bucket set-quotas --max-size "$max_size" "$bucket"
+    run_privileged garage bucket set-quotas --max-size "$max_size" "$bucket" >/dev/null
     log_info "garage: bucket '${bucket}' quota set to ${max_size}"
 }
 
@@ -87,7 +92,7 @@ garage_key_delete() {
         log_warn "garage: key '${key}' absent, nothing to delete"
         return 0
     fi
-    run_privileged garage key delete --yes "$key"
+    run_privileged garage key delete --yes "$key" >/dev/null
     log_info "garage: deleted key '${key}'"
 }
 
@@ -110,7 +115,7 @@ garage_bucket_grant() {
             esac
         done
     fi
-    run_privileged garage bucket allow "${args[@]}" --key "$key" "$bucket"
+    run_privileged garage bucket allow "${args[@]}" --key "$key" "$bucket" >/dev/null
     log_info "garage: granted ${args[*]} on '${bucket}' to key '${key}'"
 }
 
@@ -118,6 +123,6 @@ garage_bucket_grant() {
 # Removes ALL of read/write/owner from <key_name> on <bucket>.
 garage_bucket_revoke() {
     local bucket="$1" key="$2"
-    run_privileged garage bucket deny --read --write --owner --key "$key" "$bucket" || true
+    run_privileged garage bucket deny --read --write --owner --key "$key" "$bucket" >/dev/null || true
     log_info "garage: revoked all perms on '${bucket}' from key '${key}'"
 }

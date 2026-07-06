@@ -44,6 +44,8 @@ source "$BEBOP_TOOLING_LIB_DIR/transaction.sh"
 source "$BEBOP_TOOLING_LIB_DIR/registry.sh"
 # shellcheck source=lib/dns_provider.sh
 source "$BEBOP_TOOLING_LIB_DIR/dns_provider.sh"
+# shellcheck source=lib/scaleway.sh
+source "$BEBOP_TOOLING_LIB_DIR/scaleway.sh"
 # shellcheck source=lib/mongo.sh
 source "$BEBOP_TOOLING_LIB_DIR/mongo.sh"
 # shellcheck source=lib/garage.sh
@@ -858,7 +860,53 @@ phase_mail_relay() {
         --argjson fake false \
         '{host: $host, port: $port, user: $user, password: $pass, from: $from, fake: $fake}')
     RUNTIME_CONFIG_OVERRIDES+=("false:smtp=${smtp_value}")
-    log_info "mail-relay: '${TENANT_ID}' relay row + runtimeConfig.smtp queued (upstream declaration deferred to timer)"
+    log_info "mail-relay: '${TENANT_ID}' relay row + runtimeConfig.smtp queued"
+}
+
+# Phase 8c: upstream sending-domain declaration (Scaleway TEM).
+#
+# We do this in-line right after phase_mail_relay instead of leaving it
+# entirely to the retry-upstream timer (which fires every 15 min) so that
+# a freshly deployed tenant can send email within seconds instead of
+# minutes. Non-fatal: any failure here is logged as a warning and the
+# deploy carries on — the timer will retry, matching the pre-existing
+# semantic. This keeps the tenant's local resources (mongo, garage,
+# nginx, cert, kuma) reachable even if Scaleway is temporarily down or
+# out of quota.
+#
+# Called AFTER phase_mail_relay (which creates the local relay row and
+# queues runtimeConfig.smtp) — the runtime-config apply happens in phase
+# 12 which is downstream of us. Order matters because
+# mail_upstream_setup_domain publishes the SPF/DKIM/DMARC/MX records at
+# the DNS provider — the DNS zone must already exist by phase 3 and DNS
+# records are additive, so this is safe here.
+phase_mail_relay_upstream() {
+    if is_external_mode; then
+        log_info "phase 8c: --external-domain tenant — upstream declaration still uses <tid>.<BEBOP_DNS_ZONE>"
+    else
+        log_info "phase 8c: mail-relay upstream declaration (Scaleway TEM)..."
+    fi
+    if ! mail_upstream_is_configured; then
+        log_warn "phase 8c: upstream provider not configured (SCALEWAY_TEM_API_KEY/SCALEWAY_TEM_PROJECT_ID unset) — skipping. bebop-mail-relay-retry.timer picks it up as soon as creds appear in secrets.env"
+        return 0
+    fi
+    if [[ -z "${BEBOP_DNS_ZONE:-}" ]]; then
+        log_warn "phase 8c: BEBOP_DNS_ZONE unset — skipping upstream declaration"
+        return 0
+    fi
+    local full_domain="${TENANT_ID}.${BEBOP_DNS_ZONE}"
+    local domain_id
+    if ! domain_id=$(mail_upstream_setup_domain "$TENANT_ID" "$full_domain"); then
+        log_warn "phase 8c: upstream declaration for '${full_domain}' failed — the 15-min retry timer will retry. Not blocking the deploy."
+        return 0
+    fi
+    # Stamp the tenant's row so the timer skips it on future ticks
+    # (mirror what `mail-relay-ctl.sh retry-upstream` does on success).
+    if command -v mail-relay-ctl.sh >/dev/null 2>&1; then
+        mail-relay-ctl.sh set-upstream-id "$TENANT_ID" "$domain_id" >/dev/null 2>&1 \
+            || log_warn "phase 8c: could not stamp upstream_domain_id for '${TENANT_ID}' — the retry timer will attempt a recheck next tick"
+    fi
+    log_info "phase 8c: upstream declared for '${full_domain}' (id=${domain_id}) — Scaleway may still take a couple of minutes to validate the DNS records"
 }
 
 # Phase 9: per-tenant config.env
@@ -1316,6 +1364,7 @@ run_fresh_creation() {
     phase_release
     phase_phoenixd
     phase_mail_relay
+    phase_mail_relay_upstream
     phase_config_env
     phase_certificate
     phase_nginx
