@@ -23,6 +23,12 @@
 #                     leak Scaleway slots on teardown otherwise).
 #
 # Status semantics:
+#   provisioning  — a fresh add-tenant.sh is mid-run: ports reserved,
+#                   registry row exists as a placeholder, but the tenant
+#                   is NOT yet operational. registry_allocate_port must
+#                   consider these ports as taken. On successful
+#                   completion, add-tenant.sh flips the row to `active`.
+#                   On failure, the rollback undo removes the row.
 #   active        — tenant is running; reserves its ports
 #   soft-deleted  — services off, DNS removed, but data + config + ports preserved
 #   archived      — data uploaded to SFTP and locally purged; row may be removed
@@ -247,6 +253,23 @@ _registry_migrate_10_to_12() {
 
 : "${REGISTRY_LOCK_TIMEOUT_SECONDS:=120}"
 
+# registry_lock_scope <cmd> [args...]
+#
+# Acquire the registry lock, run <cmd> (with args), release the lock,
+# propagate the command's exit code. Preferred over manual
+# lock / cmd / unlock triples: guarantees the unlock even when the
+# command dies mid-run and shortens the critical section to exactly
+# the operation being protected.
+#
+# Nesting is refused (registry_lock already dies on double-take).
+registry_lock_scope() {
+    registry_lock
+    local rc=0
+    "$@" || rc=$?
+    registry_unlock
+    return "$rc"
+}
+
 registry_lock() {
     if [[ -n "${_REGISTRY_FD:-}" ]]; then
         die "registry: lock already held in this process"
@@ -323,10 +346,16 @@ registry_allocate_port() {
     esac
     local -A used=()
     local port
+    # `provisioning` counted as port-holder: a fresh add-tenant.sh that
+    # just reserved its ports and wrote a placeholder row is guaranteed
+    # to be seen by any concurrent add-tenant.sh looking for a free port,
+    # even though the tenant isn't operational yet. Without this, two
+    # parallel fresh runs racing on registry_allocate_port would both
+    # get the same "next free" number and collide on bind(2) later.
     while IFS= read -r port; do
         [[ -n "$port" ]] && used["$port"]=1
     done < <(awk -F'\t' -v c="$col" \
-        'NR>1 && ($11=="active" || $11=="soft-deleted") { print $c }' \
+        'NR>1 && ($11=="active" || $11=="soft-deleted" || $11=="provisioning") { print $c }' \
         "$REGISTRY_PATH")
     local p="$min_port"
     while [[ -n "${used[$p]:-}" ]]; do

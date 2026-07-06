@@ -459,9 +459,37 @@ phase_derive_identifiers() {
     MONGO_DB_NAME="bebop_${TENANT_ID//-/_}"
 
     if [[ "${DECISION_PATH:-fresh}" == "fresh" ]]; then
-        BEBOP_PORT=$(registry_allocate_port bebop)
-        PHOENIXD_PORT=$(registry_allocate_port phoenixd)
-        MONGO_PORT=$(registry_allocate_port mongo)
+        # ATOMIC: allocate ports + insert placeholder row + register
+        # rollback undo, all under a single lock. The row is written
+        # with status='provisioning' + empty bebop_version — from now
+        # on, any concurrent add-tenant.sh calling registry_allocate_port
+        # sees these ports as taken (registry_allocate_port treats
+        # `provisioning` as port-holding). Lock is released before the
+        # long IO work (DNS / cert / mongo / phoenixd / kuma) so other
+        # add-tenants can allocate their own ports without waiting.
+        #
+        # phase_kuma_and_registry flips the row to status='active' at
+        # the end of the run (also under a briefly-held lock).
+        _reserve_ports_and_placeholder() {
+            BEBOP_PORT=$(registry_allocate_port bebop)
+            PHOENIXD_PORT=$(registry_allocate_port phoenixd)
+            MONGO_PORT=$(registry_allocate_port mongo)
+            local now external_flag=0
+            now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+            is_external_mode && external_flag=1
+            registry_add \
+                "$TENANT_ID" "$DOMAIN" "$BEBOP_PORT" "$PHOENIXD_PORT" \
+                "$MONGO_PORT" "$MONGO_DB_NAME" \
+                "$GARAGE_BUCKET" "$GARAGE_KEY_NAME" \
+                "" "$now" "provisioning" "$external_flag"
+        }
+        registry_lock_scope _reserve_ports_and_placeholder \
+            || die "phase 2: failed to reserve ports + placeholder row"
+        # Rollback: on failure anywhere downstream, remove the row.
+        # registry_remove takes its own lock — safe from txn_run_undos
+        # which runs OUTSIDE any held lock.
+        txn_register_undo "registry placeholder row for ${TENANT_ID}" \
+            "registry_lock_scope registry_remove '${TENANT_ID}' 2>/dev/null || true"
     else
         BEBOP_PORT=$(registry_get_field "$TENANT_ID" bebop_port)
         PHOENIXD_PORT=$(registry_get_field "$TENANT_ID" phoenixd_port)
@@ -1253,24 +1281,26 @@ phase_healthcheck() {
 phase_kuma_and_registry() {
     log_info "phase 14: Uptime Kuma registration + registry write..."
     kuma_register_tenant "$TENANT_ID" "https://${DOMAIN}/"
-    local now
-    now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
     case "${DECISION_PATH:-fresh}" in
         fresh)
-            local external_flag=0
-            is_external_mode && external_flag=1
-            registry_add \
-                "$TENANT_ID" "$DOMAIN" "$BEBOP_PORT" "$PHOENIXD_PORT" \
-                "$MONGO_PORT" "$MONGO_DB_NAME" \
-                "$GARAGE_BUCKET" "$GARAGE_KEY_NAME" \
-                "$RESOLVED_VERSION" "$now" "active" "$external_flag"
+            # The row already exists (status='provisioning', inserted
+            # by phase_derive_identifiers). Flip it to 'active' and
+            # stamp the resolved version. Both mutations under a single
+            # brief lock — no port reallocation, no DNS/cert side
+            # effects here.
+            _finalise_registry_row() {
+                registry_set_field "$TENANT_ID" bebop_version "$RESOLVED_VERSION"
+                registry_set_status "$TENANT_ID" active
+            }
+            registry_lock_scope _finalise_registry_row \
+                || die "phase 14: failed to finalise registry row for ${TENANT_ID}"
             ;;
         reactivate)
-            registry_set_status "$TENANT_ID" active
+            registry_lock_scope registry_set_status "$TENANT_ID" active
             ;;
         reapply)
             # Already active; refresh version if it changed.
-            registry_set_field "$TENANT_ID" bebop_version "$RESOLVED_VERSION"
+            registry_lock_scope registry_set_field "$TENANT_ID" bebop_version "$RESOLVED_VERSION"
             ;;
     esac
 }
@@ -1493,10 +1523,16 @@ main() {
     source "$SECRETS_FILE"
 
     registry_init
-    registry_lock
-    # (registry_unlock is called from on_script_exit — the script-level
-    # EXIT trap defined near the top — so it runs after success notif
-    # AND after failure notif, on every exit path.)
+    # The registry lock is NO LONGER held for the full duration of
+    # main(). It's now acquired only around the specific mutations
+    # (port allocation + placeholder row insert in phase_derive_identifiers,
+    # final status flip in phase_kuma_and_registry, reactivate/reapply
+    # single-field updates). This keeps concurrent add-tenant.sh calls
+    # from serialising on DNS / cert / mongo / phoenixd / kuma work
+    # (~55 s) — the pre-fix behavior that made 3 API orders in <30s
+    # blow past the flock 30s timeout on the third.
+    # `on_script_exit` still calls registry_unlock defensively — it
+    # no-ops when we don't hold the fd, so it's safe on every path.
 
     preflight_purge_orphans
 
