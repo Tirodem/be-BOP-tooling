@@ -713,6 +713,26 @@ run_purge() {
     log_info "purge complete; tenant '${TENANT_ID}' fully removed"
 }
 
+# run_purge_upstream_only — idempotent completion of a purge that finished
+# locally but never cleaned the upstream provider side. Only makes sense
+# when the tenant is absent from the registry AND --purge is set; the
+# caller (main) enforces both.
+#
+# We compose the full domain from tenant_id + BEBOP_DNS_ZONE — the same
+# derivation add-tenant.sh used at registration time. No registry data
+# needed. mail_upstream_teardown_domain now die()s if upstream isn't
+# configured, so this function will bubble that up as an operator-visible
+# failure rather than silently no-op'ing again.
+run_purge_upstream_only() {
+    local zone="${BEBOP_DNS_ZONE:-}"
+    if [[ -z "$zone" ]]; then
+        die "run_purge_upstream_only: BEBOP_DNS_ZONE unset in secrets.env — cannot derive '${TENANT_ID}.<zone>' to reconcile upstream orphan"
+    fi
+    log_info "run_purge_upstream_only: reconciling upstream orphan for '${TENANT_ID}.${zone}'..."
+    mail_upstream_teardown_domain "$TENANT_ID" "${TENANT_ID}.${zone}"
+    log_info "run_purge_upstream_only: upstream orphan for '${TENANT_ID}.${zone}' reconciled"
+}
+
 # === Main ===============================================================
 main() {
     require_privileges
@@ -730,12 +750,24 @@ main() {
 
     local status
     status=$(registry_get_status "$TENANT_ID")
-    if [[ "$status" == "absent" ]]; then
+    if [[ "$status" == "absent" && "$MODE" != "purge" ]]; then
         log_info "tenant '${TENANT_ID}' is not in the registry — nothing to do"
         exit 0
     fi
     if [[ "$status" == "archived" && "$MODE" != "purge" ]]; then
         log_info "tenant '${TENANT_ID}' is already archived; only --purge has an effect now"
+        exit 0
+    fi
+    # --purge on an "absent" tenant is idempotent completion: the local
+    # side was already dismantled by a previous run, but the upstream
+    # provider may still have an orphan (e.g. secrets.env didn't yet
+    # contain SCALEWAY_TEM_* the first time around, so
+    # mail_upstream_teardown_domain used to skip silently). Skip the
+    # registry-driven load / local-only steps and go straight to the
+    # upstream cleanup path.
+    if [[ "$status" == "absent" && "$MODE" == "purge" ]]; then
+        log_info "tenant '${TENANT_ID}' absent from registry — running --purge in upstream-only reconcile mode"
+        run_purge_upstream_only
         exit 0
     fi
 

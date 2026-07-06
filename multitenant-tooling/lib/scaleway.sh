@@ -341,13 +341,22 @@ mail_upstream_recheck() {
 # mail_upstream_teardown_domain <tenant_subdomain_label> <full_domain>
 #
 # Reverse of mail_upstream_setup_domain: drop the provider-side domain
-# and remove the DNS records we posted. Best-effort — a stale entry on
-# the provider side costs nothing and shouldn't block the local purge.
+# and remove the DNS records we posted. Refuses to skip silently when
+# upstream isn't reachable — a silent skip leaves an orphan on the
+# provider side that consumes quota (Scaleway TEM Essential = 5 domains
+# hard cap) until an operator notices and cleans it up manually. So we
+# die() instead: the caller (remove-tenant.sh) surfaces the failure and
+# the operator either fixes secrets.env then retries, or knowingly opts
+# out of the strict path.
 mail_upstream_teardown_domain() {
     local subdomain_label="$1" full_domain="$2"
     [[ -z "$subdomain_label" || -z "$full_domain" ]] \
         && { log_warn "mail_upstream_teardown_domain: skipping (empty args)"; return 0; }
     local zone="${BEBOP_DNS_ZONE:-}"
+
+    if ! mail_upstream_is_configured; then
+        die "mail_upstream_teardown_domain: upstream provider not configured (SCALEWAY_TEM_API_KEY / SCALEWAY_TEM_PROJECT_ID missing in ${SECRETS_FILE:-/etc/be-BOP-tooling/secrets.env}). Refusing to proceed — a silent skip here would leave '${full_domain}' as an orphan on Scaleway (quota-consuming). Fix secrets.env and retry."
+    fi
 
     # Fetch the record labels from Scaleway BEFORE deleting the upstream
     # domain — DKIM's selector is the project UUID (unknown to us
@@ -357,9 +366,7 @@ mail_upstream_teardown_domain() {
     # (the DKIM leaves behind an orphan we can't identify blindly).
     local -a labels_to_delete=()
     local domain_id=""
-    if mail_upstream_is_configured; then
-        domain_id=$(scaleway_tem_domain_find "$full_domain" 2>/dev/null || true)
-    fi
+    domain_id=$(scaleway_tem_domain_find "$full_domain" 2>/dev/null || true)
     if [[ -n "$domain_id" && -n "$zone" ]]; then
         local dom_json rname rtype
         if dom_json=$(scaleway_tem_domain_get "$domain_id" 2>/dev/null); then
