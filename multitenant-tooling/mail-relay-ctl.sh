@@ -57,6 +57,8 @@ fi
 source "$BEBOP_TOOLING_LIB_DIR/log.sh"
 # shellcheck source=lib/sudo.sh
 source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
+# shellcheck source=lib/mongo.sh
+source "$BEBOP_TOOLING_LIB_DIR/mongo.sh"
 
 BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
@@ -380,11 +382,22 @@ _do_upstream_setup() {
 main() {
     (( $# == 0 )) && { usage; exit 1; }
     require_privileges
-    # Verify mongod@tooling is reachable before running any command; a
-    # clean error beats a mongosh connection stack trace.
+    # Verify bebop-tooling-mongodb is reachable AND its replica set is
+    # in a state we can write against. A raw ping succeeds even when the
+    # node is SECONDARY without a primary elected (or in STARTUP), so the
+    # ping alone would let us continue to the actual command and hit the
+    # infamous "node is not in primary or recovering state" error inside
+    # cmd_create/cmd_delete/etc. mongo_init_rs is idempotent (skips if
+    # rs.status().ok already), so calling it here on every invocation
+    # both self-heals a fresh mongod (never started as part of a
+    # bebop-mail-relay boot cycle) and validates the RS state before any
+    # write. Costs one mongosh ping on a healthy tenant.
     if ! run_privileged mongosh --quiet --port "$MONGO_PORT" \
             --eval 'db.runCommand({ping:1}).ok' "$MONGO_DB" >/dev/null 2>&1; then
-        die "cannot reach mongod@tooling on 127.0.0.1:${MONGO_PORT} — is it running?"
+        die "cannot reach bebop-tooling-mongodb on 127.0.0.1:${MONGO_PORT} — is it running?"
+    fi
+    if ! mongo_init_rs "$MONGO_PORT" >/dev/null 2>&1; then
+        die "bebop-tooling-mongodb: replica set not initialised on 127.0.0.1:${MONGO_PORT} and mongo_init_rs failed"
     fi
     local cmd="$1"; shift
     case "$cmd" in
