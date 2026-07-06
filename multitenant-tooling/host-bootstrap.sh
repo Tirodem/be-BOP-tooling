@@ -557,6 +557,51 @@ step_provision_garage_layout() {
     fi
 }
 
+# Pre-flight for every `nginx -t` we run in host-bootstrap.sh: scan
+# sites-enabled/ symlinks for vhosts referencing SSL cert files that
+# don't exist on disk (typical after an interrupted migrate-tenant.sh
+# or a manual `certbot delete` without a corresponding vhost update).
+# Any such vhost would make `nginx -t` fail and block the entire infra
+# update — so we quarantine them by removing the symlink from
+# sites-enabled/ (the file in sites-available/ stays intact so the
+# operator can trace what was removed). Idempotent + non-destructive:
+# on a healthy host it does nothing and logs nothing.
+#
+# Rationale: infra updates must NEVER be blocked by tenant-specific
+# broken state. An operator with one busted tenant should still be able
+# to run `install.sh` to deploy new tooling code (including the fix
+# for whatever broke that tenant). Loud log_warn per quarantined
+# tenant so the operator sees exactly which ones need repair via
+# `add-tenant.sh <tid> --admin-email <addr>`.
+_nginx_quarantine_broken_vhosts() {
+    local sites_enabled=/etc/nginx/sites-enabled
+    [[ -d "$sites_enabled" ]] || return 0
+    local link vhost_file cert_path missing_cert quarantined=0
+    for link in "$sites_enabled"/*; do
+        [[ -L "$link" || -f "$link" ]] || continue
+        vhost_file=$(readlink -f "$link" 2>/dev/null || echo "$link")
+        [[ -r "$vhost_file" ]] || continue
+        missing_cert=""
+        while IFS= read -r cert_path; do
+            [[ -z "$cert_path" ]] && continue
+            if [[ ! -e "$cert_path" ]]; then
+                missing_cert="$cert_path"
+                break
+            fi
+        done < <(grep -E '^[[:space:]]*ssl_certificate(_key)?[[:space:]]+' "$vhost_file" \
+                 | awk '{print $2}' \
+                 | tr -d ';')
+        if [[ -n "$missing_cert" ]]; then
+            log_warn "nginx: quarantining vhost '$(basename "$link")' — cert '${missing_cert}' missing on disk. Re-run \`add-tenant.sh <tid> --admin-email <addr>\` to restore. Symlink removed from sites-enabled; file preserved in sites-available for reference."
+            maybe_run run_privileged rm -f "$link"
+            (( quarantined++ ))
+        fi
+    done
+    if (( quarantined > 0 )); then
+        log_warn "nginx: ${quarantined} broken vhost(s) quarantined so this infra update can proceed"
+    fi
+}
+
 # === nginx default catch-all + ACME HTTP-01 webroot =====================
 # The default vhost has TWO responsibilities, both load-bearing:
 #   1. Serve the ACME HTTP-01 challenge tokens for ANY hostname on port 80
@@ -603,6 +648,7 @@ EOF
     maybe_run run_privileged ln -sf /etc/nginx/sites-available/default /etc/nginx/sites-enabled/default
     rm -f "$tmp"
     if [[ "$DRY_RUN" != "true" ]]; then
+        _nginx_quarantine_broken_vhosts
         run_privileged nginx -t
         # On a re-run of host-bootstrap (after updating the tooling), nginx
         # is already active and step_start_nginx's `enable --now` is a
@@ -1011,6 +1057,7 @@ EOF
     run_privileged ln -sfn /etc/nginx/sites-available/netdata.conf /etc/nginx/sites-enabled/netdata.conf
     rm -f "$tmp"
 
+    _nginx_quarantine_broken_vhosts
     if ! run_privileged nginx -t 2>/dev/null; then
         die "nginx -t failed after installing the netdata vhost"
     fi
@@ -1097,6 +1144,7 @@ step_setup_kuma_public_access() {
     run_privileged ln -sfn /etc/nginx/sites-available/kuma.conf /etc/nginx/sites-enabled/kuma.conf
     rm -f "$tmp"
 
+    _nginx_quarantine_broken_vhosts
     if ! run_privileged nginx -t 2>/dev/null; then
         die "nginx -t failed after installing the kuma vhost"
     fi
@@ -1252,6 +1300,7 @@ _deploy_api_install_public_exposure() {
     run_privileged ln -sfn /etc/nginx/sites-available/deploy.conf /etc/nginx/sites-enabled/deploy.conf
     rm -f "$tmp"
 
+    _nginx_quarantine_broken_vhosts
     if ! run_privileged nginx -t 2>/dev/null; then
         die "nginx -t failed after installing the deploy vhost"
     fi
