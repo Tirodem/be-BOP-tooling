@@ -22,8 +22,8 @@ curl -sfSL \
 #   - installs the tooling under /opt/be-BOP-tooling/,
 #   - seeds /etc/be-BOP-tooling/secrets.env from the template (mode 0600),
 #   - runs host-bootstrap.sh --defer-secrets (provisions everything that
-#     does not need OVH credentials),
-#   - opens secrets.env in nano so you can fill in OVH, SMTP, Zulip, SFTP,
+#     does not need DNS provider credentials),
+#   - opens secrets.env in nano so you can fill in DNS-provider, SMTP, Zulip, SFTP,
 #     BACKUP_ENCRYPTION_KEY.
 ```
 
@@ -33,7 +33,7 @@ curl -sfSL \
 
 ```bash
 # After saving secrets.env, finalise the bootstrap (runs the deferred
-# OVH-credential steps and verifies OVH connectivity):
+# DNS-provider credential steps and verifies DNS provider connectivity):
 sudo /opt/be-BOP-tooling/host-bootstrap.sh --verbose
 ```
 
@@ -48,15 +48,15 @@ notification channels.
 ## Test 2 — add-tenant.sh tenant1 in < 5 min
 
 ```bash
-time add-tenant.sh tenant1 --admin-email test1@pvh-labs.com --verbose
+time add-tenant.sh tenant1 --admin-email test1@be-bop.dev --verbose
 ```
 
 EXPECT: total wall-clock < 5 min on a normal-bandwidth host;
-`https://tenant1.pvh-labs.com/` returns 200; the script's final block
+`https://tenant1.be-bop.dev/` returns 200; the script's final block
 shows the phoenixd HTTP password and seed for handoff.
 
 ```bash
-curl -sI https://tenant1.pvh-labs.com/ | head -1            # HTTP/2 200
+curl -sI https://tenant1.be-bop.dev/ | head -1            # HTTP/2 200
 systemctl is-active bebop@tenant1 phoenixd@tenant1          # active active
 ```
 
@@ -65,12 +65,12 @@ systemctl is-active bebop@tenant1 phoenixd@tenant1          # active active
 ```bash
 # Sequential:
 for n in 2 3 4 5; do
-  add-tenant.sh tenant$n --admin-email test$n@pvh-labs.com --non-interactive
+  add-tenant.sh tenant$n --admin-email test$n@be-bop.dev --non-interactive
 done
 
 # Parallel (registry lock will queue them — see add-tenant docs for caveats):
 for n in 6 7 8 9 10; do
-  add-tenant.sh tenant$n --admin-email test$n@pvh-labs.com --non-interactive &
+  add-tenant.sh tenant$n --admin-email test$n@be-bop.dev --non-interactive &
   sleep 5     # stagger to avoid lock contention thrash
 done
 wait
@@ -123,7 +123,7 @@ EXPECT: `10` for every count.
 
 ```bash
 remove-tenant.sh tenant5 --verbose
-curl -sI https://tenant5.pvh-labs.com/ --max-time 5 | head -1   # 444 / connection failure / nxdomain
+curl -sI https://tenant5.be-bop.dev/ --max-time 5 | head -1   # 444 / connection failure / nxdomain
 systemctl is-active bebop@tenant5 phoenixd@tenant5 mongod@tenant5  # inactive inactive inactive
 ls /var/lib/be-BOP/tenant5/releases/                              # release tree intact
 ls /var/lib/phoenixd/tenant5/.phoenix/seed.dat                    # seed intact
@@ -137,8 +137,8 @@ mongod dbPath); status `soft-deleted` in registry.
 ## Test 7 — reactivate tenant5
 
 ```bash
-add-tenant.sh tenant5 --admin-email test5@pvh-labs.com --reactivate --verbose
-curl -sI https://tenant5.pvh-labs.com/ | head -1                 # HTTP/2 200
+add-tenant.sh tenant5 --admin-email test5@be-bop.dev --reactivate --verbose
+curl -sI https://tenant5.be-bop.dev/ | head -1                 # HTTP/2 200
 awk -F'\t' '$1=="tenant5" {print $11}' /var/lib/be-BOP/tenants.tsv    # active
 ```
 
@@ -155,7 +155,7 @@ the upgrade.
 # Terminal A
 while :; do
   printf '%s ' "$(date +%H:%M:%S)"
-  curl -sI -o /dev/null -w '%{http_code}' --max-time 2 https://tenant3.pvh-labs.com/
+  curl -sI -o /dev/null -w '%{http_code}' --max-time 2 https://tenant3.be-bop.dev/
   echo
   sleep 1
 done
@@ -180,7 +180,7 @@ within Kuma's polling interval (default 60 s).
 
 ```bash
 # Pre-condition: tenant11 is absent.
-add-tenant.sh tenant11 --admin-email crash@pvh-labs.com &
+add-tenant.sh tenant11 --admin-email crash@be-bop.dev &
 PID=$!
 sleep 4    # let it pass phase 4 (Mongo) and start phase 5 (Garage)
 kill -KILL $PID
@@ -213,7 +213,7 @@ done
 remove-tenant.sh tenant11 --purge --i-know-what-im-doing --non-interactive 2>/dev/null || true
 ```
 
-The host-level resources (Garage, nginx default, certbot OVH creds) are
+The host-level resources (Garage, nginx default, certbot DNS provider creds) are
 left in place.
 
 ## What this plan does not cover
@@ -222,5 +222,5 @@ left in place.
   `README.remove-tenant.md`).
 - Cross-version migrations of be-BOP that change the config schema.
 - Performance benchmarks under merchant load.
-- Failure modes of OVH DNS API (throttling, outage).
+- Failure modes of DNS provider API (throttling, outage).
 - VDS-level failure scenarios (disk full impacting all per-tenant mongods at once).

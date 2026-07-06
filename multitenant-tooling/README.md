@@ -3,7 +3,7 @@
 Operational tooling to host **10+ isolated be-BOP tenants** on a single
 Debian 12 VDS, with one local mongod per tenant, a single mutualised
 Garage S3 instance, per-tenant phoenixd Lightning daemons, and per-tenant
-TLS via Let's Encrypt DNS-01 over the OVH API.
+TLS via Let's Encrypt DNS-01 over the DNS provider API.
 
 This is a fork of [be-BOP-tooling](https://github.com/be-BOP-io-SA/be-BOP-tooling)
 maintained on the `multitenant-poc` branch. It lives in a sibling directory
@@ -62,7 +62,7 @@ concurrent-safe mutations).
 
 ```
 tenant_id   domain                bebop_port  phoenixd_port  mongo_port  mongodb_database  garage_bucket  garage_key            bebop_version                       created_at             status
-tenant1     tenant1.pvh-labs.com  3001        9741           27018       bebop_tenant1     bebop-tenant1  bebop-tenant1-key     be-BOP.release.2026-04-15.abc1234   2026-05-04T14:30:00Z   active
+tenant1     tenant1.be-bop.dev  3001        9741           27018       bebop_tenant1     bebop-tenant1  bebop-tenant1-key     be-BOP.release.2026-04-15.abc1234   2026-05-04T14:30:00Z   active
 ```
 
 **Status values:** `active` (running, ports reserved), `soft-deleted`
@@ -79,13 +79,14 @@ local + Mongo + Garage purged, ports released).
 
 ### Per-tenant SAN certificate, not a single shared wildcard
 
-The original spec called for a single `*.pvh-labs.com` wildcard via
-DNS-01. That cert covers `tenant1.pvh-labs.com` and `s3.pvh-labs.com`,
-**but not** `s3.tenant1.pvh-labs.com` — Let's Encrypt does not issue
+The original spec called for a single `*.be-bop.dev` wildcard via
+DNS-01. That cert covers `tenant1.be-bop.dev` and `s3.be-bop.dev`,
+**but not** `s3.tenant1.be-bop.dev` — Let's Encrypt does not issue
 multi-level wildcards. Since we expose Garage per-tenant under
 `s3.<tenant>.<zone>`, we use one cert per tenant with two SAN entries:
-`<tenant>.<zone>` and `s3.<tenant>.<zone>`. Issuance is via DNS-01 OVH
-(no DNS propagation race to the public internet).
+`<tenant>.<zone>` and `s3.<tenant>.<zone>`. Issuance is via DNS-01
+against the configured DNS provider (no propagation race to the public
+internet).
 
 ### `DynamicUser=yes` with a sub-StateDirectory
 
@@ -168,7 +169,9 @@ multitenant-tooling/
 │   ├── sudo.sh                     run_privileged + require_privileges
 │   ├── transaction.sh              undo stack for transactional scripts
 │   ├── registry.sh                 tenants.tsv read/write/lock/allocate-port
-│   ├── ovh.sh                      OVH API: signing, DNS (DNS-01 + record CRUD)
+│   ├── dns_provider.sh             façade — sources the active backend based on DNS_PROVIDER
+│   ├── ovh.sh                      dns_provider_* backend for OVH (signed API, DNS record CRUD, zone refresh)
+│   ├── infomaniak.sh               dns_provider_* backend for Infomaniak
 │   ├── mongo.sh                    per-tenant mongod helpers (mongosh wrappers)
 │   ├── garage.sh                   bucket/key/quota wrappers
 │   ├── notify.sh                   SMTP + Zulip operator alerts
@@ -210,13 +213,13 @@ curl -sfSL \
 #   - installs the tooling to /opt/be-BOP-tooling/,
 #   - seeds /etc/be-BOP-tooling/secrets.env from the template,
 #   - runs host-bootstrap.sh --defer-secrets (everything that does NOT
-#     require OVH credentials: apt packages, Node, Garage, phoenixd,
+#     require DNS provider credentials: apt packages, Node, Garage, phoenixd,
 #     nginx catch-all, docker, Uptime Kuma, netdata, systemd units…),
-#   - then opens secrets.env in nano so you can fill in OVH / SMTP /
+#   - then opens secrets.env in nano so you can fill in DNS-provider / SMTP /
 #     Zulip / SFTP / Mongo cluster details.
 
 # 2. After saving secrets.env, finalise the host bootstrap (this only
-#    runs the deferred OVH-credential steps; safe to re-run anytime):
+#    runs the deferred DNS-provider credential steps; safe to re-run anytime):
 sudo /opt/be-BOP-tooling/host-bootstrap.sh
 
 # 3. Manual one-time step: open Uptime Kuma in a browser via SSH tunnel,
@@ -285,18 +288,19 @@ will detect the partial state and try to reconcile, OR finish with a clear
    files into the new layout. There is no automated `restore-tenant.sh` yet
    (see [Roadmap](#roadmap)).
 
-### Rotate OVH credentials
+### Rotate DNS provider credentials
 
-1. Update `/etc/be-BOP-tooling/secrets.env` with the new
-   `OVH_APPLICATION_KEY` / `OVH_APPLICATION_SECRET` / `OVH_CONSUMER_KEY`.
-2. Update `/etc/letsencrypt/ovh.ini` (the certbot-dns-ovh credentials).
-3. Run `host-bootstrap.sh` again — it's idempotent and will rewrite the ini
-   from the env. No tenant restart needed.
+1. Update `/etc/be-BOP-tooling/secrets.env` with the new provider-specific
+   keys (`OVH_APPLICATION_KEY` / `OVH_APPLICATION_SECRET` /
+   `OVH_CONSUMER_KEY` for OVH, `INFOMANIAK_API_TOKEN` for Infomaniak).
+2. Run `host-bootstrap.sh` again — it re-verifies connectivity through
+   `dns_provider_ping`. No tenant restart needed; the certbot hooks pick
+   up the new values on the next issuance.
 
-### Change the DNS zone (e.g. pvh-labs.com → bop-prod.com)
+### Change the DNS zone (e.g. be-bop.dev → bop-prod.com)
 
 Out of scope for the PoC. Requires a coordinated migration (issue new
-certs, change `OVH_DNS_ZONE`, update every tenant's nginx vhost + config).
+certs, change `BEBOP_DNS_ZONE`, update every tenant's nginx vhost + config).
 Leave this for v2.
 
 ---

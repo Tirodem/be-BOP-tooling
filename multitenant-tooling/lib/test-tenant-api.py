@@ -7,7 +7,7 @@ a be-BOP "spawn a test tenant" shop and provisions an ephemeral test tenant
 on this host.
 
 Listens on 127.0.0.1:<BEBOP_DEPLOY_API_PORT> (nginx terminates TLS on
-deploy.<OVH_DNS_ZONE> and reverse-proxies here). Uses only Python stdlib:
+deploy.<BEBOP_DNS_ZONE> and reverse-proxies here). Uses only Python stdlib:
 no new package dependency on the host.
 
 Auth model (mirrors be-BOP's outbound webhook signing convention):
@@ -627,7 +627,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_json(202, {
             "ok": True,
             "tenant_id": tenant_id,
-            "expected_url": f"https://{tenant_id}.{CFG['ovh_dns_zone']}/",
+            "expected_url": f"https://{tenant_id}.{CFG['bebop_dns_zone']}/",
             "ttl_seconds": CFG["ttl_seconds"],
         })
 
@@ -640,7 +640,7 @@ class Handler(BaseHTTPRequestHandler):
         first_name: str,
         order_number: object,
     ) -> None:
-        zone = CFG["ovh_dns_zone"]
+        zone = CFG["bebop_dns_zone"]
         tenant_url = f"https://{tenant_id}.{zone}/"
         backoffice_url = f"https://{tenant_id}.{zone}/admin"
         expires_at = iso8601(now_utc() + timedelta(seconds=CFG["ttl_seconds"]))
@@ -698,7 +698,7 @@ class Handler(BaseHTTPRequestHandler):
 # --- Bootstrap --------------------------------------------------------------
 def load_cfg() -> dict:
     """Load config from environment. Required vars:
-        BEBOP_DEPLOY_API_SECRET, OVH_DNS_ZONE
+        BEBOP_DEPLOY_API_SECRET, BEBOP_DNS_ZONE
     Optional, with defaults:
         BEBOP_DEPLOY_API_BIND_ADDR        (default 127.0.0.1)
         BEBOP_DEPLOY_API_PORT             (default 8820)
@@ -710,12 +710,12 @@ def load_cfg() -> dict:
     secret = os.environ.get("BEBOP_DEPLOY_API_SECRET") or ""
     if not secret:
         sys.exit("BEBOP_DEPLOY_API_SECRET is empty — refusing to start")
-    zone = os.environ.get("OVH_DNS_ZONE") or ""
+    zone = os.environ.get("BEBOP_DNS_ZONE") or ""
     if not zone:
-        sys.exit("OVH_DNS_ZONE is empty — refusing to start")
+        sys.exit("BEBOP_DNS_ZONE is empty — refusing to start")
     return {
         "secret": secret,
-        "ovh_dns_zone": zone,
+        "bebop_dns_zone": zone,
         "bind_addr": os.environ.get("BEBOP_DEPLOY_API_BIND_ADDR", "127.0.0.1"),
         "port": int(os.environ.get("BEBOP_DEPLOY_API_PORT", "8820")),
         "replay_window_seconds": int(
@@ -738,7 +738,7 @@ def main() -> None:
     CFG.update(load_cfg())
     server = ThreadingHTTPServer((CFG["bind_addr"], CFG["port"]), Handler)
     LOG.info("deploy API listening on %s:%d (zone=%s, ttl=%ds, replay-window=%ds)",
-             CFG["bind_addr"], CFG["port"], CFG["ovh_dns_zone"],
+             CFG["bind_addr"], CFG["port"], CFG["bebop_dns_zone"],
              CFG["ttl_seconds"], CFG["replay_window_seconds"])
     try:
         server.serve_forever()

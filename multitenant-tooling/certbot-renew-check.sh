@@ -7,7 +7,7 @@
 #
 # Why a separate check (vs relying on certbot's own daily timer):
 # certbot's daily timer DOES renew but does NOT notify on failure — a
-# broken renewal flow (vhost ACME path moved, OVH creds expired, etc.)
+# broken renewal flow (vhost ACME path moved, DNS provider creds expired, etc.)
 # surfaces only when a cert expires for real and the tenant tips over.
 # The --dry-run exercises the full challenge flow against LE staging,
 # consumes no quota, and fires Zulip + SMTP via notify_failure on any

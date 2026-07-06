@@ -6,7 +6,7 @@
 #
 # Runs as root (the handler shells out to add-tenant.sh / tenant-cli.sh /
 # remove-tenant.sh which need root or be-bop-cli sudo rules). Bind is local-
-# only (127.0.0.1); nginx terminates TLS on deploy.<OVH_DNS_ZONE> and reverse-
+# only (127.0.0.1); nginx terminates TLS on deploy.<BEBOP_DNS_ZONE> and reverse-
 # proxies here with an IP whitelist.
 
 [Unit]

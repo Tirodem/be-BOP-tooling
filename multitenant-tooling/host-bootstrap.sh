@@ -11,8 +11,8 @@
 # What this script DOES NOT do:
 #   - Create any tenant. (See add-tenant.sh.)
 #   - Issue any TLS certificate. (Per-tenant SAN certs are issued by add-tenant.sh
-#     via DNS-01 OVH; the only cert-related thing here is installing the
-#     certbot OVH plugin and the credentials file.)
+#     via DNS-01 through the configured DNS provider; the only cert-related
+#     thing here is verifying the provider credentials work.)
 #   - Start any mongod. The default mongod.service shipped by mongodb-org is
 #     masked; per-tenant mongod@<tenant>.service instances are started by
 #     add-tenant.sh.
@@ -20,12 +20,13 @@
 # What this script DOES, in order:
 #   1.  Validates the host (Debian 12, RAM, disk, AVX support).
 #   2.  Loads /etc/be-BOP-tooling/secrets.env.
-#   3.  Verifies OVH API credentials work (calls /me).
+#   3.  Verifies DNS provider API credentials work (dns_provider_ping).
 #   4.  Installs apt packages: nodejs, pnpm, mongodb-org + mongodb-mongosh +
 #       mongodb-database-tools, certbot, nginx, docker, netdata, plus
 #       the build/runtime deps (curl, jq, stow, openssl, unzip, python3-venv).
-#       certbot's DNS-01 OVH challenge is handled by hooks/ scripts using
-#       our own zone-scoped OVH token, so no certbot-dns-ovh plugin needed.
+#       certbot's DNS-01 challenge is handled by our hooks/certbot-dns-{auth,
+#       cleanup}.sh scripts talking to lib/dns_provider.sh, so no
+#       certbot-dns-<provider> plugin is required.
 #   5.  Downloads & stows Garage and phoenixd binaries.
 #   6.  Creates the /var/lib/be-BOP/, /etc/be-BOP/, /etc/be-BOP-tooling/,
 #       /etc/phoenixd/, /etc/be-BOP-mongodb/, /var/lib/be-BOP-mongodb/ skeleton.
@@ -34,9 +35,10 @@
 #   8.  Masks the default mongod.service (we use per-tenant template instances).
 #   9.  Writes /etc/garage.toml + garage.service, starts Garage, applies layout.
 #  10.  Writes a 444 catch-all default vhost for nginx, then enables nginx.
-#  11.  (No-op now — kept for backwards compat: removes the legacy
-#       /etc/letsencrypt/ovh.ini if present, certbot --manual hooks read
-#       OVH creds directly from secrets.env.)
+#  11.  (Legacy cleanup: removes the /etc/letsencrypt/ovh.ini file left
+#       behind by hosts that previously used certbot-dns-ovh, since our
+#       certbot --manual hooks now read DNS-provider creds directly from
+#       secrets.env via lib/dns_provider.sh.)
 #  12.  Installs systemd template units bebop@, phoenixd@, mongod@.
 #  13.  Installs tooling libs (/usr/local/share/be-BOP-tooling/lib/) and the
 #       per-tenant scripts ({add,remove,upgrade}-tenant.sh, upgrade-all.sh).
@@ -72,8 +74,8 @@ source "$BEBOP_TOOLING_LIB_DIR/log.sh"
 source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
 # shellcheck source=lib/registry.sh
 source "$BEBOP_TOOLING_LIB_DIR/registry.sh"
-# shellcheck source=lib/ovh.sh
-source "$BEBOP_TOOLING_LIB_DIR/ovh.sh"
+# shellcheck source=lib/dns_provider.sh
+source "$BEBOP_TOOLING_LIB_DIR/dns_provider.sh"
 
 BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
@@ -107,17 +109,17 @@ Options:
   --defer-secrets        Run only the steps that do not need secrets.env
                          (apt packages, binaries, dirs, garage, nginx,
                          systemd units, registry, docker, kuma, netdata).
-                         Skips OVH connectivity check and certbot OVH
-                         credentials. Re-run host-bootstrap.sh after
-                         editing secrets.env to finalise — it is idempotent.
+                         Skips DNS-provider connectivity check. Re-run
+                         host-bootstrap.sh after editing secrets.env to
+                         finalise — it is idempotent.
   --non-interactive      Refuse to prompt; exit if input would be required.
   --dry-run              Print what would happen without changing the system.
   --verbose              Verbose logging (also enables --debug at journald).
   -h, --help             Show this help.
 
 Required environment in secrets.env:
-  OVH_APPLICATION_KEY, OVH_APPLICATION_SECRET, OVH_CONSUMER_KEY,
-  OVH_DNS_ZONE, plus SFTP/SMTP/Zulip/Kuma (all optional except OVH_*).
+  DNS_PROVIDER (ovh|infomaniak), BEBOP_DNS_ZONE, plus provider-specific
+  credentials (OVH_* or INFOMANIAK_*). SFTP/SMTP/Zulip/Kuma are optional.
 See templates/secrets.env.example.
 EOF
 }
@@ -212,7 +214,16 @@ step_load_secrets() {
     source "$SECRETS_FILE"
 
     local missing=()
-    for v in OVH_APPLICATION_KEY OVH_APPLICATION_SECRET OVH_CONSUMER_KEY OVH_DNS_ZONE; do
+    local required_vars=(BEBOP_DNS_ZONE)
+    # Empty DNS_PROVIDER falls back to "ovh" (matches lib/dns_provider.sh's
+    # default), so pre-existing secrets.env files from before the multi-
+    # provider refactor keep working without a mandatory edit.
+    case "${DNS_PROVIDER:-ovh}" in
+        ovh)        required_vars+=(OVH_APPLICATION_KEY OVH_APPLICATION_SECRET OVH_CONSUMER_KEY) ;;
+        infomaniak) required_vars+=(INFOMANIAK_API_TOKEN) ;;
+        *)          die "secrets.env: unknown DNS_PROVIDER='${DNS_PROVIDER}' (want: ovh|infomaniak)" ;;
+    esac
+    for v in "${required_vars[@]}"; do
         [[ -z "${!v:-}" ]] && missing+=("$v")
     done
     if (( ${#missing[@]} )); then
@@ -225,15 +236,15 @@ step_load_secrets() {
     log_info "secrets loaded ✓"
 }
 
-# === OVH connectivity ====================================================
-step_verify_ovh_connectivity() {
-    if [[ "$DEFER_SECRETS" == "true" && -z "${OVH_APPLICATION_KEY:-}" ]]; then
-        log_info "Skipping OVH connectivity check (--defer-secrets)"
+# === DNS provider connectivity ==========================================
+step_verify_dns_provider_connectivity() {
+    if [[ "$DEFER_SECRETS" == "true" ]] && ! dns_provider_is_configured; then
+        log_info "Skipping DNS provider connectivity check (--defer-secrets, incomplete creds)"
         return 0
     fi
-    log_info "Verifying OVH API connectivity..."
-    if ! ovh_ping; then
-        die "OVH API ping failed; check OVH_APPLICATION_KEY / OVH_APPLICATION_SECRET / OVH_CONSUMER_KEY in ${SECRETS_FILE}"
+    log_info "Verifying DNS provider API connectivity (DNS_PROVIDER=${DNS_PROVIDER})..."
+    if ! dns_provider_ping; then
+        die "DNS provider ping failed; check ${DNS_PROVIDER^^}_* creds in ${SECRETS_FILE}"
     fi
 }
 
@@ -648,11 +659,13 @@ step_start_nginx() {
     maybe_run run_privileged systemctl enable --now nginx
 }
 
-# === certbot OVH credentials (no longer needed) =========================
-# certbot-dns-ovh has been replaced by certbot --manual + our hooks/
-# scripts (see add-tenant.sh::phase_certificate). The hooks read OVH
-# creds from /etc/be-BOP-tooling/secrets.env directly, so /etc/letsencrypt/ovh.ini
-# is no longer used. We remove a stale one if it exists from a prior install.
+# === Legacy certbot-dns-ovh cleanup ======================================
+# Older bootstraps used the certbot-dns-ovh Python plugin, which reads
+# credentials from /etc/letsencrypt/ovh.ini. We've replaced that flow with
+# certbot --manual + hooks/certbot-dns-{auth,cleanup}.sh talking to
+# lib/dns_provider.sh (backed by lib/ovh.sh or lib/infomaniak.sh), so the
+# .ini file is obsolete. Delete any stale copy left behind by a prior
+# install to avoid confusion.
 step_remove_legacy_ovh_ini() {
     if [[ -f /etc/letsencrypt/ovh.ini ]]; then
         log_info "Removing legacy /etc/letsencrypt/ovh.ini (now obsolete)..."
@@ -886,14 +899,14 @@ step_install_netdata() {
 # === Netdata public reverse-proxy (optional, opt-in via secrets.env) ====
 # When NETDATA_PUBLIC_HOSTNAME is set, expose the Netdata UI publicly
 # behind nginx + Let's Encrypt + HTTP basic auth. The hostname must
-# resolve under OVH_DNS_ZONE; we create the A record + cert via the
-# OVH API, generate a random admin password, and configure the vhost.
+# resolve under BEBOP_DNS_ZONE; we create the A record + cert via the
+# configured DNS provider, generate a random admin password, and configure the vhost.
 step_setup_netdata_public_access() {
     if [[ -z "${NETDATA_PUBLIC_HOSTNAME:-}" ]]; then
         log_info "NETDATA_PUBLIC_HOSTNAME unset — Netdata stays local-only (SSH tunnel for access)"
         return 0
     fi
-    if [[ "$DEFER_SECRETS" == "true" && -z "${OVH_APPLICATION_KEY:-}" ]]; then
+    if [[ "$DEFER_SECRETS" == "true" ]] && ! dns_provider_is_configured; then
         log_info "Skipping Netdata public access (--defer-secrets)"
         return 0
     fi
@@ -901,17 +914,17 @@ step_setup_netdata_public_access() {
         log_info "[dry-run] would expose Netdata at https://${NETDATA_PUBLIC_HOSTNAME}/"
         return 0
     fi
-    local zone="${OVH_DNS_ZONE:-}"
+    local zone="${BEBOP_DNS_ZONE:-}"
     local hostname="$NETDATA_PUBLIC_HOSTNAME"
     if [[ -z "$zone" ]]; then
-        die "NETDATA_PUBLIC_HOSTNAME set but OVH_DNS_ZONE is empty"
+        die "NETDATA_PUBLIC_HOSTNAME set but BEBOP_DNS_ZONE is empty"
     fi
     if [[ "$hostname" != *".${zone}" ]]; then
-        die "NETDATA_PUBLIC_HOSTNAME=${hostname} must be within OVH_DNS_ZONE=${zone}"
+        die "NETDATA_PUBLIC_HOSTNAME=${hostname} must be within BEBOP_DNS_ZONE=${zone}"
     fi
     local sub="${hostname%.${zone}}"
 
-    # 1. DNS A record (idempotent — ovh_dns_record_create returns the
+    # 1. DNS A record (idempotent — dns_provider_dns_record_create returns the
     #    existing id if a matching record already exists).
     local host_ip
     host_ip="${BEBOP_HOST_IP:-}"
@@ -922,8 +935,8 @@ step_setup_netdata_public_access() {
         die "could not detect host public IP (set BEBOP_HOST_IP in env to override)"
     fi
     log_info "Ensuring DNS A record ${hostname} -> ${host_ip}..."
-    ovh_dns_record_create "$sub" A "$host_ip" >/dev/null
-    ovh_dns_zone_refresh
+    dns_provider_dns_record_create "$sub" A "$host_ip" >/dev/null
+    dns_provider_dns_zone_refresh
 
     # 2. TLS cert (single-domain, via our certbot --manual hooks).
     if run_privileged test -d /etc/letsencrypt/live/netdata-host; then
@@ -939,12 +952,12 @@ step_setup_netdata_public_access() {
         if [[ ! -d "$hooks_dir" ]]; then
             hooks_dir="${BEBOP_TOOLING_INSTALL_PREFIX}/hooks"
         fi
-        log_info "Issuing Let's Encrypt cert for ${hostname} (DNS-01 via OVH hooks)..."
+        log_info "Issuing Let's Encrypt cert for ${hostname} (DNS-01 via provider hooks)..."
         run_privileged certbot certonly \
             --manual \
             --preferred-challenges dns-01 \
-            --manual-auth-hook "${hooks_dir}/certbot-ovh-auth.sh" \
-            --manual-cleanup-hook "${hooks_dir}/certbot-ovh-cleanup.sh" \
+            --manual-auth-hook "${hooks_dir}/certbot-dns-auth.sh" \
+            --manual-cleanup-hook "${hooks_dir}/certbot-dns-cleanup.sh" \
             --non-interactive --agree-tos \
             --email "$acme_email" \
             --cert-name netdata-host \
@@ -1014,7 +1027,7 @@ step_setup_kuma_public_access() {
         log_info "KUMA_PUBLIC_HOSTNAME unset — Kuma stays local-only (SSH tunnel for access)"
         return 0
     fi
-    if [[ "$DEFER_SECRETS" == "true" && -z "${OVH_APPLICATION_KEY:-}" ]]; then
+    if [[ "$DEFER_SECRETS" == "true" ]] && ! dns_provider_is_configured; then
         log_info "Skipping Kuma public access (--defer-secrets)"
         return 0
     fi
@@ -1022,13 +1035,13 @@ step_setup_kuma_public_access() {
         log_info "[dry-run] would expose Kuma at https://${KUMA_PUBLIC_HOSTNAME}/"
         return 0
     fi
-    local zone="${OVH_DNS_ZONE:-}"
+    local zone="${BEBOP_DNS_ZONE:-}"
     local hostname="$KUMA_PUBLIC_HOSTNAME"
     if [[ -z "$zone" ]]; then
-        die "KUMA_PUBLIC_HOSTNAME set but OVH_DNS_ZONE is empty"
+        die "KUMA_PUBLIC_HOSTNAME set but BEBOP_DNS_ZONE is empty"
     fi
     if [[ "$hostname" != *".${zone}" ]]; then
-        die "KUMA_PUBLIC_HOSTNAME=${hostname} must be within OVH_DNS_ZONE=${zone}"
+        die "KUMA_PUBLIC_HOSTNAME=${hostname} must be within BEBOP_DNS_ZONE=${zone}"
     fi
     local sub="${hostname%.${zone}}"
 
@@ -1041,8 +1054,8 @@ step_setup_kuma_public_access() {
         die "could not detect host public IP (set BEBOP_HOST_IP in env to override)"
     fi
     log_info "Ensuring DNS A record ${hostname} -> ${host_ip}..."
-    ovh_dns_record_create "$sub" A "$host_ip" >/dev/null
-    ovh_dns_zone_refresh
+    dns_provider_dns_record_create "$sub" A "$host_ip" >/dev/null
+    dns_provider_dns_zone_refresh
 
     # 2. TLS cert (single-domain, via certbot --manual + our hooks).
     if run_privileged test -d /etc/letsencrypt/live/kuma-host; then
@@ -1058,12 +1071,12 @@ step_setup_kuma_public_access() {
         if [[ ! -d "$hooks_dir" ]]; then
             hooks_dir="${BEBOP_TOOLING_INSTALL_PREFIX}/hooks"
         fi
-        log_info "Issuing Let's Encrypt cert for ${hostname} (DNS-01 via OVH hooks)..."
+        log_info "Issuing Let's Encrypt cert for ${hostname} (DNS-01 via provider hooks)..."
         run_privileged certbot certonly \
             --manual \
             --preferred-challenges dns-01 \
-            --manual-auth-hook "${hooks_dir}/certbot-ovh-auth.sh" \
-            --manual-cleanup-hook "${hooks_dir}/certbot-ovh-cleanup.sh" \
+            --manual-auth-hook "${hooks_dir}/certbot-dns-auth.sh" \
+            --manual-cleanup-hook "${hooks_dir}/certbot-dns-cleanup.sh" \
             --non-interactive --agree-tos \
             --email "$acme_email" \
             --cert-name kuma-host \
@@ -1151,12 +1164,12 @@ _deploy_api_install_systemd() {
 # vhost). Called only when BEBOP_DEPLOY_API_HOSTNAME is set.
 _deploy_api_install_public_exposure() {
     local hostname="$1"
-    local zone="${OVH_DNS_ZONE:-}"
+    local zone="${BEBOP_DNS_ZONE:-}"
     if [[ -z "$zone" ]]; then
-        die "BEBOP_DEPLOY_API_HOSTNAME set but OVH_DNS_ZONE is empty"
+        die "BEBOP_DEPLOY_API_HOSTNAME set but BEBOP_DNS_ZONE is empty"
     fi
     if [[ "$hostname" != *".${zone}" ]]; then
-        die "BEBOP_DEPLOY_API_HOSTNAME=${hostname} must be within OVH_DNS_ZONE=${zone}"
+        die "BEBOP_DEPLOY_API_HOSTNAME=${hostname} must be within BEBOP_DNS_ZONE=${zone}"
     fi
     local sub="${hostname%.${zone}}"
 
@@ -1168,8 +1181,8 @@ _deploy_api_install_public_exposure() {
         die "could not detect host public IP (set BEBOP_HOST_IP in env to override)"
     fi
     log_info "Ensuring DNS A record ${hostname} -> ${host_ip}..."
-    ovh_dns_record_create "$sub" A "$host_ip" >/dev/null
-    ovh_dns_zone_refresh
+    dns_provider_dns_record_create "$sub" A "$host_ip" >/dev/null
+    dns_provider_dns_zone_refresh
 
     if run_privileged test -d /etc/letsencrypt/live/bebop-deploy-api; then
         log_info "Cert bebop-deploy-api already issued ✓"
@@ -1183,12 +1196,12 @@ _deploy_api_install_public_exposure() {
         if [[ ! -d "$hooks_dir" ]]; then
             hooks_dir="${BEBOP_TOOLING_INSTALL_PREFIX}/hooks"
         fi
-        log_info "Issuing Let's Encrypt cert for ${hostname} (DNS-01 via OVH hooks)..."
+        log_info "Issuing Let's Encrypt cert for ${hostname} (DNS-01 via provider hooks)..."
         run_privileged certbot certonly \
             --manual \
             --preferred-challenges dns-01 \
-            --manual-auth-hook "${hooks_dir}/certbot-ovh-auth.sh" \
-            --manual-cleanup-hook "${hooks_dir}/certbot-ovh-cleanup.sh" \
+            --manual-auth-hook "${hooks_dir}/certbot-dns-auth.sh" \
+            --manual-cleanup-hook "${hooks_dir}/certbot-dns-cleanup.sh" \
             --non-interactive --agree-tos \
             --email "$acme_email" \
             --cert-name bebop-deploy-api \
@@ -1264,7 +1277,7 @@ step_setup_test_tenant_deploy_api() {
     # Public exposure is optional. We DO want the daemon listening even in
     # local-only mode (loopback). nginx + DNS + cert only when HOSTNAME is set.
     if [[ -n "${BEBOP_DEPLOY_API_HOSTNAME:-}" ]]; then
-        if [[ "$DEFER_SECRETS" == "true" && -z "${OVH_APPLICATION_KEY:-}" ]]; then
+        if [[ "$DEFER_SECRETS" == "true" ]] && ! dns_provider_is_configured; then
             log_info "Skipping deploy API public exposure (--defer-secrets)"
         else
             _deploy_api_install_public_exposure "$BEBOP_DEPLOY_API_HOSTNAME"
@@ -1346,7 +1359,7 @@ step_setup_mail_relay() {
 # === Summary ===========================================================
 step_print_summary() {
     local title="be-BOP multi-tenant host bootstrap COMPLETE"
-    if [[ "$DEFER_SECRETS" == "true" && -z "${OVH_APPLICATION_KEY:-}" ]]; then
+    if [[ "$DEFER_SECRETS" == "true" ]] && ! dns_provider_is_configured; then
         title="be-BOP multi-tenant host bootstrap PARTIAL (deferred-secrets mode)"
     fi
     cat <<EOF
@@ -1374,7 +1387,7 @@ Key paths:
   Phoenixd data          /var/lib/phoenixd/<tenant>/.phoenix/
   Garage state           /var/lib/garage/{meta,data}/
   Secrets                ${SECRETS_FILE}    (mode 0600)
-  Certbot OVH hooks      ${BEBOP_TOOLING_INSTALL_PREFIX}/hooks/   (read OVH creds from secrets.env)
+  Certbot DNS-01 hooks   ${BEBOP_TOOLING_INSTALL_PREFIX}/hooks/   (dns_provider_* → active DNS_PROVIDER)
   Template units         /etc/systemd/system/{bebop,phoenixd,mongod}@.service
   Tooling libs           ${BEBOP_TOOLING_INSTALL_PREFIX}/lib/
 
@@ -1386,12 +1399,12 @@ Services running:
 
 NEXT STEPS:
 EOF
-    if [[ "$DEFER_SECRETS" == "true" && -z "${OVH_APPLICATION_KEY:-}" ]]; then
+    if [[ "$DEFER_SECRETS" == "true" ]] && ! dns_provider_is_configured; then
         cat <<EOF
   0. Edit ${SECRETS_FILE} (mode 0600), then re-run:
        sudo ${BEBOP_TOOLING_INSTALL_PREFIX}/host-bootstrap.sh
-     This will install OVH cert credentials, verify connectivity, and
-     auto-provision the Kuma admin + notification channels.
+     This will verify DNS provider connectivity and auto-provision the
+     Kuma admin + notification channels.
 EOF
     fi
     cat <<EOF
@@ -1414,7 +1427,7 @@ main() {
 
     step_check_prerequisites
     step_load_secrets
-    step_verify_ovh_connectivity
+    step_verify_dns_provider_connectivity
 
     step_install_apt_packages
     step_install_nodejs_pnpm

@@ -346,9 +346,9 @@ run_privileged systemctl start "bebop@${TENANT_ID}.service"
 
 log_info "healthcheck https://${DOMAIN}/..."
 healthcheck_extra=()
-# If the tenant is external-domain (its domain isn't <tenant>.<OVH_DNS_ZONE>),
+# If the tenant is external-domain (its domain isn't <tenant>.<BEBOP_DNS_ZONE>),
 # bypass the local resolver via --resolve, same trick as add-tenant phase 13.
-if [[ -n "${OVH_DNS_ZONE:-}" && "$DOMAIN" != "${TENANT_ID}.${OVH_DNS_ZONE}" ]]; then
+if [[ -n "${BEBOP_DNS_ZONE:-}" && "$DOMAIN" != "${TENANT_ID}.${BEBOP_DNS_ZONE}" ]]; then
     host_ip=$(curl -sS --max-time 10 https://api.ipify.org 2>/dev/null || true)
     host_ipv6=$(curl -sS --max-time 10 https://api6.ipify.org 2>/dev/null || true)
     if [[ -n "$host_ip" && -n "$host_ipv6" ]]; then

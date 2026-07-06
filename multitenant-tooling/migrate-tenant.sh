@@ -3,9 +3,9 @@
 # Copyright (C) 2026 be-bop.io contributors
 #
 # migrate-tenant.sh — change a tenant's public domain in one of four ways:
-#     internal → internal  (subdomain rename within OVH_DNS_ZONE)
+#     internal → internal  (subdomain rename within BEBOP_DNS_ZONE)
 #     internal → external  (switch to an operator-owned FQDN)
-#     external → internal  (fall back to a subdomain in OVH_DNS_ZONE)
+#     external → internal  (fall back to a subdomain in BEBOP_DNS_ZONE)
 #     external → external  (rename the operator-owned FQDN)
 #
 # Under the hood the migration re-uses add-tenant.sh's "reapply" path:
@@ -52,8 +52,8 @@ source "$BEBOP_TOOLING_LIB_DIR/log.sh"
 source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
 # shellcheck source=lib/registry.sh
 source "$BEBOP_TOOLING_LIB_DIR/registry.sh"
-# shellcheck source=lib/ovh.sh
-source "$BEBOP_TOOLING_LIB_DIR/ovh.sh"
+# shellcheck source=lib/dns_provider.sh
+source "$BEBOP_TOOLING_LIB_DIR/dns_provider.sh"
 # shellcheck source=lib/dns.sh
 source "$BEBOP_TOOLING_LIB_DIR/dns.sh"
 # shellcheck source=lib/notify.sh
@@ -122,7 +122,7 @@ fi
 [[ -f "$SECRETS_FILE" ]] || die "secrets file not found: $SECRETS_FILE"
 # shellcheck disable=SC1090
 source "$SECRETS_FILE"
-[[ -n "${OVH_DNS_ZONE:-}" ]] || die "OVH_DNS_ZONE not set in $SECRETS_FILE"
+[[ -n "${BEBOP_DNS_ZONE:-}" ]] || die "BEBOP_DNS_ZONE not set in $SECRETS_FILE"
 
 require_privileges
 
@@ -148,7 +148,7 @@ if [[ -z "$CURRENT_DOMAIN" ]]; then
 fi
 
 # Determine current mode from the registry-recorded domain.
-if [[ "$CURRENT_DOMAIN" == "${TENANT_ID}.${OVH_DNS_ZONE}" ]]; then
+if [[ "$CURRENT_DOMAIN" == "${TENANT_ID}.${BEBOP_DNS_ZONE}" ]]; then
     CURRENT_MODE="internal"
     OLD_SUB="$TENANT_ID"
 else
@@ -166,7 +166,7 @@ if [[ -n "$TO_SUBDOMAIN" ]]; then
         registry_unlock
         die "invalid --to-subdomain '$TO_SUBDOMAIN' (must match [a-z0-9][a-z0-9-]*, ≤32 chars)"
     fi
-    NEW_DOMAIN="${TO_SUBDOMAIN}.${OVH_DNS_ZONE}"
+    NEW_DOMAIN="${TO_SUBDOMAIN}.${BEBOP_DNS_ZONE}"
     NEW_SUB="$TO_SUBDOMAIN"
 else
     NEW_MODE="external"
@@ -174,9 +174,9 @@ else
         registry_unlock
         die "invalid --to-external '$TO_EXTERNAL' (expected an FQDN like bebop.example.com)"
     fi
-    if [[ "$TO_EXTERNAL" == *".${OVH_DNS_ZONE}" ]]; then
+    if [[ "$TO_EXTERNAL" == *".${BEBOP_DNS_ZONE}" ]]; then
         registry_unlock
-        die "--to-external '$TO_EXTERNAL' is inside OVH_DNS_ZONE='$OVH_DNS_ZONE'; use --to-subdomain instead"
+        die "--to-external '$TO_EXTERNAL' is inside BEBOP_DNS_ZONE='$BEBOP_DNS_ZONE'; use --to-subdomain instead"
     fi
     NEW_DOMAIN="$TO_EXTERNAL"
     NEW_SUB=""
@@ -236,7 +236,7 @@ if [[ "$NON_INTERACTIVE" != "true" ]]; then
 
 This will:
   * delete the tenant's current Let's Encrypt cert(s)
-  * update the DNS records in zone '$OVH_DNS_ZONE' (internal-mode side only)
+  * update the DNS records in zone '$BEBOP_DNS_ZONE' (internal-mode side only)
   * regenerate config.env, nginx vhost, and issue a new cert
   * restart bebop@$TENANT_ID (~10-20s downtime for the buyer)
 Rollback is manual if a step fails after the registry has been updated.
@@ -270,12 +270,12 @@ run_privileged certbot delete --non-interactive --cert-name "$S3_CERT_NAME" 2>/d
 #    but makes the tenant reachable the moment nginx reloads.
 if [[ "$NEW_MODE" == "internal" ]]; then
     log_info "migrate: creating DNS A '$NEW_SUB' → $HOST_IP..."
-    ovh_dns_record_create "$NEW_SUB" A "$HOST_IP" >/dev/null
+    dns_provider_dns_record_create "$NEW_SUB" A "$HOST_IP" >/dev/null
     # s3.<sub> is always internal even when the tenant's main is external;
-    # add-tenant.sh always renders s3 under OVH_DNS_ZONE. Same rule here.
+    # add-tenant.sh always renders s3 under BEBOP_DNS_ZONE. Same rule here.
     log_info "migrate: creating DNS A 's3.$NEW_SUB' → $HOST_IP..."
-    ovh_dns_record_create "s3.$NEW_SUB" A "$HOST_IP" >/dev/null
-    ovh_dns_zone_refresh
+    dns_provider_dns_record_create "s3.$NEW_SUB" A "$HOST_IP" >/dev/null
+    dns_provider_dns_zone_refresh
 fi
 
 # 3. Point the registry at the new domain. add-tenant.sh reapply reads
@@ -309,16 +309,16 @@ if [[ "$CURRENT_MODE" == "internal" && "$OLD_SUB" != "${NEW_SUB:-}" ]]; then
     # Re-acquire lock briefly for the DNS cleanup log line consistency.
     registry_lock
     log_info "migrate: cleaning up old DNS A '$OLD_SUB'..."
-    old_id=$(ovh_dns_record_find "$OLD_SUB" A 2>/dev/null || true)
+    old_id=$(dns_provider_dns_record_find "$OLD_SUB" A 2>/dev/null || true)
     if [[ -n "$old_id" ]]; then
-        ovh_dns_record_delete "$old_id" || log_warn "migrate: old A delete failed for id=$old_id"
+        dns_provider_dns_record_delete "$old_id" || log_warn "migrate: old A delete failed for id=$old_id"
     fi
     log_info "migrate: cleaning up old DNS A 's3.$OLD_SUB'..."
-    old_s3_id=$(ovh_dns_record_find "s3.$OLD_SUB" A 2>/dev/null || true)
+    old_s3_id=$(dns_provider_dns_record_find "s3.$OLD_SUB" A 2>/dev/null || true)
     if [[ -n "$old_s3_id" ]]; then
-        ovh_dns_record_delete "$old_s3_id" || log_warn "migrate: old s3 A delete failed for id=$old_s3_id"
+        dns_provider_dns_record_delete "$old_s3_id" || log_warn "migrate: old s3 A delete failed for id=$old_s3_id"
     fi
-    ovh_dns_zone_refresh
+    dns_provider_dns_zone_refresh
     registry_unlock
 fi
 

@@ -33,7 +33,7 @@
 #       Same as --purge but iterates over every orphan detected.
 #
 # What this script does NOT touch:
-#   - DNS records         (would need OVH creds; risky)
+#   - DNS records         (would need DNS provider creds; risky)
 #   - Garage buckets/keys (may still hold customer data; use remove-tenant)
 #   - Uptime Kuma monitor (no way to match by id)
 #

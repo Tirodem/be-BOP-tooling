@@ -42,8 +42,8 @@ source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
 source "$BEBOP_TOOLING_LIB_DIR/transaction.sh"
 # shellcheck source=lib/registry.sh
 source "$BEBOP_TOOLING_LIB_DIR/registry.sh"
-# shellcheck source=lib/ovh.sh
-source "$BEBOP_TOOLING_LIB_DIR/ovh.sh"
+# shellcheck source=lib/dns_provider.sh
+source "$BEBOP_TOOLING_LIB_DIR/dns_provider.sh"
 # shellcheck source=lib/mongo.sh
 source "$BEBOP_TOOLING_LIB_DIR/mongo.sh"
 # shellcheck source=lib/garage.sh
@@ -173,11 +173,11 @@ Optional:
   --bebop-version <tag>   GitHub release tag of be-BOP, or "latest" (default)
   --external-domain <fqdn>
                           deploy under <fqdn> instead of the default
-                          <tenant_id>.<OVH_DNS_ZONE>. The operator MUST
+                          <tenant_id>.<BEBOP_DNS_ZONE>. The operator MUST
                           configure both A and AAAA records on their DNS
                           provider pointing to this VDS before running.
                           The S3 endpoint stays internal at
-                          s3.<tenant_id>.<OVH_DNS_ZONE>. The main cert is
+                          s3.<tenant_id>.<BEBOP_DNS_ZONE>. The main cert is
                           issued via HTTP-01 (separate from the S3 DNS-01
                           cert). Requires public IPv6 on the VDS.
   --no-local-s3           do NOT provision a local Garage bucket + key for
@@ -263,7 +263,7 @@ done
 unset _reserved
 
 # --external-domain: validate FQDN syntax + refuse a domain that's actually
-# under OVH_DNS_ZONE (= would be an internal tenant misusing the flag).
+# under BEBOP_DNS_ZONE (= would be an internal tenant misusing the flag).
 if [[ -n "$EXTERNAL_DOMAIN" ]]; then
     if [[ ! "$EXTERNAL_DOMAIN" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]]; then
         die "invalid --external-domain '${EXTERNAL_DOMAIN}' (expected an FQDN like bebop.example.com)"
@@ -397,7 +397,7 @@ phase_status_decision() {
 # Phase 2: ports, domain names, identifier derivation
 phase_derive_identifiers() {
     log_info "phase 2: deriving identifiers..."
-    ZONE="${OVH_DNS_ZONE:?OVH_DNS_ZONE missing in secrets.env}"
+    ZONE="${BEBOP_DNS_ZONE:?BEBOP_DNS_ZONE missing in secrets.env}"
 
     # On reapply / reactivate, recover the external-domain mode from the
     # registry if the caller didn't pass --external-domain. Saves the
@@ -426,7 +426,7 @@ phase_derive_identifiers() {
         # External public FQDN; reject if it happens to land back inside our zone.
         DOMAIN="$EXTERNAL_DOMAIN"
         if [[ "$DOMAIN" == *".${ZONE}" ]]; then
-            die "--external-domain '${DOMAIN}' is under OVH_DNS_ZONE='${ZONE}'; drop the flag to use the standard internal path"
+            die "--external-domain '${DOMAIN}' is under BEBOP_DNS_ZONE='${ZONE}'; drop the flag to use the standard internal path"
         fi
         CERT_NAME="bebop-${TENANT_ID}"
     else
@@ -483,27 +483,27 @@ phase_derive_identifiers() {
 phase_clean_orphans() {
     log_info "phase 2.5: scanning for orphan resources from prior failed runs..."
     local cleaned=0
-    # OVH DNS records:
+    # DNS records at the active provider (see DNS_PROVIDER):
     #   - main: only checked when NOT external (otherwise it's in another zone).
     #   - s3:   only checked when has_local_s3 (otherwise we never created one).
     local id
     if ! is_external_mode; then
-        id=$(ovh_dns_record_find "$TENANT_ID" A 2>/dev/null || true)
+        id=$(dns_provider_dns_record_find "$TENANT_ID" A 2>/dev/null || true)
         if [[ -n "$id" ]]; then
             log_warn "orphan: DNS A ${DOMAIN} (id=${id}); deleting"
-            ovh_dns_record_delete "$id" || log_warn "orphan: DNS delete failed for ${id} — continuing"
+            dns_provider_dns_record_delete "$id" || log_warn "orphan: DNS delete failed for ${id} — continuing"
             cleaned=1
         fi
     fi
     if has_local_s3; then
-        id=$(ovh_dns_record_find "s3.${TENANT_ID}" A 2>/dev/null || true)
+        id=$(dns_provider_dns_record_find "s3.${TENANT_ID}" A 2>/dev/null || true)
         if [[ -n "$id" ]]; then
             log_warn "orphan: DNS A ${S3_DOMAIN} (id=${id}); deleting"
-            ovh_dns_record_delete "$id" || log_warn "orphan: DNS delete failed for ${id} — continuing"
+            dns_provider_dns_record_delete "$id" || log_warn "orphan: DNS delete failed for ${id} — continuing"
             cleaned=1
         fi
     fi
-    [[ "$cleaned" == 1 ]] && ovh_dns_zone_refresh
+    [[ "$cleaned" == 1 ]] && dns_provider_dns_zone_refresh
 
     # Stale systemd units (still enabled / active from a previous run).
     local unit
@@ -586,12 +586,12 @@ phase_clean_orphans() {
 }
 
 # Phase 3: DNS records.
-# - Internal mode: create A records via OVH for both <tenant>.<zone> and
+# - Internal mode: create A records via the DNS provider for both <tenant>.<zone> and
 #   s3.<tenant>.<zone>.
 # - External mode: skip the main domain (operator manages it on their own
 #   provider); pre-flight check that A AND AAAA on <external_domain> match
 #   the VDS's IPs (abort with actionable message otherwise). Still create
-#   the S3 OVH record since S3 stays on our zone.
+#   the S3 record since S3 stays on our zone.
 phase_dns() {
     if is_external_mode; then
         log_info "phase 3: pre-flight DNS check on external domain ${DOMAIN}..."
@@ -600,23 +600,23 @@ phase_dns() {
         log_info "phase 3: external DNS OK (main is operator-managed)"
         DNS_RECORD_BEBOP_ID=""
     else
-        log_info "phase 3: DNS A record via OVH (main)..."
-        DNS_RECORD_BEBOP_ID=$(ovh_dns_record_create "$TENANT_ID" A "$HOST_IP")
+        log_info "phase 3: DNS A record via provider (main)..."
+        DNS_RECORD_BEBOP_ID=$(dns_provider_dns_record_create "$TENANT_ID" A "$HOST_IP")
         txn_register_undo "DNS A record ${DOMAIN}" \
-            "ovh_dns_record_delete '${DNS_RECORD_BEBOP_ID}' && ovh_dns_zone_refresh"
+            "dns_provider_dns_record_delete '${DNS_RECORD_BEBOP_ID}' && dns_provider_dns_zone_refresh"
     fi
-    # S3 OVH record: only when has_local_s3 (the s3.<tenant>.<zone> hostname
+    # S3 record: only when has_local_s3 (the s3.<tenant>.<zone> hostname
     # points at our Garage; with --no-local-s3 there's no Garage to point at).
     if has_local_s3; then
-        DNS_RECORD_S3_ID=$(ovh_dns_record_create "s3.${TENANT_ID}" A "$HOST_IP")
+        DNS_RECORD_S3_ID=$(dns_provider_dns_record_create "s3.${TENANT_ID}" A "$HOST_IP")
         txn_register_undo "DNS A record ${S3_DOMAIN}" \
-            "ovh_dns_record_delete '${DNS_RECORD_S3_ID}' && ovh_dns_zone_refresh"
+            "dns_provider_dns_record_delete '${DNS_RECORD_S3_ID}' && dns_provider_dns_zone_refresh"
     else
         DNS_RECORD_S3_ID=""
-        log_info "phase 3: --no-local-s3 → skipping S3 OVH record creation"
+        log_info "phase 3: --no-local-s3 → skipping S3 DNS record creation"
     fi
-    ovh_dns_zone_refresh
-    log_info "DNS records pushed; OVH propagates them to authoritative NS within ~30s"
+    dns_provider_dns_zone_refresh
+    log_info "DNS records pushed; provider propagates them to authoritative NS within ~30s"
 }
 
 # Phase 4: per-tenant local mongod (port.env + start unit + init RS)
@@ -847,7 +847,7 @@ phase_mail_relay() {
     # overrides array. apply_runtime_config_overrides() at
     # phase_bebop_service writes it via mongo_runtime_config_upsert
     # (commit 8242d54's generic mechanism — nothing smtp-specific).
-    local subdomain="${TENANT_ID}.${OVH_DNS_ZONE}"
+    local subdomain="${TENANT_ID}.${BEBOP_DNS_ZONE}"
     local smtp_value
     smtp_value=$(jq -nc \
         --arg host "127.0.0.1" \
@@ -909,13 +909,14 @@ phase_config_env() {
     log_info "config.env installed (mode 0640)"
 }
 
-# Phase 10: TLS cert (per-tenant SAN, DNS-01 via custom OVH hook)
+# Phase 10: TLS cert (per-tenant SAN, DNS-01 via provider-agnostic hook)
 #
 # We use certbot --manual + our own auth/cleanup hooks instead of the
-# certbot-dns-ovh plugin. The plugin requires an OVH token scoped to
-# /domain/* (it lists all zones for auto-discovery); our hooks know
-# the zone from secrets.env and only need GET/POST/DELETE under
-# /domain/zone/<OVH_DNS_ZONE>/* — strictly tenant-scoped.
+# per-provider certbot-dns-* plugins. Those plugins typically require
+# broad API scopes for zone auto-discovery; our hooks already know the
+# zone from secrets.env (BEBOP_DNS_ZONE) and delegate the actual DNS
+# mutation to lib/dns_provider.sh, so a narrowly-scoped token per
+# provider suffices.
 phase_certificate() {
     local hooks_dir="/usr/local/share/be-BOP-tooling/hooks"
     if [[ -d "${SCRIPT_DIR}/hooks" ]]; then
@@ -1042,7 +1043,7 @@ _issue_cert_http01() {
 }
 
 # _issue_cert_dns01 <cert_name> <domain> <acme_email> <hooks_dir>
-# Single-domain DNS-01 via custom OVH hook (the same hook the SAN cert uses).
+# Single-domain DNS-01 via our provider-agnostic hook (the same hook the SAN cert uses).
 _issue_cert_dns01() {
     local cert_name="$1" domain="$2" email="$3" hooks_dir="$4"
     if run_privileged test -d "/etc/letsencrypt/live/${cert_name}"; then
@@ -1053,8 +1054,8 @@ _issue_cert_dns01() {
         certonly \
         --manual \
         --preferred-challenges dns-01 \
-        --manual-auth-hook "${hooks_dir}/certbot-ovh-auth.sh" \
-        --manual-cleanup-hook "${hooks_dir}/certbot-ovh-cleanup.sh" \
+        --manual-auth-hook "${hooks_dir}/certbot-dns-auth.sh" \
+        --manual-cleanup-hook "${hooks_dir}/certbot-dns-cleanup.sh" \
         --non-interactive --agree-tos \
         --email "$email" \
         --cert-name "$cert_name" \
@@ -1075,8 +1076,8 @@ _issue_cert_dns01_san() {
         certonly \
         --manual \
         --preferred-challenges dns-01 \
-        --manual-auth-hook "${hooks_dir}/certbot-ovh-auth.sh" \
-        --manual-cleanup-hook "${hooks_dir}/certbot-ovh-cleanup.sh" \
+        --manual-auth-hook "${hooks_dir}/certbot-dns-auth.sh" \
+        --manual-cleanup-hook "${hooks_dir}/certbot-dns-cleanup.sh" \
         --non-interactive --agree-tos \
         --email "$email" \
         --cert-name "$cert_name" \
@@ -1214,8 +1215,8 @@ phase_bebop_service() {
 # routinely fails because the operator just set their public DNS and the
 # system resolver still has a negative cache — even though the zone IS
 # correctly published (proved by the auth-NS check). For internal tenants
-# we keep using the system resolver (OVH propagation is fast enough on
-# our zone).
+# we keep using the system resolver (propagation on our own zone is
+# usually fast enough).
 phase_healthcheck() {
     log_info "phase 13: healthcheck https://${DOMAIN}/..."
     if [[ "$DRY_RUN" == "true" ]]; then

@@ -338,14 +338,14 @@ cmd_retry_upstream() {
 
     # shellcheck source=lib/scaleway.sh
     source "${BEBOP_TOOLING_LIB_DIR}/scaleway.sh"
-    # shellcheck source=lib/ovh.sh
-    source "${BEBOP_TOOLING_LIB_DIR}/ovh.sh"
+    # shellcheck source=lib/dns_provider.sh
+    source "${BEBOP_TOOLING_LIB_DIR}/dns_provider.sh"
 
     if ! mail_upstream_is_configured; then
         log_debug "retry-upstream: no upstream provider configured — noop"
         return 0
     fi
-    [[ -z "${OVH_DNS_ZONE:-}" ]] && die "retry-upstream: OVH_DNS_ZONE unset — cannot compose sending domains"
+    [[ -z "${BEBOP_DNS_ZONE:-}" ]] && die "retry-upstream: BEBOP_DNS_ZONE unset — cannot compose sending domains"
 
     if [[ "$target" == "--all" ]]; then
         local ids
@@ -374,7 +374,7 @@ cmd_retry_upstream() {
 # timer will retry next tick. Returns 0 on success, non-zero otherwise.
 _do_upstream_setup() {
     local tid="$1"
-    local full_domain="${tid}.${OVH_DNS_ZONE}"
+    local full_domain="${tid}.${BEBOP_DNS_ZONE}"
     log_info "retry-upstream: declaring '${full_domain}' upstream..."
     local domain_id
     if ! domain_id=$(mail_upstream_setup_domain "$tid" "$full_domain"); then

@@ -79,7 +79,7 @@ die() {
 # Use it when piping subprocess output that may contain credentials.
 mask_secrets() {
     sed -E \
-        -e 's/(OVH_[A-Z_]*KEY|OVH_[A-Z_]*SECRET|SMTP_PASSWORD|ZULIP_[A-Z_]*KEY|UPTIME_KUMA_API_KEY|SFTP_PASSWORD|GARAGE_KEY_SECRET|PHOENIXD_HTTP_PASSWORD|MONGODB_URL|BACKUP_ENCRYPTION_KEY)=([^[:space:]]+)/\1=***REDACTED***/g' \
+        -e 's/(OVH_[A-Z_]*KEY|OVH_[A-Z_]*SECRET|INFOMANIAK_API_TOKEN|SMTP_PASSWORD|ZULIP_[A-Z_]*KEY|UPTIME_KUMA_API_KEY|SFTP_PASSWORD|GARAGE_KEY_SECRET|PHOENIXD_HTTP_PASSWORD|MONGODB_URL|BACKUP_ENCRYPTION_KEY)=([^[:space:]]+)/\1=***REDACTED***/g' \
         -e 's/(Authorization:[[:space:]]*Bearer[[:space:]]+)[A-Za-z0-9._~+/=-]+/\1***REDACTED***/g' \
         -e 's/(Authorization:[[:space:]]*Basic[[:space:]]+)[A-Za-z0-9+/=]+/\1***REDACTED***/g' \
         -e 's/(X-Ovh-Application:[[:space:]]+)[A-Za-z0-9]+/\1***REDACTED***/g' \

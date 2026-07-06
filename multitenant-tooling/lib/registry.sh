@@ -5,7 +5,7 @@
 #
 # Schema (header row, 11 columns):
 #   tenant_id       — slug, [a-z0-9][a-z0-9-]*, max 32 chars
-#   domain          — full FQDN, e.g. tenant1.pvh-labs.com
+#   domain          — full FQDN, e.g. tenant1.be-bop.dev
 #   bebop_port      — local port for be-BOP HTTP (≥ 3001)
 #   phoenixd_port   — local port for phoenixd HTTP API (≥ 9741)
 #   mongo_port      — local port for the per-tenant mongod (≥ 27018)

@@ -31,7 +31,7 @@
 #      - Fresh / reset path → with --defer-secrets, then opens secrets.env
 #        in $EDITOR / nano (if a TTY is attached). Operator must re-run
 #        host-bootstrap.sh after filling in secrets.
-#      - Resume path → without --defer-secrets, OVH connectivity is checked
+#      - Resume path → without --defer-secrets, DNS provider connectivity is checked
 #        immediately. No editor is opened; the existing secrets.env is used.
 #   6. Prints next-step commands tailored to the path taken.
 #
@@ -138,7 +138,7 @@ RESUME_FROM_EXISTING=false
 # the required-and-template-empty vars has a value, the file is effectively
 # blank and can be replaced from the current template without loss.
 secrets_have_values() {
-    grep -qE '^(OVH_APPLICATION_KEY|OVH_APPLICATION_SECRET|OVH_CONSUMER_KEY|BACKUP_ENCRYPTION_KEY)=.+' \
+    grep -qE '^(OVH_APPLICATION_KEY|OVH_APPLICATION_SECRET|OVH_CONSUMER_KEY|INFOMANIAK_API_TOKEN|BACKUP_ENCRYPTION_KEY)=.+' \
         "$SECRETS_FILE" 2>/dev/null
 }
 
@@ -172,7 +172,7 @@ else
         echo "  [r] Reset  — backup to ${SECRETS_FILE}.bak.<ts>, replace with"
         echo "              the template, then re-edit interactively."
         echo "  [k] Keep   — resume the setup using the existing values"
-        echo "              (skips the editor; OVH credentials checked now)."
+        echo "              (skips the editor; DNS provider credentials checked now)."
         read -r -p "Choose [r/k] (default: k): " choice
         case "${choice:-k}" in
             r|R) reset_secrets_to_template ;;
@@ -185,9 +185,9 @@ else
     fi
 fi
 
-# 5. Run host-bootstrap.sh. Resume path skips --defer-secrets so OVH
-# connectivity is verified immediately and the certbot OVH credentials
-# file is installed in the same pass.
+# 5. Run host-bootstrap.sh. Resume path skips --defer-secrets so DNS
+# provider connectivity is verified immediately (dns_provider_ping via
+# lib/dns_provider.sh, backed by the selected DNS_PROVIDER).
 if [[ "$RESUME_FROM_EXISTING" == "true" ]]; then
     log "Running host-bootstrap.sh (resume — no --defer-secrets)..."
     "${INSTALL_DIR}/host-bootstrap.sh" "${forwarded_args[@]+"${forwarded_args[@]}"}"
@@ -223,8 +223,8 @@ EOF
 if [[ "$RESUME_FROM_EXISTING" == "true" ]]; then
     cat <<EOF
 SETUP RESUMED with the existing secrets.env. host-bootstrap.sh ran
-without --defer-secrets, so OVH connectivity has been validated and the
-certbot OVH credentials file is in place.
+without --defer-secrets, so DNS provider connectivity has been validated and the
+certbot DNS provider credentials file is in place.
 
 NEXT STEPS:
 
@@ -242,7 +242,7 @@ NEXT STEPS:
        sudo \$EDITOR ${SECRETS_FILE}
 
   2. Finalise the host bootstrap (idempotent — only runs the
-     OVH-credential steps that were deferred):
+     DNS-provider credential steps that were deferred):
        sudo ${INSTALL_DIR}/host-bootstrap.sh
 
   3. Add your first tenant:

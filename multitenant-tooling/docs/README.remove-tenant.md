@@ -26,7 +26,7 @@ Reversible, idempotent.
 1. `systemctl disable --now bebop@<id>.service phoenixd@<id>.service mongod@<id>.service`
 2. `rm /etc/nginx/sites-enabled/bebop-<id>.conf` (`sites-available` kept)
 3. `nginx -t && systemctl reload nginx`
-4. Delete A records for `<id>.<zone>` and `s3.<id>.<zone>` via OVH API
+4. Delete A records for `<id>.<zone>` and `s3.<id>.<zone>` via DNS provider API
 5. `kuma_unregister_tenant` (manual stub: prints operator instructions)
 6. `registry_set_status <id> soft-deleted`
 

@@ -46,8 +46,8 @@ source "$BEBOP_TOOLING_LIB_DIR/log.sh"
 source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
 # shellcheck source=lib/registry.sh
 source "$BEBOP_TOOLING_LIB_DIR/registry.sh"
-# shellcheck source=lib/ovh.sh
-source "$BEBOP_TOOLING_LIB_DIR/ovh.sh"
+# shellcheck source=lib/dns_provider.sh
+source "$BEBOP_TOOLING_LIB_DIR/dns_provider.sh"
 # shellcheck source=lib/mongo.sh
 source "$BEBOP_TOOLING_LIB_DIR/mongo.sh"
 # shellcheck source=lib/garage.sh
@@ -183,25 +183,25 @@ stop_disable_unit() {
 
 # Remove tenant DNS records (looked up by subdomain since registry doesn't
 # store record IDs). For external-domain tenants, skip the main FQDN — it
-# lives on the operator's DNS provider, not in our OVH zone — and only
-# clean the S3 record which always stays in the OVH zone.
+# lives on the operator's DNS provider, not in our managed zone — and only
+# clean the S3 record which always stays in our managed zone.
 delete_dns_records() {
     local id
     if is_external_tenant; then
-        log_info "main domain ${DOMAIN} is operator-managed (external) — skipping OVH lookup"
+        log_info "main domain ${DOMAIN} is operator-managed (external) — skipping DNS lookup"
     else
-        log_info "deleting OVH DNS A record for ${DOMAIN}..."
-        id=$(ovh_dns_record_find "$TENANT_ID" A 2>/dev/null || true)
-        [[ -n "$id" ]] && ovh_dns_record_delete "$id"
+        log_info "deleting DNS A record for ${DOMAIN}..."
+        id=$(dns_provider_dns_record_find "$TENANT_ID" A 2>/dev/null || true)
+        [[ -n "$id" ]] && dns_provider_dns_record_delete "$id"
     fi
     if has_local_s3_tenant; then
-        log_info "deleting OVH DNS A record for ${S3_DOMAIN}..."
-        id=$(ovh_dns_record_find "s3.${TENANT_ID}" A 2>/dev/null || true)
-        [[ -n "$id" ]] && ovh_dns_record_delete "$id"
+        log_info "deleting DNS A record for ${S3_DOMAIN}..."
+        id=$(dns_provider_dns_record_find "s3.${TENANT_ID}" A 2>/dev/null || true)
+        [[ -n "$id" ]] && dns_provider_dns_record_delete "$id"
     else
-        log_info "tenant has no local S3 (--no-local-s3 at create time) — skipping S3 OVH record"
+        log_info "tenant has no local S3 (--no-local-s3 at create time) — skipping S3 DNS record"
     fi
-    ovh_dns_zone_refresh
+    dns_provider_dns_zone_refresh
 }
 
 # is_external_tenant — true iff the tenant's domain isn't <tenant>.<zone>.
@@ -241,8 +241,8 @@ drop_mail_relay_resources() {
     else
         log_debug "drop_mail_relay: mail-relay-ctl.sh not on PATH, skipping tooling MongoDB cleanup"
     fi
-    if ! is_external_tenant && [[ -n "${OVH_DNS_ZONE:-}" ]]; then
-        mail_upstream_teardown_domain "$TENANT_ID" "${TENANT_ID}.${OVH_DNS_ZONE}"
+    if ! is_external_tenant && [[ -n "${BEBOP_DNS_ZONE:-}" ]]; then
+        mail_upstream_teardown_domain "$TENANT_ID" "${TENANT_ID}.${BEBOP_DNS_ZONE}"
     fi
 }
 
@@ -441,7 +441,7 @@ load_tenant_from_registry() {
     GARAGE_BUCKET=$(registry_get_field "$TENANT_ID" garage_bucket)
     GARAGE_KEY_NAME=$(registry_get_field "$TENANT_ID" garage_key)
     BEBOP_VERSION=$(registry_get_field "$TENANT_ID" bebop_version)
-    ZONE="${OVH_DNS_ZONE:-}"
+    ZONE="${BEBOP_DNS_ZONE:-}"
     S3_DOMAIN="s3.${TENANT_ID}.${ZONE}"
 }
 

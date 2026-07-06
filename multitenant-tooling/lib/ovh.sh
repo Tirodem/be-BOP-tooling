@@ -1,19 +1,26 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 be-bop.io contributors
 #
-# ovh.sh — OVH Public API client used by the multi-tenant tooling.
+# ovh.sh — OVH implementation of the dns_provider_* contract.
 #
-# Exposes:
-#   - low-level signed HTTP:    ovh_api_call
-#   - credentials sanity check: ovh_ping
-#   - DNS:                      ovh_dns_record_create / _delete / _find
-#                               ovh_dns_zone_refresh
+# The tooling calls DNS mutations through a provider-agnostic surface
+# (dns_provider_*, see lib/dns_provider.sh). This file is one concrete
+# backend; lib/infomaniak.sh is another. Selection at runtime happens via
+# the `DNS_PROVIDER` env var loaded from secrets.env.
+#
+# Public contract implemented:
+#   dns_provider_ping
+#   dns_provider_is_configured
+#   dns_provider_dns_record_find    <subdomain> <type>
+#   dns_provider_dns_record_create  <subdomain> <type> <target> [ttl]
+#   dns_provider_dns_record_delete  <record_id>
+#   dns_provider_dns_zone_refresh
 #
 # Required env (typically loaded from /etc/be-BOP-tooling/secrets.env):
 #   OVH_APPLICATION_KEY
 #   OVH_APPLICATION_SECRET
 #   OVH_CONSUMER_KEY
-# DNS calls additionally need OVH_DNS_ZONE.
+#   BEBOP_DNS_ZONE            (provider-agnostic zone name)
 #
 # Optional:
 #   OVH_API_BASE_URL  default: https://eu.api.ovh.com/1.0
@@ -44,9 +51,8 @@ _ovh_signature() {
     printf '$1$%s' "$digest"
 }
 
-# ovh_api_call <METHOD> <PATH> [BODY]
-# Outputs the response body on stdout. Curl's exit code propagates.
-ovh_api_call() {
+# _ovh_api_call <METHOD> <PATH> [BODY] — internal, low-level.
+_ovh_api_call() {
     local method="$1" path="$2" body="${3:-}"
     _ovh_check_credentials
     local url="${OVH_API_BASE_URL}${path}"
@@ -69,46 +75,53 @@ ovh_api_call() {
     curl "${curl_args[@]}" "$url"
 }
 
-# ovh_ping — verify credentials by GET /me. Logs nichandle on success.
-ovh_ping() {
+# === dns_provider_* contract implementation ===========================
+
+dns_provider_is_configured() {
+    [[ -n "${OVH_APPLICATION_KEY:-}" \
+        && -n "${OVH_APPLICATION_SECRET:-}" \
+        && -n "${OVH_CONSUMER_KEY:-}" \
+        && -n "${BEBOP_DNS_ZONE:-}" ]]
+}
+
+# dns_provider_ping — verify credentials via GET /me. Logs nichandle on success.
+dns_provider_ping() {
     local resp
-    if ! resp=$(ovh_api_call GET /me); then
-        log_error "ovh_ping: curl request failed"
+    if ! resp=$(_ovh_api_call GET /me); then
+        log_error "dns_provider(ovh): curl request failed"
         return 1
     fi
     local nic
     nic=$(printf '%s' "$resp" | jq -r '.nichandle // empty' 2>/dev/null)
     if [[ -z "$nic" ]]; then
-        log_error "ovh_ping: unexpected response: $(printf '%s' "$resp" | head -c 200)"
+        log_error "dns_provider(ovh): unexpected response: $(printf '%s' "$resp" | head -c 200)"
         return 1
     fi
     log_info "OVH API authenticated as nichandle '${nic}'"
 }
 
-# === DNS ===============================================================
-
-# ovh_dns_record_find <subdomain> <type>
+# dns_provider_dns_record_find <subdomain> <type>
 # Returns the first record id matching <subdomain> + <type>, or empty.
-# Uses OVH_DNS_ZONE.
-ovh_dns_record_find() {
+# Uses BEBOP_DNS_ZONE.
+dns_provider_dns_record_find() {
     local subdomain="$1" rtype="$2"
-    [[ -z "${OVH_DNS_ZONE:-}" ]] && die "ovh_dns_record_find: OVH_DNS_ZONE unset"
+    [[ -z "${BEBOP_DNS_ZONE:-}" ]] && die "dns_provider(ovh): BEBOP_DNS_ZONE unset"
     local resp
-    resp=$(ovh_api_call GET "/domain/zone/${OVH_DNS_ZONE}/record?subDomain=${subdomain}&fieldType=${rtype}")
+    resp=$(_ovh_api_call GET "/domain/zone/${BEBOP_DNS_ZONE}/record?subDomain=${subdomain}&fieldType=${rtype}")
     printf '%s' "$resp" | jq -r '.[0] // empty' 2>/dev/null
 }
 
-# ovh_dns_record_create <subdomain> <type> <target> [ttl=300]
-# Outputs the created record id on stdout.
-# Idempotent in the sense that if a matching record already exists, its id is
-# returned without modification. (Use ovh_dns_record_delete + create to change.)
-ovh_dns_record_create() {
+# dns_provider_dns_record_create <subdomain> <type> <target> [ttl=300]
+# Outputs the created record id on stdout. Idempotent: if a matching record
+# already exists, its id is returned without modification (use delete+create
+# to change the target).
+dns_provider_dns_record_create() {
     local subdomain="$1" rtype="$2" target="$3" ttl="${4:-300}"
-    [[ -z "${OVH_DNS_ZONE:-}" ]] && die "ovh_dns_record_create: OVH_DNS_ZONE unset"
+    [[ -z "${BEBOP_DNS_ZONE:-}" ]] && die "dns_provider(ovh): BEBOP_DNS_ZONE unset"
     local existing
-    existing=$(ovh_dns_record_find "$subdomain" "$rtype")
+    existing=$(dns_provider_dns_record_find "$subdomain" "$rtype")
     if [[ -n "$existing" ]]; then
-        log_info "ovh_dns: ${subdomain}.${OVH_DNS_ZONE} ${rtype} record already exists (id=${existing})"
+        log_info "dns_provider(ovh): ${subdomain}.${BEBOP_DNS_ZONE} ${rtype} record already exists (id=${existing})"
         printf '%s\n' "$existing"
         return 0
     fi
@@ -120,28 +133,28 @@ ovh_dns_record_create() {
         --argjson ttl "$ttl" \
         '{subDomain: $sd, fieldType: $rt, target: $tg, ttl: $ttl}')
     local resp
-    resp=$(ovh_api_call POST "/domain/zone/${OVH_DNS_ZONE}/record" "$body")
+    resp=$(_ovh_api_call POST "/domain/zone/${BEBOP_DNS_ZONE}/record" "$body")
     local record_id
     record_id=$(printf '%s' "$resp" | jq -r '.id // empty')
     if [[ -z "$record_id" ]]; then
-        die "ovh_dns_record_create failed: $(printf '%s' "$resp" | head -c 300)"
+        die "dns_provider(ovh): create failed: $(printf '%s' "$resp" | head -c 300)"
     fi
-    log_info "ovh_dns: created ${subdomain}.${OVH_DNS_ZONE} ${rtype} → ${target} (id=${record_id})"
+    log_info "dns_provider(ovh): created ${subdomain}.${BEBOP_DNS_ZONE} ${rtype} → ${target} (id=${record_id})"
     printf '%s\n' "$record_id"
 }
 
-# ovh_dns_record_delete <record_id>
-ovh_dns_record_delete() {
+# dns_provider_dns_record_delete <record_id>
+dns_provider_dns_record_delete() {
     local record_id="$1"
-    [[ -z "${OVH_DNS_ZONE:-}" ]] && die "ovh_dns_record_delete: OVH_DNS_ZONE unset"
-    [[ -z "$record_id" ]] && { log_warn "ovh_dns_record_delete: empty id, nothing to do"; return 0; }
-    ovh_api_call DELETE "/domain/zone/${OVH_DNS_ZONE}/record/${record_id}" >/dev/null
-    log_info "ovh_dns: deleted record id ${record_id} in zone ${OVH_DNS_ZONE}"
+    [[ -z "${BEBOP_DNS_ZONE:-}" ]] && die "dns_provider(ovh): BEBOP_DNS_ZONE unset"
+    [[ -z "$record_id" ]] && { log_warn "dns_provider(ovh): delete called with empty id, nothing to do"; return 0; }
+    _ovh_api_call DELETE "/domain/zone/${BEBOP_DNS_ZONE}/record/${record_id}" >/dev/null
+    log_info "dns_provider(ovh): deleted record id ${record_id} in zone ${BEBOP_DNS_ZONE}"
 }
 
-# ovh_dns_zone_refresh — push pending changes to the authoritative servers.
-ovh_dns_zone_refresh() {
-    [[ -z "${OVH_DNS_ZONE:-}" ]] && die "ovh_dns_zone_refresh: OVH_DNS_ZONE unset"
-    ovh_api_call POST "/domain/zone/${OVH_DNS_ZONE}/refresh" "" >/dev/null
-    log_info "ovh_dns: zone ${OVH_DNS_ZONE} refresh requested"
+# dns_provider_dns_zone_refresh — push pending changes to authoritative NS.
+dns_provider_dns_zone_refresh() {
+    [[ -z "${BEBOP_DNS_ZONE:-}" ]] && die "dns_provider(ovh): BEBOP_DNS_ZONE unset"
+    _ovh_api_call POST "/domain/zone/${BEBOP_DNS_ZONE}/refresh" "" >/dev/null
+    log_info "dns_provider(ovh): zone ${BEBOP_DNS_ZONE} refresh requested"
 }

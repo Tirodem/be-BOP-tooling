@@ -167,10 +167,10 @@ _auth_ban_until: dict[str, float] = {}
 
 # --- Cross-tenant impersonation guard --------------------------------------
 
-# Zone under which every tenant subdomain lives (e.g. "pvh-labs.com" today,
-# "be-bop.shop" tomorrow — same variable). Sourced from the same env var
-# the rest of the tooling uses.
-ZONE = os.environ.get("OVH_DNS_ZONE", "").strip().lower()
+# Zone under which every tenant subdomain lives (e.g. "be-bop.dev").
+# Provider-agnostic — sourced from the same env var the rest of the
+# tooling reads (see lib/dns_provider.sh).
+ZONE = os.environ.get("BEBOP_DNS_ZONE", "").strip().lower()
 
 # --- Zulip notifications ---------------------------------------------------
 

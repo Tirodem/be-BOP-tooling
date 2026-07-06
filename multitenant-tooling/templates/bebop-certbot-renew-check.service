@@ -7,7 +7,7 @@
 #   sudo systemctl start bebop-certbot-renew-check.service
 #
 # Catches silent renewal failures for BOTH DNS-01 (internal tenants via the
-# OVH hook) AND HTTP-01 (external-domain tenants via the default vhost's
+# provider-agnostic hook) AND HTTP-01 (external-domain tenants via the default vhost's
 # ACME webroot). Without this, a broken renewal flow surfaces only when
 # the cert actually expires and the tenant goes down with a TLS error.
 

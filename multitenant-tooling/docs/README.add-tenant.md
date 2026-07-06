@@ -32,7 +32,7 @@ Options:
 ```
  1. status decision         — read registry, branch
  2. derive identifiers      — domain, ports (incl. mongo), bucket+key names, mongo db
- 3. DNS records             — POST 2× A records via OVH, refresh zone
+ 3. DNS records via the configured provider, refresh zone
  4. local mongod            — write port.env, systemctl enable --now mongod@<id>,
                               wait ready, rs.initiate() (single-node rs0)
  5. Garage                  — bucket create, key create, allow rwO, set quota
@@ -40,7 +40,7 @@ Options:
  7. release                 — download + extract + pnpm install + symlink
  8. phoenixd                — write port.env, start phoenixd@<id>, read http-password
  9. config.env              — render template with all secrets
-10. certificate             — certbot DNS-01 OVH, 2 SANs (<id> + s3.<id>)
+10. certificate             — certbot DNS-01 via active DNS provider, 2 SANs (<id> + s3.<id>)
 11. nginx vhost             — render template, symlink sites-enabled, reload
 12. bebop service           — systemctl enable --now bebop@<id>
 13. healthcheck             — curl https://<id>.<zone>/ until 2xx (15× 2s)
@@ -98,8 +98,8 @@ losing the seed loses the funds.
 The transaction stack records an undo command after each successful step:
 
 ```
-DNS A record <id>      → ovh_dns_record_delete + zone refresh
-DNS A record s3.<id>   → ovh_dns_record_delete + zone refresh
+DNS A record <id>      → dns_provider_dns_record_delete + zone refresh
+DNS A record s3.<id>   → dns_provider_dns_record_delete + zone refresh
 mongod port.env        → rm -rf /etc/be-BOP-mongodb/<id>/
 mongod@<id>.service    → systemctl disable --now + rm -rf /var/lib/be-BOP-mongodb/<id>/
 Garage bucket          → garage_bucket_delete <bucket>
@@ -121,10 +121,10 @@ but don't abort the rollback.
 
 | Symptom                                          | What to do                                |
 |--------------------------------------------------|-------------------------------------------|
-| Script exited mid-phase, rollback succeeded      | Fix the underlying cause (e.g. OVH DNS API outage) and re-run `add-tenant.sh` from scratch |
+| Script exited mid-phase, rollback succeeded      | Fix the underlying cause (e.g. DNS provider API outage) and re-run `add-tenant.sh` from scratch |
 | `mongod@<id> did not become ready within 60s`    | Check `journalctl -u mongod@<id>`; usually a port collision, dbPath permissions, or AVX-missing CPU. |
 | Rollback also failed (network glitch)            | Check the alert email/Zulip for the list of un-undone steps; clean them by hand or via `remove-tenant.sh --purge` then re-run |
-| `cert: timeout waiting for DNS-01 propagation`   | Re-run; OVH propagation is usually < 60 s but can spike. Or increase `--dns-ovh-propagation-seconds` in phase_certificate (currently 60). |
+| `cert: timeout waiting for DNS-01 propagation`   | Re-run; DNS-provider propagation is usually < 60 s but can spike. Or increase `--dns-propagation-seconds` in phase_certificate (currently 60). |
 | `pnpm install failed`                            | Network or disk issue. Check `journalctl -t bebop-tooling-add-tenant`, fix, re-run. |
 | `healthcheck failed for https://<id>.<zone>/`    | Service crashed at startup. Check `journalctl -u bebop@<id>` and `journalctl -u phoenixd@<id>`. The rollback will still complete. |
 

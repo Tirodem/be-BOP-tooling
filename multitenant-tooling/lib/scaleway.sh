@@ -197,8 +197,8 @@ mail_upstream_is_configured() {
 # End-to-end registration for one tenant's sending domain:
 #   1. Register the domain with the upstream provider.
 #   2. Wait for DKIM material to be available.
-#   3. Post SPF / DKIM / DMARC records in our DNS zone via lib/ovh.sh
-#      (the caller must have sourced lib/ovh.sh and OVH_DNS_ZONE must
+#   3. Post SPF / DKIM / DMARC records in our DNS zone via lib/dns_provider.sh
+#      (the caller must have sourced lib/dns_provider.sh and BEBOP_DNS_ZONE must
 #      match the parent zone of <full_domain>).
 #
 # Prints the upstream provider's internal domain id on stdout on success —
@@ -228,13 +228,13 @@ mail_upstream_setup_domain() {
     fi
     # DNS records. The SPF include and DKIM selector are provider-specific;
     # they live here so nothing else in the tooling needs to know.
-    ovh_dns_record_create "$subdomain_label" TXT \
+    dns_provider_dns_record_create "$subdomain_label" TXT \
         "v=spf1 include:_spf.tem.scaleway.com -all" 300 >/dev/null
-    ovh_dns_record_create "scw._domainkey.${subdomain_label}" TXT \
+    dns_provider_dns_record_create "scw._domainkey.${subdomain_label}" TXT \
         "v=DKIM1; k=rsa; p=${dkim_key}" 300 >/dev/null
-    ovh_dns_record_create "_dmarc.${subdomain_label}" TXT \
+    dns_provider_dns_record_create "_dmarc.${subdomain_label}" TXT \
         "v=DMARC1; p=quarantine" 300 >/dev/null
-    ovh_dns_zone_refresh
+    dns_provider_dns_zone_refresh
     printf '%s\n' "$domain_id"
 }
 
@@ -257,7 +257,7 @@ mail_upstream_teardown_domain() {
     fi
     local host id
     for host in "$subdomain_label" "scw._domainkey.${subdomain_label}" "_dmarc.${subdomain_label}"; do
-        id=$(ovh_dns_record_find "$host" TXT 2>/dev/null || true)
-        [[ -n "$id" ]] && ovh_dns_record_delete "$id" 2>/dev/null || true
+        id=$(dns_provider_dns_record_find "$host" TXT 2>/dev/null || true)
+        [[ -n "$id" ]] && dns_provider_dns_record_delete "$id" 2>/dev/null || true
     done
 }

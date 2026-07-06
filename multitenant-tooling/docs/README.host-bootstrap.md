@@ -17,7 +17,7 @@ curl -sfSL \
   -o install.sh \
   && sudo bash ./install.sh
 
-# After editing secrets.env (idempotent — only finalises OVH steps):
+# After editing secrets.env (idempotent — only finalises DNS-provider steps):
 sudo /opt/be-BOP-tooling/host-bootstrap.sh
 ```
 
@@ -30,7 +30,7 @@ host-bootstrap.sh [options]
 Options:
 - `--secrets-file <path>` — path to secrets.env (default
   `/etc/be-BOP-tooling/secrets.env`).
-- `--defer-secrets` — skip steps that need OVH credentials (used by
+- `--defer-secrets` — skip steps that need DNS provider credentials (used by
   `install.sh` on the very first run, before the operator has filled in
   `secrets.env`). Re-run without this flag to finalise.
 - `--non-interactive` — refuse to prompt; exit if input would be needed.
@@ -43,9 +43,11 @@ Options:
 1. Validates the host: Debian 12, ≥ 2 GiB RAM, ≥ 20 GiB free on `/var`,
    systemd present, **CPU AVX support** (required by MongoDB 5.0+ on amd64).
 2. Loads `/etc/be-BOP-tooling/secrets.env`.
-3. Pings the OVH API (`GET /me`) to verify credentials.
-4. Installs apt packages: `nginx`, `certbot` + `python3-certbot-dns-ovh`,
-   `docker.io`, `netdata`, plus `curl jq stow rclone xxd unzip openssl`.
+3. Pings the DNS provider API (`GET /me`) to verify credentials.
+4. Installs apt packages: `nginx`, `certbot`, `docker.io`, `netdata`,
+   plus `curl jq stow rclone xxd unzip openssl`. DNS-01 is handled by our
+   `hooks/certbot-dns-{auth,cleanup}.sh` scripts talking to
+   `lib/dns_provider.sh`, so no per-provider certbot plugin is required.
 5. Configures the NodeSource repo and installs Node.js + corepack/pnpm.
 6. Configures the **MongoDB official APT repo** (signed) and installs
    `mongodb-org`, `mongodb-mongosh`, `mongodb-database-tools`. Masks the
@@ -60,7 +62,10 @@ Options:
 11. Writes `/etc/garage.toml` (no `root_domain` — see root README) and
     `/etc/systemd/system/garage.service`, starts Garage, applies layout.
 12. Writes a 444 catch-all default nginx vhost; enables nginx.
-13. Installs `/etc/letsencrypt/ovh.ini` (mode 0600) for certbot DNS-01.
+13. (No-op now — kept for backwards compat: removes any legacy
+    `/etc/letsencrypt/ovh.ini` left behind by hosts previously using
+    the `certbot-dns-ovh` plugin. Credentials come from `secrets.env`
+    via `lib/dns_provider.sh`.)
 14. Installs the systemd template units `bebop@.service`,
     `phoenixd@.service`, **`mongod@.service`**.
 15. Installs the tooling libs to
@@ -122,7 +127,7 @@ monitor creation is currently not feasible against Kuma 1.x.)
 | Symptom                                     | Likely cause / fix                      |
 |---------------------------------------------|------------------------------------------|
 | `secrets.env mode is XXX; should be 600`    | `chmod 600 /etc/be-BOP-tooling/secrets.env` |
-| `OVH API ping failed`                       | Wrong OVH keys, or consumer key expired. Regenerate at https://api.ovh.com/createToken/ |
+| `DNS provider ping failed`                       | Wrong or expired provider keys. OVH: regenerate at https://api.ovh.com/createToken/. Infomaniak: regenerate at https://manager.infomaniak.com/v3/ng/accounts/token/list |
 | `Garage did not become ready in 30s`        | First start may take longer on slow disks; re-run, or check `journalctl -u garage` |
 | `MongoDB ${MONGODB_VERSION} requires CPU AVX support` | Your CPU is too old (or KVM is hiding the AVX flag). Either pick a newer host or override `MONGODB_VERSION=4.4` and accept the security tradeoffs. |
 | `nginx -t` fails after re-run               | Hand-edited vhost? The default catch-all is regenerated on every run; unrelated vhosts under `sites-available` are not touched |
