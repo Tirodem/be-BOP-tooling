@@ -209,10 +209,10 @@ mail_upstream_setup_domain() {
     local subdomain_label="$1" full_domain="$2"
     [[ -z "$subdomain_label" || -z "$full_domain" ]] \
         && { log_error "mail_upstream_setup_domain: both args required"; return 2; }
-    # Capture stderr from the create call so we can surface the actual
-    # HTTP error (status + body) — swallowing it with 2>/dev/null used to
-    # hide 401 (bad API key), 403 (missing policy), 400 (invalid project
-    # id), etc. and leave the operator guessing.
+    [[ -z "${BEBOP_DNS_ZONE:-}" ]] \
+        && { log_error "mail_upstream_setup_domain: BEBOP_DNS_ZONE unset"; return 2; }
+
+    # 1. Create (idempotent). Capture stderr → surface HTTP error verbatim.
     local domain_id create_err
     create_err=$(mktemp)
     if ! domain_id=$(scaleway_tem_domain_create "$full_domain" 2>"$create_err"); then
@@ -223,31 +223,55 @@ mail_upstream_setup_domain() {
         return 1
     fi
     rm -f "$create_err"
-    # DKIM key is populated by the provider a few seconds after creation.
-    local dkim_key attempt=0 dkim_err
-    dkim_err=$(mktemp)
-    while (( attempt < 5 )); do
-        dkim_key=$(scaleway_tem_domain_dkim_public_key "$domain_id" 2>"$dkim_err" || true)
-        [[ -n "$dkim_key" ]] && break
-        sleep 3
-        (( ++attempt ))
-    done
-    if [[ -z "$dkim_key" ]]; then
-        local dkim_snippet
-        dkim_snippet=$(cat "$dkim_err")
-        rm -f "$dkim_err"
-        log_warn "mail_upstream_setup_domain: DKIM key not populated for '${full_domain}' after 15s — will retry${dkim_snippet:+ (last error: ${dkim_snippet})}"
+
+    # 2. Fetch the domain object. Its `records` map contains the SPF /
+    # DKIM / DMARC values ready to publish — Scaleway derives DKIM
+    # selector from the project UUID (e.g. "<uuid>._domainkey.<domain>"),
+    # NOT a fixed "scw._domainkey", so we can't hardcode names. We read
+    # each record's `name` + `value` verbatim from the response.
+    local dom_json get_err
+    get_err=$(mktemp)
+    if ! dom_json=$(scaleway_tem_domain_get "$domain_id" 2>"$get_err"); then
+        local err_snippet
+        err_snippet=$(cat "$get_err")
+        rm -f "$get_err"
+        log_warn "mail_upstream_setup_domain: could not fetch records for '${full_domain}' (id=${domain_id}): ${err_snippet:-<no stderr>}"
         return 1
     fi
-    rm -f "$dkim_err"
-    # DNS records. The SPF include and DKIM selector are provider-specific;
-    # they live here so nothing else in the tooling needs to know.
-    dns_provider_dns_record_create "$subdomain_label" TXT \
-        "v=spf1 include:_spf.tem.scaleway.com -all" 300 >/dev/null
-    dns_provider_dns_record_create "scw._domainkey.${subdomain_label}" TXT \
-        "v=DKIM1; k=rsa; p=${dkim_key}" 300 >/dev/null
-    dns_provider_dns_record_create "_dmarc.${subdomain_label}" TXT \
-        "v=DMARC1; p=quarantine" 300 >/dev/null
+    rm -f "$get_err"
+
+    # 3. For each of spf / dkim / dmarc: extract name+value from
+    # `.records.<type>`, strip trailing dot, strip the parent zone suffix
+    # to get the local label, publish as TXT via lib/dns_provider.sh.
+    # MX from Scaleway is ignored — the relay only sends outbound; we
+    # don't accept incoming mail on tenant subdomains.
+    local zone="$BEBOP_DNS_ZONE"
+    local rtype rname rval label
+    for rtype in spf dkim dmarc; do
+        rname=$(printf '%s' "$dom_json" | jq -r ".records.${rtype}.name // empty")
+        rval=$(printf '%s' "$dom_json" | jq -r ".records.${rtype}.value // empty")
+        if [[ -z "$rname" || -z "$rval" ]]; then
+            log_warn "mail_upstream_setup_domain: Scaleway response missing records.${rtype} for '${full_domain}' — will retry"
+            return 1
+        fi
+        # Strip trailing dot (FQDN → dotless). Strip the zone suffix
+        # (with its leading dot) to keep only the local label, which is
+        # what dns_provider_dns_record_create expects. If the record is
+        # AT the zone apex it's an error here — TEM records always live
+        # under <tenant>.<zone>, never at the apex.
+        rname="${rname%.}"
+        if [[ "$rname" == "$zone" ]]; then
+            log_warn "mail_upstream_setup_domain: unexpected apex record for ${rtype} on zone '${zone}' — skipping"
+            continue
+        fi
+        if [[ "$rname" != *".${zone}" ]]; then
+            log_warn "mail_upstream_setup_domain: record ${rtype} name '${rname}' not under BEBOP_DNS_ZONE='${zone}' — skipping"
+            continue
+        fi
+        label="${rname%.${zone}}"
+        dns_provider_dns_record_create "$label" TXT "$rval" 300 >/dev/null \
+            || { log_warn "mail_upstream_setup_domain: dns_provider_dns_record_create failed for ${rtype} (${label}.${zone})"; return 1; }
+    done
     dns_provider_dns_zone_refresh
     printf '%s\n' "$domain_id"
 }
@@ -261,16 +285,41 @@ mail_upstream_teardown_domain() {
     local subdomain_label="$1" full_domain="$2"
     [[ -z "$subdomain_label" || -z "$full_domain" ]] \
         && { log_warn "mail_upstream_teardown_domain: skipping (empty args)"; return 0; }
+    local zone="${BEBOP_DNS_ZONE:-}"
+
+    # Fetch the record labels from Scaleway BEFORE deleting the upstream
+    # domain — DKIM's selector is the project UUID (unknown to us
+    # otherwise) so hardcoding "scw._domainkey" would leave orphan
+    # records in the zone. If upstream is unreachable / missing, fall
+    # back to a best-effort SPF + DMARC cleanup on predictable labels
+    # (the DKIM leaves behind an orphan we can't identify blindly).
+    local -a labels_to_delete=()
+    local domain_id=""
     if mail_upstream_is_configured; then
-        local domain_id
         domain_id=$(scaleway_tem_domain_find "$full_domain" 2>/dev/null || true)
-        if [[ -n "$domain_id" ]]; then
-            scaleway_tem_domain_delete "$domain_id" \
-                || log_warn "mail_upstream_teardown_domain: provider delete failed for '${full_domain}'"
+    fi
+    if [[ -n "$domain_id" && -n "$zone" ]]; then
+        local dom_json rname rtype
+        if dom_json=$(scaleway_tem_domain_get "$domain_id" 2>/dev/null); then
+            for rtype in spf dkim dmarc; do
+                rname=$(printf '%s' "$dom_json" | jq -r ".records.${rtype}.name // empty")
+                rname="${rname%.}"
+                [[ -z "$rname" || "$rname" != *".${zone}" ]] && continue
+                labels_to_delete+=("${rname%.${zone}}")
+            done
         fi
     fi
+    if (( ${#labels_to_delete[@]} == 0 )); then
+        log_warn "mail_upstream_teardown_domain: no upstream record map available for '${full_domain}' — best-effort SPF+DMARC cleanup only (DKIM record, if any, must be pruned manually)"
+        labels_to_delete=("$subdomain_label" "_dmarc.${subdomain_label}")
+    fi
+
+    if [[ -n "$domain_id" ]]; then
+        scaleway_tem_domain_delete "$domain_id" \
+            || log_warn "mail_upstream_teardown_domain: provider delete failed for '${full_domain}'"
+    fi
     local host id
-    for host in "$subdomain_label" "scw._domainkey.${subdomain_label}" "_dmarc.${subdomain_label}"; do
+    for host in "${labels_to_delete[@]}"; do
         id=$(dns_provider_dns_record_find "$host" TXT 2>/dev/null || true)
         [[ -n "$id" ]] && dns_provider_dns_record_delete "$id" 2>/dev/null || true
     done
