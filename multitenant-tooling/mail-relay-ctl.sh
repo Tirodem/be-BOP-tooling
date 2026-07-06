@@ -367,30 +367,67 @@ cmd_retry_upstream() {
     [[ -z "${BEBOP_DNS_ZONE:-}" ]] && die "retry-upstream: BEBOP_DNS_ZONE unset — cannot compose sending domains"
 
     if [[ "$target" == "--all" ]]; then
-        local ids
-        ids=$(_mongo "
+        # We now sweep TWO categories on each tick:
+        #   - upstream_domain_id: null  → run the full setup (create +
+        #     publish records + first /check + poll).
+        #   - upstream_domain_id: <id> but Scaleway status != "checked"
+        #     → run mail_upstream_recheck (just /check + poll). Domain
+        #     was correctly registered previously but Scaleway needed
+        #     more time to re-verify DNS.
+        # Emit each id prefixed with its category so the caller dispatches
+        # without a second mongo round-trip per tenant.
+        local pending validated_pending
+        pending=$(_mongo "
             db.tenants.find(
                 {upstream_domain_id:null, mail_status:'active'},
                 {_id:1}
-            ).sort({_id:1}).forEach(function(d) { print(d._id); });
+            ).sort({_id:1}).forEach(function(d) { print('setup:'+d._id); });
         ")
-        if [[ -z "$ids" ]]; then
-            log_debug "retry-upstream --all: no tenants pending upstream declaration"
+        validated_pending=$(_mongo "
+            db.tenants.find(
+                {upstream_domain_id:{\$ne:null}, mail_status:'active'},
+                {_id:1, upstream_domain_id:1}
+            ).sort({_id:1}).forEach(function(d) { print('recheck:'+d._id+':'+d.upstream_domain_id); });
+        ")
+        local combined
+        combined=$(printf '%s\n%s\n' "$pending" "$validated_pending" | grep -v '^$' || true)
+        if [[ -z "$combined" ]]; then
+            log_debug "retry-upstream --all: no tenants pending upstream declaration or recheck"
             return 0
         fi
-        local id
-        while IFS= read -r id; do
-            [[ -z "$id" ]] && continue
-            _do_upstream_setup "$id"
-        done <<< "$ids"
+        local line
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            case "$line" in
+                setup:*)
+                    _do_upstream_setup "${line#setup:}"
+                    ;;
+                recheck:*)
+                    local rest="${line#recheck:}"
+                    _do_upstream_recheck "${rest%%:*}" "${rest#*:}"
+                    ;;
+            esac
+        done <<< "$combined"
         return 0
     fi
     _check_tenant_id "$target"
-    _do_upstream_setup "$target"
+    # Single-tenant CLI invocation: dispatch based on current state so an
+    # operator running `retry-upstream <tid>` on an already-registered
+    # tenant just re-polls, doesn't re-do the whole setup.
+    local existing_id
+    existing_id=$(_mongo "
+        var t = db.tenants.findOne({_id:'${target}'}, {upstream_domain_id:1});
+        print(t && t.upstream_domain_id ? t.upstream_domain_id : '');
+    ")
+    if [[ -n "$existing_id" ]]; then
+        _do_upstream_recheck "$target" "$existing_id"
+    else
+        _do_upstream_setup "$target"
+    fi
 }
 
-# Runs one tenant through the upstream setup. Non-fatal on failure — the
-# timer will retry next tick. Returns 0 on success, non-zero otherwise.
+# Runs one tenant through the FULL upstream setup (create + records +
+# initial check). Non-fatal on failure — the timer will retry next tick.
 _do_upstream_setup() {
     local tid="$1"
     local full_domain="${tid}.${BEBOP_DNS_ZONE}"
@@ -402,6 +439,23 @@ _do_upstream_setup() {
     fi
     cmd_set_upstream_id "$tid" "$domain_id"
     log_info "retry-upstream: '${tid}' declared (id=${domain_id})"
+}
+
+# Runs one tenant through a lightweight upstream RECHECK — no create,
+# no publish, just POST /check + poll status. For domains that were
+# correctly registered but haven't been validated by Scaleway yet.
+# Silently no-op when the domain is already status=checked.
+_do_upstream_recheck() {
+    local tid="$1" domain_id="$2"
+    local full_domain="${tid}.${BEBOP_DNS_ZONE}"
+    local status
+    status=$(scaleway_tem_domain_status "$domain_id" 2>/dev/null || true)
+    if [[ "$status" == "checked" ]]; then
+        log_debug "retry-upstream: '${tid}' already validated (status=checked) — skip"
+        return 0
+    fi
+    log_info "retry-upstream: re-checking '${full_domain}' (current status=${status:-<unknown>})..."
+    mail_upstream_recheck "$domain_id" "$full_domain" || true
 }
 
 main() {

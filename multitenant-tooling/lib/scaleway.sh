@@ -156,6 +156,28 @@ scaleway_tem_domain_dns_records() {
     _scaleway_api GET "/regions/${SCALEWAY_TEM_REGION}/domains/${id}"
 }
 
+# scaleway_tem_domain_check <domain_id>
+# Trigger a Scaleway-side DNS re-verification of a domain. After we've
+# published SPF / DKIM / DMARC on the DNS provider, this tells Scaleway
+# to re-query and flip the domain from status="unchecked" to "checked".
+# Without triggering it, Scaleway's next auto-check runs on a schedule we
+# don't control (empirically hours), and any MAIL FROM before then is
+# rejected with `551 5.5.3 Domain name '...' must be added, and validated
+# before using it`.
+scaleway_tem_domain_check() {
+    local id="$1"
+    [[ -z "$id" ]] && die "scaleway_tem_domain_check: id required"
+    _scaleway_api POST "/regions/${SCALEWAY_TEM_REGION}/domains/${id}/check" ""
+}
+
+# scaleway_tem_domain_status <domain_id>
+# Prints the current status string ("unchecked" | "checked" | ...).
+scaleway_tem_domain_status() {
+    local id="$1"
+    [[ -z "$id" ]] && die "scaleway_tem_domain_status: id required"
+    scaleway_tem_domain_get "$id" | jq -r '.status // empty'
+}
+
 # scaleway_tem_domain_delete <domain_id>
 # Best-effort: 404 is treated as success (already deleted).
 scaleway_tem_domain_delete() {
@@ -273,7 +295,47 @@ mail_upstream_setup_domain() {
             || { log_warn "mail_upstream_setup_domain: dns_provider_dns_record_create failed for ${rtype} (${label}.${zone})"; return 1; }
     done
     dns_provider_dns_zone_refresh
+
+    # 4. Kick off Scaleway's DNS re-verification. Records are visible on
+    # our zone by now; a first /check + short poll usually flips the
+    # status to "checked" in under 30 s. If it doesn't (e.g. Scaleway
+    # temporarily can't resolve, or the resolver cache lags), we don't
+    # block or fail — the caller stores upstream_domain_id, and the
+    # retry-upstream sweep polls again every 15 min via
+    # mail_upstream_recheck until the domain validates.
+    mail_upstream_recheck "$domain_id" "$full_domain" || true
+
     printf '%s\n' "$domain_id"
+}
+
+# mail_upstream_recheck <domain_id> <full_domain>
+#
+# Fires POST /domains/<id>/check and polls GET /domains/<id> briefly for
+# status="checked". Cheap enough to run on every retry-upstream tick
+# against already-registered-but-not-yet-validated tenants.
+#
+# Returns 0 iff the domain is validated by the end of the poll window;
+# non-zero otherwise (caller keeps polling on subsequent ticks). Never
+# fails on transport errors — logs and returns non-zero.
+mail_upstream_recheck() {
+    local domain_id="$1" full_domain="$2"
+    [[ -z "$domain_id" ]] && { log_error "mail_upstream_recheck: domain_id required"; return 2; }
+    if ! scaleway_tem_domain_check "$domain_id" >/dev/null 2>&1; then
+        log_warn "mail_upstream_recheck: /check request failed for id=${domain_id}"
+        return 1
+    fi
+    local status attempt=0
+    while (( attempt < 6 )); do
+        status=$(scaleway_tem_domain_status "$domain_id" 2>/dev/null || true)
+        if [[ "$status" == "checked" ]]; then
+            log_info "mail_upstream_recheck: domain '${full_domain:-id=$domain_id}' validated (status=checked)"
+            return 0
+        fi
+        sleep 5
+        (( ++attempt ))
+    done
+    log_warn "mail_upstream_recheck: domain '${full_domain:-id=$domain_id}' still status='${status:-<unknown>}' after 30s — will retry on next tick"
+    return 1
 }
 
 # mail_upstream_teardown_domain <tenant_subdomain_label> <full_domain>
