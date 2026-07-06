@@ -1012,8 +1012,21 @@ _certbot_run() {
         log_info "[dry-run] would run: certbot ${args[*]}"
         return 0
     fi
+    # Serialize concurrent certbot invocations across parallel
+    # add-tenant.sh calls. certbot itself takes an exclusive lock on
+    # /var/log/letsencrypt/.certbot.lock — when the second instance
+    # can't get it, certbot exits with a cryptic error. Our own flock
+    # here queues the invocations cleanly instead: acquire → run →
+    # release. Timeout large enough for a DNS-01 SAN cert issuance
+    # (typically 30-60s per tenant) times a modest queue depth.
+    : "${CERTBOT_LOCK_PATH:=/var/lib/be-BOP/.certbot.lock}"
+    : "${CERTBOT_LOCK_TIMEOUT_SECONDS:=300}"
+    run_privileged install -d -m 0755 /var/lib/be-BOP
+    run_privileged touch "$CERTBOT_LOCK_PATH"
     local out rc=0
-    out=$(run_privileged certbot "${args[@]}" 2>&1) || rc=$?
+    out=$(run_privileged flock -x -w "$CERTBOT_LOCK_TIMEOUT_SECONDS" \
+        "$CERTBOT_LOCK_PATH" \
+        certbot "${args[@]}" 2>&1) || rc=$?
     if (( rc == 0 )); then
         # Success — echo the useful lines (usually the "Certificate is
         # saved at:" block) so ops keeps visibility.

@@ -80,24 +80,35 @@ _scaleway_api() {
 
 # scaleway_tem_domain_create <full_domain_name>
 #
-# Idempotent: if the domain already exists in the project (HTTP 409), we
-# fetch its id via list + filter and return that.
+# Idempotent: check-before-create. Scaleway's TEM API does NOT return
+# 409 on a duplicate domain_name POST — it happily creates a second
+# entry with a fresh UUID (observed on 2026-07 : 3-4 duplicate rows
+# for the same name after the sync's 5-retry loop). So the 409 branch
+# we used to rely on was dead code. Fix: always lookup first via
+# `scaleway_tem_domain_find` and only POST when truly absent.
 #
 # Prints the domain id (a UUID) on stdout on success.
 scaleway_tem_domain_create() {
     local full_domain="$1"
     [[ -z "$full_domain" ]] && die "scaleway_tem_domain_create: domain name required"
-    local body resp
+
+    # 1. Check if the domain is already registered under this project.
+    local existing
+    existing=$(scaleway_tem_domain_find "$full_domain" 2>/dev/null || true)
+    if [[ -n "$existing" ]]; then
+        log_info "scaleway: domain '${full_domain}' already registered (id=${existing})"
+        printf '%s\n' "$existing"
+        return 0
+    fi
+
+    # 2. Not found — POST the create request.
+    local body resp rc=0
     body=$(jq -nc \
         --arg dn "$full_domain" \
         --arg pid "$SCALEWAY_TEM_PROJECT_ID" \
         '{domain_name: $dn, project_id: $pid, autoconfig: false}')
-    # Same $? trap as scaleway_tem_domain_delete: capture rc immediately
-    # (assignment failure via `local rc=$?` right after `if ...; fi`
-    # returns 0 for a non-taken then-branch and hid every 409 conflict).
     resp=$(_scaleway_api POST \
-            "/regions/${SCALEWAY_TEM_REGION}/domains" "$body")
-    local rc=$?
+            "/regions/${SCALEWAY_TEM_REGION}/domains" "$body") || rc=$?
     if (( rc == 0 )); then
         local id
         id=$(printf '%s' "$resp" | jq -r '.id // empty')
@@ -106,14 +117,16 @@ scaleway_tem_domain_create() {
         printf '%s\n' "$id"
         return 0
     fi
-    # Conflict → domain already exists in this project. Look it up.
+    # 3. Failed POST. If Scaleway now DOES return 409 (behaviour that
+    # might land in a future API version), fall back to a lookup — the
+    # domain may exist under a concurrent create.
     if (( rc == 49 )); then
-        local existing
-        existing=$(scaleway_tem_domain_find "$full_domain")
-        [[ -z "$existing" ]] && die "scaleway_tem_domain_create: 409 but domain not found on lookup"
-        log_info "scaleway: domain '${full_domain}' already registered (id=${existing})"
-        printf '%s\n' "$existing"
-        return 0
+        existing=$(scaleway_tem_domain_find "$full_domain" 2>/dev/null || true)
+        if [[ -n "$existing" ]]; then
+            log_info "scaleway: domain '${full_domain}' registered concurrently (id=${existing})"
+            printf '%s\n' "$existing"
+            return 0
+        fi
     fi
     die "scaleway_tem_domain_create: could not create '${full_domain}' (see previous WARN)"
 }
