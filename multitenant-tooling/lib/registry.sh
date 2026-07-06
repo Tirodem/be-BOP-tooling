@@ -48,6 +48,7 @@ readonly _BEBOP_REGISTRY_SOURCED=1
 
 readonly REGISTRY_HEADER=$'tenant_id\tdomain\tbebop_port\tphoenixd_port\tmongo_port\tmongodb_database\tgarage_bucket\tgarage_key\tbebop_version\tcreated_at\tstatus\texternal'
 readonly REGISTRY_LEGACY_HEADER_11COLS=$'tenant_id\tdomain\tbebop_port\tphoenixd_port\tmongo_port\tmongodb_database\tgarage_bucket\tgarage_key\tbebop_version\tcreated_at\tstatus'
+readonly REGISTRY_LEGACY_HEADER_10COLS=$'tenant_id\tdomain\tbebop_port\tphoenixd_port\tmongodb_database\tgarage_bucket\tgarage_key\tbebop_version\tcreated_at\tstatus'
 
 _registry_col_index() {
     case "$1" in
@@ -84,33 +85,88 @@ registry_init() {
     fi
 }
 
-# One-shot in-place migration from the pre-external 11-column schema to
-# the current 12-column one. Idempotent — no-op when the header already
-# has 12 columns. Existing rows get `external=0` (internal) backfilled,
-# which is the safe default: it makes the tooling always attempt the
-# upstream cleanup on teardown. Genuinely external tenants — if any
-# existed before the migration — will need to be flipped to `external=1`
-# by hand (single tab-separated column edit in tenants.tsv).
+# One-shot in-place migration from any older schema to the current 12-col
+# one. Idempotent — no-op when the header already has 12 columns.
+# Handles two known older shapes:
+#
+#   10-col (pre-mongo_port): tenant_id, domain, bebop_port, phoenixd_port,
+#                            mongodb_database, garage_bucket, garage_key,
+#                            bebop_version, created_at, status
+#     Migration: insert `mongo_port` at position 5 (value backfilled from
+#     /etc/be-BOP-mongodb/<tid>/port.env when present, else empty +
+#     log_warn — an empty mongo_port breaks any future call to
+#     registry_get_field <tid> mongo_port on that tenant, so operators
+#     should notice and fix or purge). Then append external=0.
+#
+#   11-col (pre-external): all current fields except `external`.
+#     Migration: append \t0 to every data row.
+#
+# Existing rows get external=0 (internal) — safe default: teardown will
+# always attempt the upstream cleanup instead of silently skipping.
+# Genuinely --external-domain tenants that predate the migration must be
+# flipped to `external=1` by hand (one column edit in tenants.tsv).
 _registry_migrate_schema_if_needed() {
     local current_header
     current_header=$(head -n1 "$REGISTRY_PATH" 2>/dev/null || true)
     if [[ "$current_header" == "$REGISTRY_HEADER" ]]; then
         return 0
     fi
-    if [[ "$current_header" != "$REGISTRY_LEGACY_HEADER_11COLS" ]]; then
-        die "registry: unknown header in $REGISTRY_PATH (expected 11-col legacy or 12-col current, got: '${current_header}')"
+    if [[ "$current_header" == "$REGISTRY_LEGACY_HEADER_10COLS" ]]; then
+        _registry_migrate_10_to_12
+        return 0
     fi
+    if [[ "$current_header" == "$REGISTRY_LEGACY_HEADER_11COLS" ]]; then
+        _registry_migrate_11_to_12
+        return 0
+    fi
+    die "registry: unknown header in $REGISTRY_PATH (expected 10/11-col legacy or 12-col current, got: '${current_header}')"
+}
+
+_registry_migrate_11_to_12() {
     log_info "registry: migrating $REGISTRY_PATH from 11-col to 12-col schema (adding 'external' column, default=0)"
     local tmp
     tmp=$(mktemp)
-    # Rewrite header + append \t0 to each data row (backfilled to internal).
     awk -F'\t' -v OFS='\t' -v new_hdr="$REGISTRY_HEADER" '
         NR == 1 { print new_hdr; next }
         { print $0 "\t0" }
     ' "$REGISTRY_PATH" > "$tmp"
     run_privileged install -m 0644 "$tmp" "$REGISTRY_PATH"
     rm -f "$tmp"
-    log_info "registry: schema migration OK"
+    log_info "registry: schema migration 11→12 OK"
+}
+
+_registry_migrate_10_to_12() {
+    log_info "registry: migrating $REGISTRY_PATH from 10-col (pre-mongo_port) to 12-col schema"
+    local tmp
+    tmp=$(mktemp)
+    # Write the new header first.
+    printf '%s\n' "$REGISTRY_HEADER" > "$tmp"
+    # Iterate data rows and reconstruct with the two missing columns
+    # inserted. Column 5 (mongo_port) is backfilled from
+    # /etc/be-BOP-mongodb/<tid>/port.env if present; column 12 (external)
+    # is set to 0 (internal).
+    local row tid port_env mongo_port
+    while IFS= read -r row; do
+        # Skip empty lines (defensive).
+        [[ -z "$row" ]] && continue
+        tid=$(printf '%s' "$row" | cut -f1)
+        port_env="/etc/be-BOP-mongodb/${tid}/port.env"
+        mongo_port=""
+        if [[ -f "$port_env" ]]; then
+            mongo_port=$(grep -Eo '^MONGO_PORT=[0-9]+' "$port_env" 2>/dev/null | cut -d= -f2 | head -1)
+        fi
+        if [[ -z "$mongo_port" ]]; then
+            log_warn "registry: could not backfill mongo_port for tenant '${tid}' (no ${port_env}); leaving empty — expect breakage on any port-dependent op, purge the tenant or fix the row"
+        fi
+        # awk with an insert-at-position pattern: fields 1..4 → same,
+        # insert mongo_port, then fields 5..10 → same, then external=0.
+        printf '%s' "$row" | awk -F'\t' -v OFS='\t' -v mp="$mongo_port" '
+            { print $1, $2, $3, $4, mp, $5, $6, $7, $8, $9, $10, 0 }
+        ' >> "$tmp"
+    done < <(tail -n +2 "$REGISTRY_PATH")
+    run_privileged install -m 0644 "$tmp" "$REGISTRY_PATH"
+    rm -f "$tmp"
+    log_info "registry: schema migration 10→12 OK"
 }
 
 registry_lock() {
