@@ -163,7 +163,21 @@ migrate_one() {
         url_has_creds=true
     fi
     if $port_env_has_auth && $url_has_creds; then
-        log_info "already migrated (port.env + config.env both authed) — skip"
+        # State on disk is clean. If bebop@<t> happens to be in a failed
+        # state (e.g. crash-loop from a previous buggy preflight that got
+        # patched since), reset-failed + restart to bring it back on the
+        # fresh preflight code. No-op when it's already active.
+        if run_privileged systemctl is-active --quiet "bebop@${tid}.service"; then
+            log_info "already migrated + bebop@${tid} active — skip"
+        else
+            log_warn "already migrated but bebop@${tid} not active — resetting + restarting"
+            run_privileged systemctl reset-failed "bebop@${tid}.service" 2>/dev/null || true
+            if ! run_privileged systemctl restart "bebop@${tid}.service"; then
+                log_error "bebop@${tid} failed to restart despite clean config"
+                FAILED+=("$tid")
+                return 1
+            fi
+        fi
         SKIPPED+=("$tid")
         return 0
     fi
