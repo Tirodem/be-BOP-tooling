@@ -146,6 +146,43 @@ on_upgrade_exit() {
 }
 trap 'on_upgrade_exit' EXIT
 
+# Take a mongodump BEFORE the symlink swap. Rationale: be-BOP runs schema
+# migrations on boot. A release that migrates then gets rolled back would
+# leave old code on a "future" schema. The dump is the safety net when
+# migrations turn out non-backward-compatible.
+# Dies on failure — refusing to swap is safer than swapping without a dump.
+# Retention: keep the last 5 dumps per tenant.
+pre_swap_mongodump() {
+    local tid="$1" old_tag="$2" new_tag="$3"
+    local mongo_port mongo_db
+    mongo_port=$(registry_get_field "$tid" mongo_port)
+    mongo_db=$(registry_get_field "$tid" mongodb_database)
+    [[ -z "$mongo_port" || -z "$mongo_db" ]] \
+        && die "pre-upgrade dump: registry missing mongo_port / mongodb_database for ${tid}"
+    if ! mongo_wait_ready "$mongo_port" 60 1; then
+        die "pre-upgrade dump: mongod@${tid} not ready on port ${mongo_port}"
+    fi
+    local dump_root="/var/lib/be-BOP/${tid}/pre-upgrade-dumps"
+    local ts
+    ts=$(date -u +%Y%m%dT%H%M%SZ)
+    local dump_dir="${dump_root}/${ts}-${old_tag}-${new_tag}"
+    run_privileged install -d -m 0700 "$dump_root"
+    run_privileged install -d -m 0700 "$dump_dir"
+    log_info "pre-upgrade: mongodumping ${mongo_db} from 127.0.0.1:${mongo_port} to ${dump_dir}"
+    if ! run_privileged mongodump \
+        --host="127.0.0.1:${mongo_port}" \
+        --db="${mongo_db}" \
+        --out="${dump_dir}" \
+        --quiet; then
+        die "pre-upgrade dump FAILED — refusing to swap symlink (data integrity risk)"
+    fi
+    local keep=5 name kept=0
+    while IFS= read -r name; do
+        (( kept < keep )) && { (( kept++ )); continue; }
+        run_privileged rm -rf -- "${dump_root}/${name}"
+    done < <(run_privileged bash -c "cd '${dump_root}' && ls -1t 2>/dev/null" || true)
+}
+
 # === Main ===============================================================
 main() {
     require_privileges
@@ -201,6 +238,9 @@ main() {
     fi
 
     release_cache_ensure "$new_tag"
+    if [[ "$new_tag" != "$old_tag" ]]; then
+        pre_swap_mongodump "$TENANT_ID" "$old_tag" "$new_tag"
+    fi
     release_cache_set_current "$TENANT_ID" "$new_tag"
 
     if (( ${#RUNTIME_CONFIG_OVERRIDES[@]} > 0 )); then
