@@ -151,14 +151,15 @@ migrate_one() {
     fi
 
     # Idempotence: a tenant is considered "already migrated" ONLY when BOTH
-    # port.env has MONGO_AUTH_ARGS AND config.env's MONGODB_URL contains an
-    # `<user>:<pwd>@` chunk. If port.env alone is set (previous run crashed
-    # between step 4 and step 6), we resume from step 3: reset the user's
-    # password to a fresh one, keep going. This guarantees no manual
-    # cleanup needed after a partial migration failure.
+    # port.env has a QUOTED MONGO_AUTH_ARGS AND config.env's MONGODB_URL is
+    # in the clean authed format (ending exactly at `&replicaSet=rs0`, no
+    # trailing garbage). If either is off (partial migration crashed
+    # between step 4 and step 6, OR the previous sed corruption produced
+    # a concatenated line), we resume from step 2 — regress port.env to
+    # unauth, reset password, rewrite everything cleanly.
     local port_env_has_auth=false url_has_creds=false
-    grep -qE '^MONGO_AUTH_ARGS=..' "$port_env" && port_env_has_auth=true
-    if grep -qE '^MONGODB_URL=mongodb://[^:]+:[^@]+@' "$cfg_env"; then
+    grep -qE '^MONGO_AUTH_ARGS="' "$port_env" && port_env_has_auth=true
+    if grep -qE '^MONGODB_URL=mongodb://[^@]+@[^?]+\?authSource=[^&]+&replicaSet=rs0$' "$cfg_env"; then
         url_has_creds=true
     fi
     if $port_env_has_auth && $url_has_creds; then
@@ -232,13 +233,13 @@ migrate_one() {
     log_info "step 6/6: rewriting MONGODB_URL in ${cfg_env}..."
     local cfg_tmp
     cfg_tmp=$(mktemp)
-    # Preserve every other line; replace MONGODB_URL= if present, append if not.
-    if run_privileged grep -q '^MONGODB_URL=' "$cfg_env"; then
-        run_privileged sed -E "s|^MONGODB_URL=.*|MONGODB_URL=${uri}|" "$cfg_env" > "$cfg_tmp"
-    else
-        run_privileged cat "$cfg_env" > "$cfg_tmp"
-        printf 'MONGODB_URL=%s\n' "$uri" >> "$cfg_tmp"
-    fi
+    # awk (not sed): sed's replacement string treats '&' as "the entire
+    # match", corrupting our URI which contains '&' (authSource=X&replicaSet=Y).
+    # awk's $0=STRING assignment is literal — no metacharacter interpretation.
+    # Filter out ALL existing MONGODB_URL= lines (there may be several if
+    # a prior corrupted run wrote them), then append exactly one clean line.
+    run_privileged awk '!/^MONGODB_URL=/' "$cfg_env" > "$cfg_tmp"
+    printf 'MONGODB_URL=%s\n' "$uri" >> "$cfg_tmp"
     run_privileged install -m 0640 "$cfg_tmp" "${cfg_env}.new"
     run_privileged mv -T "${cfg_env}.new" "$cfg_env"
     rm -f "$cfg_tmp"
