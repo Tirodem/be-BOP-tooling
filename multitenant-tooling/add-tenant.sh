@@ -120,7 +120,7 @@ readonly RESERVED_TENANT_IDS=(
 # `fresh` path only — re-applies, reactivations, and removals are exempt.
 : "${BEBOP_TENANT_CAP:=16}"
 readonly DEFAULT_BUCKET_QUOTA="20GiB"
-readonly TEMPLATE_REVISION="2026062101"
+readonly TEMPLATE_REVISION="2026070701"
 readonly HEALTHCHECK_RETRIES=15
 readonly HEALTHCHECK_INTERVAL=2
 readonly PHOENIXD_PASSWORD_RETRIES=20
