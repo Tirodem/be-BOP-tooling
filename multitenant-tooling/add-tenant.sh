@@ -128,16 +128,22 @@ readonly PHOENIXD_PASSWORD_INTERVAL=2
 
 # === CLI ================================================================
 SECRETS_FILE=/etc/be-BOP-tooling/secrets.env
-DEPLOY_DEFAULT_FILE=/etc/be-BOP-tooling/deploy-default.env
+DEPLOY_DEFAULT_FILE=/etc/be-BOP-tooling/deploy-default.json
 TENANT_ID=""
 ADMIN_EMAIL=""
 EXTERNAL_DOMAIN=""    # set by --external-domain <fqdn>; empty = internal tenant
-# 3-state knobs: "" = not set by CLI (fall back to deploy-default.env then
+# 3-state knobs: "" = not set by CLI (fall back to deploy-default.json then
 # hardcoded true), "true" / "false" = explicit CLI override.
-# Populated by apply_deploy_defaults() after sourcing deploy-default.env.
+# Populated by apply_deploy_defaults() after loading the JSON.
 NO_LOCAL_S3=""        # set by --local-s3 / --no-local-s3
 ENABLE_PHOENIXD=""    # set by --phoenixd / --no-phoenixd
 ENABLE_MAIL_RELAY=""  # set by --mail-relay / --no-mail-relay
+# Per-source profile (optional) — passed by tooling-tenant-api.service
+# when the webhook lands on /deploy-test-tenant/<source-domain>, or
+# manually via --profile <name>. Resolved against
+# deploy-default.json.profiles[<name>] to prepend runtimeConfig
+# overrides. Empty = no profile.
+PROFILE=""
 # Let's Encrypt staging mode. Use for repeated test provisionings so we
 # don't burn through prod's "5 duplicate certs per exact identifiers per
 # week" rate limit. Set via --staging on the CLI or BEBOP_LE_STAGING=true
@@ -245,6 +251,7 @@ while (( $# )); do
         --no-local-s3)     NO_LOCAL_S3=true; shift ;;
         --mail-relay)      ENABLE_MAIL_RELAY=true; shift ;;
         --no-mail-relay)   ENABLE_MAIL_RELAY=false; shift ;;
+        --profile)         PROFILE="$2"; shift 2 ;;
         --reactivate)      REACTIVATE=true; shift ;;
         --staging)         LE_STAGING=true; shift ;;
         --runtime-config)        parse_runtime_config_flag "false" "$2"; shift 2 ;;
@@ -1651,27 +1658,67 @@ preflight_purge_orphans() {
     fi
 }
 
-# Fill unset knobs (3-state: "" from CLI = not overridden) from the
-# deploy-default.env values, falling back to hardcoded "true" per knob
-# when the env var itself is unset. Called after sourcing both env
-# files, before phase execution.
+# Fill unset knobs (3-state: "" from CLI = not overridden) from
+# deploy-default.json.defaults, falling back to hardcoded "true" per
+# knob when the file is missing or the key is absent. Called after all
+# arg parsing, before phase execution.
 apply_deploy_defaults() {
-    if [[ -z "$ENABLE_PHOENIXD" ]]; then
-        ENABLE_PHOENIXD="${BEBOP_TENANT_DEFAULT_PHOENIXD:-true}"
+    local file="$DEPLOY_DEFAULT_FILE"
+    local phoenixd_def=true local_s3_def=true mail_relay_def=true
+    if [[ -f "$file" ]] && jq -e . "$file" >/dev/null 2>&1; then
+        phoenixd_def=$(jq -r '.defaults.phoenixd // true' "$file")
+        local_s3_def=$(jq -r '.defaults.local_s3 // true' "$file")
+        mail_relay_def=$(jq -r '.defaults.mail_relay // true' "$file")
     fi
-    if [[ -z "$ENABLE_MAIL_RELAY" ]]; then
-        ENABLE_MAIL_RELAY="${BEBOP_TENANT_DEFAULT_MAIL_RELAY:-true}"
-    fi
+    [[ -z "$ENABLE_PHOENIXD" ]] && ENABLE_PHOENIXD="$phoenixd_def"
+    [[ -z "$ENABLE_MAIL_RELAY" ]] && ENABLE_MAIL_RELAY="$mail_relay_def"
     if [[ -z "$NO_LOCAL_S3" ]]; then
         # NO_LOCAL_S3 is the INVERSE of the LOCAL_S3 default — historical
         # naming (--no-local-s3 opts out of the default-on behaviour).
-        if [[ "${BEBOP_TENANT_DEFAULT_LOCAL_S3:-true}" == "true" ]]; then
+        if [[ "$local_s3_def" == "true" ]]; then
             NO_LOCAL_S3=false
         else
             NO_LOCAL_S3=true
         fi
     fi
     log_debug "deploy defaults resolved: phoenixd=${ENABLE_PHOENIXD} local_s3=$(if [[ "$NO_LOCAL_S3" == "false" ]]; then echo true; else echo false; fi) mail_relay=${ENABLE_MAIL_RELAY}"
+}
+
+# Load a per-source profile from deploy-default.json.profiles[<name>] and
+# PREPEND its runtimeConfig entries to RUNTIME_CONFIG_OVERRIDES so that any
+# --runtime-config[-locked] entries the CLI already parsed win on same-key
+# collisions (mongo upsert = last-write wins per key).
+apply_profile() {
+    [[ -z "$PROFILE" ]] && return 0
+    # Refuse convention-comment keys — those are shown in the template as
+    # documentation and should never match a real webhook path. Requires
+    # the operator to actually rename the example before use.
+    if [[ "$PROFILE" == '$'* || "$PROFILE" == _example* ]]; then
+        die "profile '${PROFILE}' looks like a template placeholder (\$-prefixed or _example*) — rename to a real source domain in ${DEPLOY_DEFAULT_FILE}"
+    fi
+    local file="$DEPLOY_DEFAULT_FILE"
+    if [[ ! -f "$file" ]] || ! jq -e . "$file" >/dev/null 2>&1; then
+        die "--profile '${PROFILE}' requested but ${file} is missing or invalid JSON"
+    fi
+    if ! jq -e --arg p "$PROFILE" '.profiles | has($p)' "$file" >/dev/null; then
+        die "profile '${PROFILE}' not defined in ${file}. Available: $(jq -r '.profiles | keys | map(select(startswith("$") | not) | select(startswith("_example") | not)) | join(", ")' "$file")"
+    fi
+    local -a profile_entries=()
+    local key value
+    while IFS='=' read -r key value; do
+        [[ -z "$key" ]] && continue
+        profile_entries+=("true:${key}=${value}")
+    done < <(jq -r --arg p "$PROFILE" '.profiles[$p].locked // {} | to_entries[] | "\(.key)=\(.value)"' "$file")
+    while IFS='=' read -r key value; do
+        [[ -z "$key" ]] && continue
+        profile_entries+=("false:${key}=${value}")
+    done < <(jq -r --arg p "$PROFILE" '.profiles[$p].unlocked // {} | to_entries[] | "\(.key)=\(.value)"' "$file")
+    if (( ${#profile_entries[@]} == 0 )); then
+        log_warn "profile '${PROFILE}' defined but has no runtimeConfig entries"
+        return 0
+    fi
+    RUNTIME_CONFIG_OVERRIDES=("${profile_entries[@]}" "${RUNTIME_CONFIG_OVERRIDES[@]}")
+    log_info "profile '${PROFILE}' applied: ${#profile_entries[@]} runtimeConfig entries"
 }
 
 main() {
@@ -1683,15 +1730,13 @@ main() {
     # shellcheck disable=SC1090
     source "$SECRETS_FILE"
 
-    # Deploy defaults — non-secret ops config (feature toggles for the
-    # fresh tenant path). Missing file is tolerated (fall back to
-    # hardcoded "true" per knob) so hosts provisioned before the
-    # deploy-default introduction keep the pre-refactor behaviour.
-    if [[ -f "$DEPLOY_DEFAULT_FILE" ]]; then
-        # shellcheck disable=SC1090
-        source "$DEPLOY_DEFAULT_FILE"
-    fi
+    # Deploy defaults + per-source profile — non-secret ops config,
+    # parsed from JSON (no shell source). apply_deploy_defaults
+    # tolerates a missing file (hardcoded "true" fallbacks) so hosts
+    # provisioned before this feature keep the pre-refactor behaviour.
+    # apply_profile is a no-op when $PROFILE is empty.
     apply_deploy_defaults
+    apply_profile
 
     registry_init
     # The registry lock is NO LONGER held for the full duration of

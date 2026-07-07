@@ -225,14 +225,21 @@ reset_secrets_to_template() {
     log "Reset $SECRETS_FILE from template"
 }
 
-DEPLOY_DEFAULT_TEMPLATE="${INSTALL_DIR}/templates/deploy-default.env.example"
-DEPLOY_DEFAULT_FILE="${SECRETS_DIR}/deploy-default.env"
-# Install deploy-default.env if missing. Never overwrite — operator's
-# deploy-time choices stay across install.sh re-runs. mode 0644 because
-# it's NOT secret (feature flags, not credentials).
+DEPLOY_DEFAULT_TEMPLATE="${INSTALL_DIR}/templates/deploy-default.json.example"
+DEPLOY_DEFAULT_FILE="${SECRETS_DIR}/deploy-default.json"
+# Install deploy-default.json if missing. Never overwrite — operator's
+# deploy-time choices (feature toggles + per-source profiles) stay
+# across install.sh re-runs. mode 0644 because it's NOT secret.
 if [[ ! -f "$DEPLOY_DEFAULT_FILE" ]]; then
     install -m 0644 "$DEPLOY_DEFAULT_TEMPLATE" "$DEPLOY_DEFAULT_FILE"
-    log "Created $DEPLOY_DEFAULT_FILE (mode 0644) — edit to change per-tenant defaults"
+    log "Created $DEPLOY_DEFAULT_FILE (mode 0644) — edit to change per-tenant defaults + per-source profiles"
+fi
+# Legacy deploy-default.env from the pre-JSON draft: harmless once ignored
+# by add-tenant.sh, but rm it here to keep /etc clean and prevent operator
+# confusion about which file is authoritative.
+if [[ -f "${SECRETS_DIR}/deploy-default.env" ]]; then
+    warn "removing legacy ${SECRETS_DIR}/deploy-default.env (superseded by deploy-default.json)"
+    rm -f "${SECRETS_DIR}/deploy-default.env"
 fi
 
 if [[ ! -f "$SECRETS_FILE" ]]; then

@@ -1,0 +1,31 @@
+{
+  "$schema_note": "Host-wide deploy config for be-BOP multi-tenant tooling. Install at /etc/be-BOP-tooling/deploy-default.json with mode 0644 owned by root. NOT SECRET — reviewable ops configuration, kept out of secrets.env. Loaded by add-tenant.sh (fresh path only) and by tooling-tenant-api.service when it spawns add-tenant.sh. Existing tenants keep their original setup on reapply/reactivate; no migration.",
+
+  "defaults": {
+    "$note": "Feature knobs applied to every new tenant unless a CLI flag overrides. Mongo is always ON (main storage, no knob).",
+    "phoenixd": true,
+    "local_s3": true,
+    "mail_relay": true
+  },
+
+  "profiles": {
+    "$note": "Per-source runtimeConfig overrides. The API selects a profile from the URL path segment: POST /deploy-test-tenant/<source-domain> loads profiles.<source-domain>. Empty path segment = no profile applied. Unknown profile → 400.",
+
+    "$profile_key_convention": "Use the full source domain as the profile key (e.g. 'pf.be-bop.io', 'ch.be-bop.shop'). Keys starting with '$' or '_example' are treated as documentation and will never match a real webhook path — copy the '_example_full_profile' entry below, rename its key to your real source domain, and adjust the values.",
+
+    "$field_semantics": "Each profile has two optional sub-objects: 'locked' (marked read-only in the be-BOP UI, protects ops-required values like VAT country) and 'unlocked' (editable by the merchant, sensible defaults they can tweak). Both sub-objects map runtimeConfig keys to string values. CLI --runtime-config[-locked] flags win on same-key collisions (mongo upsert = last-write wins).",
+
+    "_example_full_profile": {
+      "$note": "Copy this entry, rename the key to your real source domain (e.g. 'pf.be-bop.io'), and adapt the values. Leave keys you don't need out — the profile can be as small or as large as needed.",
+      "locked": {
+        "vatCountry": "XX",
+        "currencyMain": "EUR",
+        "locale": "fr_FR"
+      },
+      "unlocked": {
+        "websiteTitle": "My be-BOP Shop",
+        "logoUrl": "https://example.com/logo.png"
+      }
+    }
+  }
+}

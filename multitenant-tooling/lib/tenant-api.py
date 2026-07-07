@@ -370,12 +370,15 @@ def run(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
         return 124, e.stdout or "", e.stderr or f"timeout after {timeout}s"
 
 
-def add_tenant(tenant_id: str, admin_email: str) -> tuple[int, str, str]:
-    return run([
+def add_tenant(tenant_id: str, admin_email: str, profile: str | None = None) -> tuple[int, str, str]:
+    argv = [
         "add-tenant.sh", tenant_id,
         "--admin-email", admin_email,
         "--non-interactive",
-    ], timeout=900)
+    ]
+    if profile:
+        argv += ["--profile", profile]
+    return run(argv, timeout=900)
 
 
 def install_branch(tenant_id: str, branch: str) -> tuple[int, str, str]:
@@ -549,7 +552,24 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": "not found"})
 
     def do_POST(self) -> None:  # noqa: N802 — stdlib API
-        if self.path != "/deploy-test-tenant":
+        # Routes:
+        #   POST /deploy-test-tenant                — no profile applied
+        #   POST /deploy-test-tenant/<source-domain> — resolves against
+        #       deploy-default.json.profiles[<source-domain>], passed to
+        #       add-tenant.sh via --profile. Unknown → 400 (via add-tenant).
+        path = self.path
+        profile: str | None = None
+        prefix = "/deploy-test-tenant"
+        if path == prefix:
+            profile = None
+        elif path.startswith(prefix + "/"):
+            profile = path[len(prefix) + 1:]
+            # Domain-like chars only. Reject anything containing '/', '?',
+            # '#', whitespace — defence against path-traversal and query
+            # smuggling.
+            if not profile or any(c in profile for c in ("/", "?", "#", " ", "\t", "\r", "\n")):
+                return self._send_json(400, {"error": "invalid profile in path"})
+        else:
             return self._send_json(404, {"error": "not found"})
 
         # Read raw body. Content-Length is required (be-BOP's outbound webhook
@@ -619,7 +639,7 @@ class Handler(BaseHTTPRequestHandler):
         # ACK before a long add-tenant.sh run starts.
         threading.Thread(
             target=self._provision,
-            args=(tenant_id, admin_email, branch, buyer_email, first_name, order_number),
+            args=(tenant_id, admin_email, branch, buyer_email, first_name, order_number, profile),
             daemon=True,
             name=f"provision-{tenant_id}",
         ).start()
@@ -639,6 +659,7 @@ class Handler(BaseHTTPRequestHandler):
         buyer_email: str,
         first_name: str,
         order_number: object,
+        profile: str | None = None,
     ) -> None:
         zone = CFG["bebop_dns_zone"]
         tenant_url = f"https://{tenant_id}.{zone}/"
@@ -662,7 +683,7 @@ class Handler(BaseHTTPRequestHandler):
             notify_operator_failure(tenant_id, f"expiry-track failed: {track_err}")
             return
 
-        rc, _, err = add_tenant(tenant_id, admin_email)
+        rc, _, err = add_tenant(tenant_id, admin_email, profile=profile)
         if rc != 0:
             LOG.error("provision %s: add-tenant failed (rc=%d): %s", tenant_id, rc, err)
             notify_operator_failure(tenant_id, f"add-tenant failed: {err[:500]}")
