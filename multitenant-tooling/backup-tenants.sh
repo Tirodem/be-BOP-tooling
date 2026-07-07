@@ -197,26 +197,32 @@ do_backup_tenant() {
         || die "mongodump failed for ${mongo_db}"
 
     # 2. Garage bucket sync (only when the tenant has a local Garage bucket).
+    # Missing S3 creds MUST be fatal — a "warn+skip" produces an archive
+    # WITHOUT the bucket content. If restore-tenant.sh trusts it and does
+    # rclone --delete-during on the destination, it wipes production data.
+    local bucket_obj_count=0
     if [[ -n "$garage_bucket" ]]; then
         log_info "backup: rclone sync garage:${garage_bucket} → bucket/"
         local key_id key_secret
         key_id=$(run_privileged grep -oP '^S3_KEY_ID=\K.*' "/etc/be-BOP/${tenant}/config.env" 2>/dev/null || true)
         key_secret=$(run_privileged grep -oP '^S3_KEY_SECRET=\K.*' "/etc/be-BOP/${tenant}/config.env" 2>/dev/null || true)
         if [[ -z "$key_id" || -z "$key_secret" ]]; then
-            log_warn "Garage credentials missing from config.env; bucket sync SKIPPED"
-        else
-            mkdir -p "${workdir}/bucket"
-            RCLONE_CONFIG_GARAGE_TYPE=s3 \
-            RCLONE_CONFIG_GARAGE_PROVIDER=Other \
-            RCLONE_CONFIG_GARAGE_ENDPOINT=http://127.0.0.1:3900 \
-            RCLONE_CONFIG_GARAGE_REGION=garage \
-            RCLONE_CONFIG_GARAGE_ACCESS_KEY_ID="$key_id" \
-            RCLONE_CONFIG_GARAGE_SECRET_ACCESS_KEY="$key_secret" \
-                rclone --quiet sync "garage:${garage_bucket}" "${workdir}/bucket" \
-                || die "rclone Garage sync failed"
+            die "backup: Garage S3 credentials missing from /etc/be-BOP/${tenant}/config.env — refusing to produce an incomplete archive."
         fi
+        mkdir -p "${workdir}/bucket"
+        RCLONE_CONFIG_GARAGE_TYPE=s3 \
+        RCLONE_CONFIG_GARAGE_PROVIDER=Other \
+        RCLONE_CONFIG_GARAGE_ENDPOINT=http://127.0.0.1:3900 \
+        RCLONE_CONFIG_GARAGE_REGION=garage \
+        RCLONE_CONFIG_GARAGE_ACCESS_KEY_ID="$key_id" \
+        RCLONE_CONFIG_GARAGE_SECRET_ACCESS_KEY="$key_secret" \
+            rclone --quiet sync "garage:${garage_bucket}" "${workdir}/bucket" \
+            || die "rclone Garage sync failed"
+        bucket_obj_count=$(find "${workdir}/bucket" -type f 2>/dev/null | wc -l)
+        log_info "backup: bucket sync complete (${bucket_obj_count} object(s))"
     else
         log_info "backup: tenant has no local Garage bucket (--no-local-s3 at create time); skipping S3 dump"
+        bucket_obj_count=-1
     fi
 
     # 3. phoenixd seed + http-password.
@@ -254,6 +260,7 @@ do_backup_tenant() {
   "bebop_version":    "${bebop_version}",
   "backed_up_at":     "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
   "backup_format":    "1",
+  "bucket_obj_count": ${bucket_obj_count},
   "encryption":       "openssl aes-256-cbc + pbkdf2 (100000 iters), $(if [[ "$FOR_HANDOFF" == "true" ]]; then echo "random per-backup passphrase"; else echo "BACKUP_ENCRYPTION_KEY"; fi)"
 }
 EOF

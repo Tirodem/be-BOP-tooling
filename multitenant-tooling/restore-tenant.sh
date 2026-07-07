@@ -234,10 +234,34 @@ if [[ -d "${EXTRACT_DIR}/bucket" ]]; then HAS_BUCKET=true; fi
 if [[ -f "${EXTRACT_DIR}/phoenixd/seed.dat" ]]; then HAS_PHOENIXD=true; fi
 if [[ -f "${EXTRACT_DIR}/config.env" ]]; then HAS_CONFIG=true; fi
 
+BUCKET_META_COUNT=""
 if [[ "$DRY_RUN" != "true" && -r "${EXTRACT_DIR}/metadata.json" ]]; then
     fmt=$(jq -r '.backup_format // "0"' "${EXTRACT_DIR}/metadata.json" 2>/dev/null || echo "0")
     if [[ "$fmt" != "1" ]]; then
         die "backup_format='${fmt}' unsupported by this restore-tenant.sh; expected '1'"
+    fi
+    BUCKET_META_COUNT=$(jq -r '.bucket_obj_count // ""' "${EXTRACT_DIR}/metadata.json" 2>/dev/null || echo "")
+fi
+
+# Compare the archive's declared bucket_obj_count to what's actually in
+# ${EXTRACT_DIR}/bucket/. Mismatch OR missing metadata → refuse
+# --delete-during (we'd wipe prod bucket content that the archive can't
+# put back). Fall back to a NON-destructive sync so the operator can
+# still recover partial data, plus a loud warning.
+BUCKET_SYNC_MODE="delete-during"
+if $HAS_BUCKET; then
+    actual_count=$(find "${EXTRACT_DIR}/bucket" -type f 2>/dev/null | wc -l)
+    if [[ -z "$BUCKET_META_COUNT" ]]; then
+        log_warn "backup metadata has no bucket_obj_count (old format?); switching to NON-destructive rclone sync as a safety net"
+        BUCKET_SYNC_MODE="safe"
+    elif [[ "$BUCKET_META_COUNT" == "-1" ]]; then
+        log_info "backup declares no bucket (tenant was --no-local-s3 at backup time); no bucket restore"
+        HAS_BUCKET=false
+    elif [[ "$actual_count" != "$BUCKET_META_COUNT" ]]; then
+        log_warn "backup bucket integrity check FAILED: metadata declares ${BUCKET_META_COUNT} object(s), archive contains ${actual_count}. Switching to NON-destructive rclone sync — refusing to wipe prod bucket with an incomplete backup."
+        BUCKET_SYNC_MODE="safe"
+    else
+        log_info "backup bucket integrity OK: ${actual_count} object(s) match metadata"
     fi
 fi
 
@@ -284,7 +308,13 @@ fi
 
 # Garage
 if $HAS_BUCKET && [[ -n "$GARAGE_BUCKET" ]]; then
-    log_info "garage: rclone sync --delete-during ${EXTRACT_DIR}/bucket → ${GARAGE_BUCKET}"
+    rc_delete_flag=""
+    if [[ "$BUCKET_SYNC_MODE" == "delete-during" ]]; then
+        rc_delete_flag="--delete-during"
+        log_info "garage: rclone sync --delete-during ${EXTRACT_DIR}/bucket → ${GARAGE_BUCKET}"
+    else
+        log_warn "garage: rclone sync (NO --delete-during: incomplete backup or missing metadata) ${EXTRACT_DIR}/bucket → ${GARAGE_BUCKET}"
+    fi
     key_id=$(run_privileged grep -oP '^S3_KEY_ID=\K.*' "/etc/be-BOP/${TENANT_ID}/config.env" 2>/dev/null || true)
     key_secret=$(run_privileged grep -oP '^S3_KEY_SECRET=\K.*' "/etc/be-BOP/${TENANT_ID}/config.env" 2>/dev/null || true)
     if [[ -z "$key_id" || -z "$key_secret" ]]; then
@@ -296,7 +326,7 @@ if $HAS_BUCKET && [[ -n "$GARAGE_BUCKET" ]]; then
         RCLONE_CONFIG_GARAGE_REGION=garage \
         RCLONE_CONFIG_GARAGE_ACCESS_KEY_ID="$key_id" \
         RCLONE_CONFIG_GARAGE_SECRET_ACCESS_KEY="$key_secret" \
-            rclone --quiet sync --delete-during \
+            rclone --quiet sync ${rc_delete_flag} \
                 "${EXTRACT_DIR}/bucket" "garage:${GARAGE_BUCKET}" \
             || die "rclone Garage sync failed"
     fi
