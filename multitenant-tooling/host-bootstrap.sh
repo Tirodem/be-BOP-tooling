@@ -228,11 +228,13 @@ step_load_secrets() {
     source "$SECRETS_FILE"
 
     local missing=()
-    local required_vars=(BEBOP_DNS_ZONE)
-    # Empty DNS_PROVIDER falls back to "ovh" (matches lib/dns_provider.sh's
-    # default), so pre-existing secrets.env files from before the multi-
-    # provider refactor keep working without a mandatory edit.
-    case "${DNS_PROVIDER:-ovh}" in
+    local required_vars=(BEBOP_DNS_ZONE DNS_PROVIDER)
+    # Dispatch on DNS_PROVIDER. Empty value is an error (no silent fallback
+    # to ovh) — the operator must pick explicitly since we support several
+    # providers now. In --defer-secrets mode the missing-value check just
+    # below emits a warn instead of dying, so a fresh install still passes.
+    case "${DNS_PROVIDER:-}" in
+        "")         : ;;  # captured by the missing-value loop below
         ovh)        required_vars+=(OVH_APPLICATION_KEY OVH_APPLICATION_SECRET OVH_CONSUMER_KEY) ;;
         infomaniak) required_vars+=(INFOMANIAK_API_TOKEN) ;;
         *)          die "secrets.env: unknown DNS_PROVIDER='${DNS_PROVIDER}' (want: ovh|infomaniak)" ;;

@@ -20,8 +20,9 @@
 # wrappers below defer the backend load to the first call, at which
 # point secrets.env has been read.
 #
-#   DNS_PROVIDER=ovh         → lib/ovh.sh          (default)
+#   DNS_PROVIDER=ovh         → lib/ovh.sh
 #   DNS_PROVIDER=infomaniak  → lib/infomaniak.sh
+# Empty DNS_PROVIDER dies loudly — no silent fallback.
 #
 # Adding a new provider = drop lib/<name>.sh implementing the same
 # function names, then extend the case in _dns_provider_load_backend.
@@ -39,7 +40,10 @@ readonly _BEBOP_DNS_PROVIDER_SOURCED=1
 # replaced by the real implementation from that point on.
 _dns_provider_load_backend() {
     [[ -n "${_BEBOP_DNS_PROVIDER_BACKEND_SOURCED:-}" ]] && return 0
-    case "${DNS_PROVIDER:-ovh}" in
+    case "${DNS_PROVIDER:-}" in
+        "")
+            die "dns_provider: DNS_PROVIDER is empty. Set it explicitly to 'ovh' or 'infomaniak' in ${SECRETS_FILE:-/etc/be-BOP-tooling/secrets.env}."
+            ;;
         ovh)
             # shellcheck source=ovh.sh
             source "${BEBOP_TOOLING_LIB_DIR}/ovh.sh"

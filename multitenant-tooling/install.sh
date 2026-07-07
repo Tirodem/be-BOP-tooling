@@ -184,13 +184,31 @@ RESUME_FROM_EXISTING=false
 # and falsely report the file as filled, which then routes install.sh to
 # the keep/reset prompt instead of the resume-with-defer-secrets path.
 secrets_have_values() {
+    # BACKUP_ENCRYPTION_KEY is now auto-seeded (see seed_backup_encryption_key),
+    # so it's always present on a fresh install — checking it would falsely
+    # mark the file as "filled". Only look at provider creds, which the
+    # operator MUST enter by hand.
     (
         set -a
         # shellcheck disable=SC1090
         source "$SECRETS_FILE" 2>/dev/null || exit 1
         set +a
-        [[ -n "${OVH_APPLICATION_KEY:-}${OVH_APPLICATION_SECRET:-}${OVH_CONSUMER_KEY:-}${INFOMANIAK_API_TOKEN:-}${BACKUP_ENCRYPTION_KEY:-}" ]]
+        [[ -n "${OVH_APPLICATION_KEY:-}${OVH_APPLICATION_SECRET:-}${OVH_CONSUMER_KEY:-}${INFOMANIAK_API_TOKEN:-}" ]]
     )
+}
+
+# Auto-populate BACKUP_ENCRYPTION_KEY when it's still the empty
+# placeholder from the template. Pure crypto material — nothing the
+# operator can meaningfully choose, so we skip forcing them to run
+# `openssl rand -hex 32` and paste the value by hand. Preserves any
+# manually-set value (sed only matches the exact empty form).
+seed_backup_encryption_key() {
+    if grep -qE '^BACKUP_ENCRYPTION_KEY=""$' "$SECRETS_FILE"; then
+        local gen
+        gen=$(openssl rand -hex 32)
+        sed -i "s|^BACKUP_ENCRYPTION_KEY=\"\"|BACKUP_ENCRYPTION_KEY=\"${gen}\"|" "$SECRETS_FILE"
+        log "Auto-generated BACKUP_ENCRYPTION_KEY (32 bytes hex)"
+    fi
 }
 
 reset_secrets_to_template() {
@@ -203,11 +221,13 @@ reset_secrets_to_template() {
         log "Backed up current secrets.env to $bak"
     fi
     install -m 0600 "$TEMPLATE_PATH" "$SECRETS_FILE"
+    seed_backup_encryption_key
     log "Reset $SECRETS_FILE from template"
 }
 
 if [[ ! -f "$SECRETS_FILE" ]]; then
     install -m 0600 "$TEMPLATE_PATH" "$SECRETS_FILE"
+    seed_backup_encryption_key
     log "Created $SECRETS_FILE (mode 0600)"
 elif ! secrets_have_values; then
     log "$SECRETS_FILE has no required credentials filled in; replacing with the current template"
