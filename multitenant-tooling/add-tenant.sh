@@ -1477,6 +1477,9 @@ EOF
 
 run_fresh_creation() {
     DECISION_PATH=fresh
+    # Fresh path only: apply the per-source profile (if --profile was
+    # given). Reapply / reactivate refuse --profile — see gate in main().
+    apply_profile
     txn_init
     detect_host_ip
     phase_derive_identifiers
@@ -1730,13 +1733,13 @@ main() {
     # shellcheck disable=SC1090
     source "$SECRETS_FILE"
 
-    # Deploy defaults + per-source profile — non-secret ops config,
-    # parsed from JSON (no shell source). apply_deploy_defaults
-    # tolerates a missing file (hardcoded "true" fallbacks) so hosts
-    # provisioned before this feature keep the pre-refactor behaviour.
-    # apply_profile is a no-op when $PROFILE is empty.
+    # Deploy defaults — non-secret ops config, parsed from JSON.
+    # apply_deploy_defaults tolerates a missing file (hardcoded "true"
+    # fallbacks). apply_profile is deferred to run_fresh_creation()
+    # because --profile is only accepted on fresh creations (a reapply /
+    # reactivate against an existing tenant would silently overwrite its
+    # runtimeConfig — refused).
     apply_deploy_defaults
-    apply_profile
 
     registry_init
     # The registry lock is NO LONGER held for the full duration of
@@ -1753,6 +1756,13 @@ main() {
     preflight_purge_orphans
 
     phase_status_decision
+
+    # --profile refuses on any path except fresh: the profile is meant to
+    # seed a new tenant's runtimeConfig, not silently rewrite an existing
+    # merchant's config through a reapply / reactivate.
+    if [[ -n "$PROFILE" && "${DECISION_PATH:-fresh}" != "fresh" ]]; then
+        die "--profile '${PROFILE}' can only be used when creating a new tenant (this call resolved to DECISION_PATH=${DECISION_PATH}). Drop the flag or purge the existing tenant first."
+    fi
 
     case "${DECISION_PATH:-fresh}" in
         fresh)      run_fresh_creation ;;
