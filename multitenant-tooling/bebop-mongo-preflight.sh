@@ -117,18 +117,19 @@ mongo_wait_ready "$CONN_TARGET" 30 1 \
     || die "mongod@${TENANT_ID} did not become ready on 127.0.0.1:${MONGO_PORT}"
 
 # 4. Verify or initialise the single-node RS.
-#    - Unauth mode: mongo_init_rs is idempotent (checks then initiates).
-#    - Auth mode: RS was initiated BEFORE auth was enabled (add-tenant.sh
-#      phase_mongo or migrate-mongo-auth.sh). We only VERIFY status here
-#      — re-initiating would fail without cluster-admin auth. If the RS
-#      is somehow broken on an auth-enabled tenant, that's out of the
-#      preflight's remit and needs operator intervention.
-if [[ -n "${MONGO_AUTH_ARGS:-}" ]]; then
-    if ! mongosh --quiet "$CONN_TARGET" --eval "rs.status().ok" 2>/dev/null \
-            | grep -q '^1$'; then
-        die "mongod@${TENANT_ID} RS not OK on auth-enabled tenant; preflight cannot recover — operator needed"
-    fi
-else
+#    - Unauth mode: mongo_init_rs is idempotent (checks status then
+#      initiates if needed).
+#    - Auth mode: we DON'T check rs.status() here. Rationale: the tenant's
+#      SCRAM user has role=dbOwner scoped to its own DB, which does NOT
+#      grant the `clusterMonitor` action required for `replSetGetStatus`
+#      (i.e. rs.status()). Any check we make here would either need a
+#      privileged user (widens attack surface) or fail with "unauthorized"
+#      even on a perfectly healthy RS. The authenticated ping above
+#      already confirms mongod is reachable + auth works; a broken RS
+#      manifests as be-BOP timing out on connect (Mongo driver waits for
+#      primary election via `replicaSet=rs0` in MONGODB_URL). That's the
+#      pre-existing detection path; letting it flow through here is fine.
+if [[ -z "${MONGO_AUTH_ARGS:-}" ]]; then
     mongo_init_rs "$MONGO_PORT"
 fi
 
