@@ -138,12 +138,19 @@ install -d -m 0700 "$SECRETS_DIR"
 TEMPLATE_PATH="${INSTALL_DIR}/templates/secrets.env.example"
 RESUME_FROM_EXISTING=false
 
-# Heuristic: did the operator fill in any required credential? If none of
-# the required-and-template-empty vars has a value, the file is effectively
-# blank and can be replaced from the current template without loss.
+# Did the operator fill in any required credential?
+# Source the file in a subshell so quoted-empty values (`KEY=""`) resolve
+# to actual empty strings — a grep `.+` would count the quotes as "value"
+# and falsely report the file as filled, which then routes install.sh to
+# the keep/reset prompt instead of the resume-with-defer-secrets path.
 secrets_have_values() {
-    grep -qE '^(OVH_APPLICATION_KEY|OVH_APPLICATION_SECRET|OVH_CONSUMER_KEY|INFOMANIAK_API_TOKEN|BACKUP_ENCRYPTION_KEY)=.+' \
-        "$SECRETS_FILE" 2>/dev/null
+    (
+        set -a
+        # shellcheck disable=SC1090
+        source "$SECRETS_FILE" 2>/dev/null || exit 1
+        set +a
+        [[ -n "${OVH_APPLICATION_KEY:-}${OVH_APPLICATION_SECRET:-}${OVH_CONSUMER_KEY:-}${INFOMANIAK_API_TOKEN:-}${BACKUP_ENCRYPTION_KEY:-}" ]]
+    )
 }
 
 reset_secrets_to_template() {
