@@ -462,6 +462,26 @@ step_setup_directories() {
     maybe_run run_privileged install -d -m 0755 /etc/letsencrypt
 }
 
+# === Mongo keyfile (host-wide, host-secret) =============================
+# Required to enable --auth on a replSet: mongod's intra-cluster auth
+# mechanism uses this keyfile. Delivered to each mongod@<tenant> via
+# LoadCredential= in the template unit, so the DynamicUser can read it
+# without ever seeing /etc/be-BOP-mongodb/keyfile directly.
+# 24 chars of base64 → 128 bits of entropy, mongod accepts anything
+# 6..1024 chars. Idempotent: skip if the file already exists.
+step_setup_mongo_keyfile() {
+    local keyfile=/etc/be-BOP-mongodb/keyfile
+    if [[ -f "$keyfile" ]]; then
+        log_info "mongod keyfile already present at ${keyfile} ✓"
+        return 0
+    fi
+    log_info "Generating mongod keyfile at ${keyfile}..."
+    maybe_run run_privileged install -d -m 0755 /etc/be-BOP-mongodb
+    maybe_run run_privileged bash -c "openssl rand -base64 24 > '${keyfile}'"
+    maybe_run run_privileged chmod 0400 "$keyfile"
+    maybe_run run_privileged chown root:root "$keyfile"
+}
+
 # === be-bop-cli system user (parity with v1 wizard) =====================
 step_setup_user_be_bop_cli() {
     if id be-bop-cli >/dev/null 2>&1; then
@@ -1545,6 +1565,7 @@ main() {
     step_install_phoenixd_binary
 
     step_setup_directories
+    step_setup_mongo_keyfile
     step_setup_user_be_bop_cli
 
     step_write_garage_config
