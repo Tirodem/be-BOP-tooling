@@ -1360,7 +1360,13 @@ phase_summary() {
 
 EOF
     if [[ "${DECISION_PATH:-fresh}" == "fresh" && "$ENABLE_PHOENIXD" == "true" ]]; then
-        cat <<EOF
+        # phoenixd seed + HTTP password control the merchant's Lightning wallet.
+        # Print them ONLY if stdout is an interactive TTY. Otherwise (piped, tee,
+        # captured by a daemon like test-tenant-api) write them to a root-owned
+        # 0600 file and print only its path — prevents leak into install.log,
+        # journal captures, notification bodies, etc.
+        if [[ -t 1 ]]; then
+            cat <<EOF
   ==== TRANSMIT TO MERCHANT (sensitive — handle carefully) ====
   phoenixd HTTP password:   ${PHOENIXD_HTTP_PASSWORD}
   phoenixd seed (hex):      ${PHOENIXD_SEED_HEX:-(seed.dat not readable)}
@@ -1369,6 +1375,24 @@ EOF
   the merchant's password manager and back the seed up off-host (encrypted).
 
 EOF
+        else
+            local secrets_dir=/root/bebop-tenant-secrets
+            local secrets_file="${secrets_dir}/${TENANT_ID}.txt"
+            run_privileged install -d -m 0700 "$secrets_dir"
+            run_privileged tee "$secrets_file" >/dev/null <<EOF
+tenant: ${TENANT_ID}
+created_at: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+phoenixd HTTP password: ${PHOENIXD_HTTP_PASSWORD}
+phoenixd seed (hex): ${PHOENIXD_SEED_HEX:-(seed.dat not readable)}
+EOF
+            run_privileged chmod 0600 "$secrets_file"
+            cat <<EOF
+  ==== TRANSMIT TO MERCHANT (sensitive) ====
+  stdout is not a TTY — secrets written to: ${secrets_file} (mode 0600, root)
+  Copy them off-host to the merchant's password manager, then delete the file.
+
+EOF
+        fi
     fi
 }
 

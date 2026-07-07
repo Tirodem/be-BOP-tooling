@@ -37,6 +37,11 @@ _log_emit() {
     local prefix="[${BEBOP_TOOLING_SESSION_ID}] [${timestamp}] [${level}]"
     [[ -n "$BEBOP_TOOLING_TENANT_ID" ]] && prefix+=" [tenant=${BEBOP_TOOLING_TENANT_ID}]"
     local line="${prefix} $*"
+    # Redact known secret-shaped values before ANY sink writes. Applies to
+    # stderr, systemd-cat, and the err-log used in notify_failure bodies.
+    local masked
+    masked=$(printf '%s' "$line" | mask_secrets) || masked="$line"
+    line="$masked"
     printf '%s\n' "$line" >&2
     if command -v systemd-cat >/dev/null 2>&1; then
         local prio
@@ -83,5 +88,7 @@ mask_secrets() {
         -e 's/(Authorization:[[:space:]]*Bearer[[:space:]]+)[A-Za-z0-9._~+/=-]+/\1***REDACTED***/g' \
         -e 's/(Authorization:[[:space:]]*Basic[[:space:]]+)[A-Za-z0-9+/=]+/\1***REDACTED***/g' \
         -e 's/(X-Ovh-Application:[[:space:]]+)[A-Za-z0-9]+/\1***REDACTED***/g' \
-        -e 's/(X-Ovh-Consumer:[[:space:]]+)[A-Za-z0-9]+/\1***REDACTED***/g'
+        -e 's/(X-Ovh-Consumer:[[:space:]]+)[A-Za-z0-9]+/\1***REDACTED***/g' \
+        -e 's/(X-Ovh-Signature:[[:space:]]+)\$1\$[A-Za-z0-9]+/\1***REDACTED***/g' \
+        -e 's|(mongodb(\+srv)?://)[^:@[:space:]]+:[^@[:space:]]+@|\1***REDACTED***@|g'
 }
