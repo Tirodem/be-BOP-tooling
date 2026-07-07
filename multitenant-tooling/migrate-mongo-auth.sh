@@ -150,11 +150,24 @@ migrate_one() {
         die "config.env missing for '${tid}' (${cfg_env})"
     fi
 
-    # Idempotence: skip already-migrated tenants (MONGO_AUTH_ARGS non-empty).
-    if grep -qE '^MONGO_AUTH_ARGS=..' "$port_env"; then
-        log_info "already migrated (MONGO_AUTH_ARGS set in ${port_env}) — skip"
+    # Idempotence: a tenant is considered "already migrated" ONLY when BOTH
+    # port.env has MONGO_AUTH_ARGS AND config.env's MONGODB_URL contains an
+    # `<user>:<pwd>@` chunk. If port.env alone is set (previous run crashed
+    # between step 4 and step 6), we resume from step 3: reset the user's
+    # password to a fresh one, keep going. This guarantees no manual
+    # cleanup needed after a partial migration failure.
+    local port_env_has_auth=false url_has_creds=false
+    grep -qE '^MONGO_AUTH_ARGS=..' "$port_env" && port_env_has_auth=true
+    if grep -qE '^MONGODB_URL=mongodb://[^:]+:[^@]+@' "$cfg_env"; then
+        url_has_creds=true
+    fi
+    if $port_env_has_auth && $url_has_creds; then
+        log_info "already migrated (port.env + config.env both authed) — skip"
         SKIPPED+=("$tid")
         return 0
+    fi
+    if $port_env_has_auth && ! $url_has_creds; then
+        log_warn "partial migration detected (port.env authed, config.env not) — resuming from step 3"
     fi
 
     local mongo_port mongo_db
@@ -172,10 +185,24 @@ migrate_one() {
     log_info "step 1/6: stopping bebop@${tid}.service..."
     run_privileged systemctl stop "bebop@${tid}.service" 2>/dev/null || true
 
-    log_info "step 2/6: ensuring mongod@${tid} is up (unauth) for user creation..."
-    run_privileged systemctl start "mongod@${tid}.service"
+    log_info "step 2/6: forcing mongod@${tid} into UNAUTH mode for user creation..."
+    # Regress port.env to no-auth. No-op when it was already unauth.
+    # Necessary on partial-migration resume: if port.env is currently
+    # authed but config.env still lacks creds, a previous run crashed
+    # between step 4 and step 6. The SCRAM user exists with a password
+    # known only to that crashed run. With --auth off, mongo_create_user
+    # (updateUser path) can reset the password without needing to
+    # authenticate first. With --auth on, both localhost exception
+    # (closes once a user exists) and unauth updates are impossible.
+    local unauth_tmp
+    unauth_tmp=$(mktemp)
+    printf 'MONGO_PORT=%s\n' "$mongo_port" > "$unauth_tmp"
+    run_privileged install -m 0640 "$unauth_tmp" "$port_env"
+    rm -f "$unauth_tmp"
+    run_privileged systemctl daemon-reload
+    run_privileged systemctl restart "mongod@${tid}.service"
     mongo_wait_ready "$mongo_port" 60 1 \
-        || die "mongod@${tid} did not become ready on port ${mongo_port}"
+        || die "mongod@${tid} did not become ready in unauth mode on port ${mongo_port}"
 
     log_info "step 3/6: creating SCRAM user via localhost exception..."
     local user="bebop_${tid//-/_}"

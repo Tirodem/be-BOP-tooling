@@ -44,6 +44,12 @@ EnvironmentFile=/etc/be-BOP-mongodb/%i/port.env
 # seeing the source path. When MONGO_AUTH_ARGS is empty, mongod ignores
 # the credential file — no side effect.
 LoadCredential=keyfile:/etc/be-BOP-mongodb/keyfile
+
+# NOTE: ExecStart below uses bare $MONGO_AUTH_ARGS (no braces) so systemd
+# whitespace-SPLITS the value into distinct argv elements. With
+# ${MONGO_AUTH_ARGS} (braces), the whole "--auth --keyFile /..." string
+# is passed to mongod as ONE argument and mongod exits code 2 with
+# "unknown option". See systemd.exec(5) "variable substitution".
 ExecStart=/usr/bin/mongod \
     --dbpath /var/lib/be-BOP-mongodb/%i \
     --bind_ip 127.0.0.1 \
@@ -51,7 +57,7 @@ ExecStart=/usr/bin/mongod \
     --replSet rs0 \
     --logpath /var/lib/be-BOP-mongodb/%i/mongod.log \
     --logappend \
-    ${MONGO_AUTH_ARGS}
+    $MONGO_AUTH_ARGS
 Restart=always
 RestartSec=5
 TimeoutStartSec=120
