@@ -86,6 +86,18 @@ export BEBOP_TOOLING_SYSLOG_IDENT
 : "${NODEJS_MAJOR_VERSION:=20}"
 : "${GARAGE_VERSION:=2.2.0}"
 : "${PHOENIXD_VERSION:=0.6.2}"
+# Pin pnpm so bootstraps are reproducible across days. `corepack prepare
+# pnpm@latest` would install whatever pnpm was tagged latest on that
+# clock, and produce subtly different lockfile resolutions from one host
+# to another. Bump this in a dedicated commit + note the change.
+: "${PNPM_VERSION:=9.15.1}"
+# Optional SHA256 for the Garage and phoenixd binaries. When set, the
+# downloader verifies the hash before installing — a corrupted download
+# or a swapped upstream artefact fails loudly instead of running as root
+# and touching Lightning keys. When empty (default), the bootstrap
+# warns loudly but proceeds — populate these on the next version bump.
+: "${GARAGE_SHA256:=}"
+: "${PHOENIXD_SHA256:=}"
 : "${MONGODB_VERSION:=8.0}"
 : "${UPTIME_KUMA_IMAGE:=louislam/uptime-kuma:1}"
 : "${UPTIME_KUMA_HOST_PORT:=8810}"
@@ -342,9 +354,25 @@ step_install_nodejs_pnpm() {
     if ! command -v corepack >/dev/null 2>&1; then
         die "corepack not available — Node.js install seems broken"
     fi
-    log_info "Enabling corepack and pnpm..."
+    log_info "Enabling corepack and pinning pnpm@${PNPM_VERSION}..."
     maybe_run run_privileged corepack enable
-    maybe_run run_privileged corepack prepare pnpm@latest --activate
+    maybe_run run_privileged corepack prepare "pnpm@${PNPM_VERSION}" --activate
+}
+
+# Verify sha256 of a downloaded binary. Empty $expected → warn + skip
+# (never silently trust). Non-empty → verify and die on mismatch.
+_verify_sha256() {
+    local file="$1" expected="$2" label="$3"
+    if [[ -z "$expected" ]]; then
+        log_warn "sha256: NO expected hash configured for ${label} — skipping integrity check. Populate ${label^^}_SHA256 in secrets.env or in host-bootstrap.sh on next version bump."
+        return 0
+    fi
+    local actual
+    actual=$(sha256sum "$file" | awk '{print $1}')
+    if [[ "$actual" != "$expected" ]]; then
+        die "sha256 mismatch for ${label}: expected ${expected}, got ${actual}. Refusing to install a binary that doesn't match the expected hash."
+    fi
+    log_info "sha256: ${label} verified ✓"
 }
 
 # === Garage binary ======================================================
@@ -366,7 +394,11 @@ step_install_garage_binary() {
         tmp=$(mktemp -d)
         # shellcheck disable=SC2064
         trap "rm -rf '${tmp}'" RETURN
-        maybe_run curl -fsSL --connect-timeout 10 --max-time 300 -o "${tmp}/garage" "${url}"
+        maybe_run curl -fsSL \
+            --retry 3 --retry-delay 5 --retry-connrefused \
+            --connect-timeout 10 --max-time 300 \
+            -o "${tmp}/garage" "${url}"
+        _verify_sha256 "${tmp}/garage" "$GARAGE_SHA256" "garage"
         maybe_run run_privileged install -d -m 0755 "${pkg_dir}/bin"
         maybe_run run_privileged install -m 0755 "${tmp}/garage" "${pkg_dir}/bin/garage"
         rm -rf "${tmp}"
@@ -395,7 +427,11 @@ step_install_phoenixd_binary() {
         tmp=$(mktemp -d)
         # shellcheck disable=SC2064
         trap "rm -rf '${tmp}'" RETURN
-        maybe_run curl -fsSL --connect-timeout 10 --max-time 300 -o "${tmp}/phoenixd.zip" "${url}"
+        maybe_run curl -fsSL \
+            --retry 3 --retry-delay 5 --retry-connrefused \
+            --connect-timeout 10 --max-time 300 \
+            -o "${tmp}/phoenixd.zip" "${url}"
+        _verify_sha256 "${tmp}/phoenixd.zip" "$PHOENIXD_SHA256" "phoenixd"
         ( cd "${tmp}" && maybe_run unzip -q phoenixd.zip )
         maybe_run run_privileged install -d -m 0755 "${pkg_dir}/bin"
         maybe_run run_privileged bash -c "install -m 0755 ${tmp}/phoenixd-*/phoenixd ${pkg_dir}/bin/"
@@ -1376,6 +1412,58 @@ step_setup_mail_relay() {
     log_info "bebop-mail-relay-prune firing nightly (03:15 UTC, 90-day retention)"
 }
 
+# Render a "Capabilities" block for the end-of-bootstrap summary. Each
+# line reports what the secrets landscape enables/disables so the operator
+# doesn't discover months later that mail alerts were silently dead.
+_summary_capabilities_block() {
+    local out=""
+    _cap_line() {
+        # $1=label, $2=expression returning "OK" / "NON CONFIGURÉ"
+        printf '  %-32s %s\n' "$1" "$2"
+    }
+    out+=$(cat <<CAPS
+Capabilities (from ${SECRETS_FILE}):
+CAPS
+)
+    out+=$'\n'
+    if dns_provider_is_configured 2>/dev/null; then
+        out+=$(_cap_line "DNS provider (${BEBOP_DNS_PROVIDER:-?})" "OK")
+    else
+        out+=$(_cap_line "DNS provider" "NON CONFIGURÉ (add-tenant will fail on DNS)")
+    fi
+    out+=$'\n'
+    if [[ -n "${LE_OPERATOR_EMAIL:-}" ]]; then
+        out+=$(_cap_line "LE_OPERATOR_EMAIL" "OK (${LE_OPERATOR_EMAIL})")
+    else
+        out+=$(_cap_line "LE_OPERATOR_EMAIL" "NON CONFIGURÉ — each tenant burns 1 LE account (10/IP/3h wall)")
+    fi
+    out+=$'\n'
+    if [[ -n "${SMTP_HOST:-}" && -n "${SMTP_USER:-}" && -n "${SMTP_PASSWORD:-}" ]]; then
+        out+=$(_cap_line "SMTP (ops alerts)" "OK (${SMTP_HOST})")
+    else
+        out+=$(_cap_line "SMTP (ops alerts)" "NON CONFIGURÉ — mail notify_failure silently skips")
+    fi
+    out+=$'\n'
+    if [[ -n "${ZULIP_URL:-}" && -n "${ZULIP_BOT_EMAIL:-}" && -n "${ZULIP_API_KEY:-}" ]]; then
+        out+=$(_cap_line "Zulip (ops alerts)" "OK")
+    else
+        out+=$(_cap_line "Zulip (ops alerts)" "NON CONFIGURÉ — Zulip notify_failure silently skips")
+    fi
+    out+=$'\n'
+    if [[ -n "${SFTP_HOST:-}" && -n "${SFTP_USER:-}" && -n "${SFTP_PASSWORD:-}" && -n "${BACKUP_ENCRYPTION_KEY:-}" ]]; then
+        out+=$(_cap_line "SFTP backups" "OK (${SFTP_HOST})")
+    else
+        out+=$(_cap_line "SFTP backups" "NON CONFIGURÉ — backup-tenants.sh will not ship offsite")
+    fi
+    out+=$'\n'
+    if [[ -n "${UPTIME_KUMA_URL:-}" ]]; then
+        out+=$(_cap_line "Uptime Kuma" "OK (${UPTIME_KUMA_URL})")
+    else
+        out+=$(_cap_line "Uptime Kuma" "NON CONFIGURÉ — no per-tenant monitors")
+    fi
+    printf '%s\n' "$out"
+}
+
 # === Summary ===========================================================
 step_print_summary() {
     local title="be-BOP multi-tenant host bootstrap COMPLETE"
@@ -1417,12 +1505,13 @@ Services running:
   netdata.service
   bebop-uptime-kuma (Docker, bound to 127.0.0.1:${UPTIME_KUMA_HOST_PORT})
 
+$(_summary_capabilities_block)
 NEXT STEPS:
 EOF
     if [[ "$DEFER_SECRETS" == "true" ]] && ! dns_provider_is_configured; then
         cat <<EOF
   0. Edit ${SECRETS_FILE} (mode 0600), then re-run:
-       sudo ${BEBOP_TOOLING_INSTALL_PREFIX}/host-bootstrap.sh
+       sudo /opt/be-BOP-tooling/host-bootstrap.sh
      This will verify DNS provider connectivity and auto-provision the
      Kuma admin + notification channels.
 EOF
