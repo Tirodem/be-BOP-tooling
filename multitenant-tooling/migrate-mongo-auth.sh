@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# migrate-mongo-auth.sh — enable SCRAM auth on tenants provisioned before
+# the auth rollout. Idempotent AND resumable — a tenant already migrated
+# is skipped silently, so operators can safely re-run with --all.
+#
+# Per-tenant, rolling (one at a time to bound the blast radius):
+#   1. Detect current auth state via /etc/be-BOP-mongodb/<tid>/port.env.
+#      MONGO_AUTH_ARGS non-empty → skip, already done.
+#   2. Stop bebop@<tid>.service (downtime starts).
+#   3. Ensure mongod@<tid> is up in unauth mode; use the localhost
+#      exception to create the SCRAM user (dbOwner scoped to the
+#      tenant's DB).
+#   4. Rewrite port.env with MONGO_AUTH_ARGS pointing to the LoadCredential
+#      keyfile, systemctl daemon-reload + restart mongod@<tid>.
+#      mongod now runs with --auth --keyFile active.
+#   5. Verify authenticated ping using the freshly-built URI.
+#   6. Rewrite /etc/be-BOP/<tid>/config.env: replace unauth MONGODB_URL
+#      with the authenticated URI. Uses .new + mv -T for atomicity
+#      (same pattern as add-tenant.sh phase_config_env).
+#   7. Start bebop@<tid>.service (downtime ends, ~30-60s).
+#
+# On any failure, tries to leave the tenant on the OLD state (bebop@
+# restarted, mongod@ back to unauth if we already flipped it) so the
+# operator can investigate without a stuck tenant.
+
+set -eEuo pipefail
+
+readonly SCRIPT_NAME="migrate-mongo-auth"
+readonly SECRETS_FILE=/etc/be-BOP-tooling/secrets.env
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -d "$SCRIPT_DIR/lib" ]]; then
+    BEBOP_TOOLING_LIB_DIR="$SCRIPT_DIR/lib"
+elif [[ -d /usr/local/share/be-BOP-tooling/lib ]]; then
+    BEBOP_TOOLING_LIB_DIR=/usr/local/share/be-BOP-tooling/lib
+else
+    echo "${SCRIPT_NAME}: cannot locate lib/ directory" >&2
+    exit 1
+fi
+
+BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
+export BEBOP_TOOLING_SYSLOG_IDENT
+
+# shellcheck source=lib/log.sh
+source "$BEBOP_TOOLING_LIB_DIR/log.sh"
+# shellcheck source=lib/sudo.sh
+source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
+# shellcheck source=lib/registry.sh
+source "$BEBOP_TOOLING_LIB_DIR/registry.sh"
+# shellcheck source=lib/mongo.sh
+source "$BEBOP_TOOLING_LIB_DIR/mongo.sh"
+# shellcheck source=lib/notify.sh
+source "$BEBOP_TOOLING_LIB_DIR/notify.sh"
+
+# === CLI ================================================================
+ALL=false
+DRY_RUN=false
+NON_INTERACTIVE=false
+TENANT_IDS=()
+
+usage() {
+    cat <<EOF
+migrate-mongo-auth.sh — enable SCRAM auth on pre-migration tenants.
+
+Usage:
+  migrate-mongo-auth.sh <tenant_id> [<tenant_id>...] [options]
+  migrate-mongo-auth.sh --all [options]
+
+Options:
+  --all                back up every tenant with status=active in the registry
+  --non-interactive    skip the "proceed?" prompt (for scripting / cron)
+  --dry-run            print what would happen; make no changes
+  -h, --help
+
+Per-tenant downtime (~30-60s each) while mongod bounces + bebop@ restarts.
+Rolling: one at a time; --all runs sequentially, no fan-out.
+EOF
+}
+
+while (( $# )); do
+    case "$1" in
+        --all)              ALL=true; shift ;;
+        --non-interactive)  NON_INTERACTIVE=true; shift ;;
+        --dry-run)          DRY_RUN=true; shift ;;
+        -h|--help)          usage; exit 0 ;;
+        --) shift; break ;;
+        -*) usage; die "unknown option: $1" ;;
+        *)  TENANT_IDS+=("$1"); shift ;;
+    esac
+done
+
+if [[ "$ALL" == "true" && ${#TENANT_IDS[@]} -gt 0 ]]; then
+    die "--all is mutually exclusive with explicit tenant ids"
+fi
+if [[ "$ALL" != "true" && ${#TENANT_IDS[@]} -eq 0 ]]; then
+    usage; die "specify at least one tenant_id, or --all"
+fi
+
+require_privileges
+
+if [[ ! -f "$SECRETS_FILE" ]]; then
+    die "secrets file not found: ${SECRETS_FILE}"
+fi
+# shellcheck disable=SC1090
+source "$SECRETS_FILE"
+
+if [[ ! -f "/etc/be-BOP-mongodb/keyfile" ]]; then
+    die "/etc/be-BOP-mongodb/keyfile missing — re-run host-bootstrap.sh first"
+fi
+
+registry_init
+
+if [[ "$ALL" == "true" ]]; then
+    mapfile -t TENANT_IDS < <(registry_list_by_status active)
+fi
+
+if (( ${#TENANT_IDS[@]} == 0 )); then
+    log_info "no active tenants to migrate"
+    exit 0
+fi
+
+log_info "candidates: ${#TENANT_IDS[@]} tenant(s): ${TENANT_IDS[*]}"
+if [[ "$NON_INTERACTIVE" != "true" && "$DRY_RUN" != "true" ]]; then
+    read -r -p "Proceed with rolling migration (~30-60s downtime per tenant) ? [y/N] " ans
+    case "$ans" in
+        y|Y|yes|YES) ;;
+        *) die "aborted by operator" ;;
+    esac
+fi
+
+# === Per-tenant migration ===============================================
+SUCCEEDED=()
+SKIPPED=()
+FAILED=()
+
+migrate_one() {
+    local tid="$1"
+    BEBOP_TOOLING_TENANT_ID="$tid"
+    export BEBOP_TOOLING_TENANT_ID
+
+    local port_env="/etc/be-BOP-mongodb/${tid}/port.env"
+    local cfg_env="/etc/be-BOP/${tid}/config.env"
+    if [[ ! -f "$port_env" ]]; then
+        die "port.env missing for '${tid}' (${port_env})"
+    fi
+    if [[ ! -f "$cfg_env" ]]; then
+        die "config.env missing for '${tid}' (${cfg_env})"
+    fi
+
+    # Idempotence: skip already-migrated tenants (MONGO_AUTH_ARGS non-empty).
+    if grep -qE '^MONGO_AUTH_ARGS=..' "$port_env"; then
+        log_info "already migrated (MONGO_AUTH_ARGS set in ${port_env}) — skip"
+        SKIPPED+=("$tid")
+        return 0
+    fi
+
+    local mongo_port mongo_db
+    mongo_port=$(registry_get_field "$tid" mongo_port)
+    mongo_db=$(registry_get_field "$tid" mongodb_database)
+    [[ -z "$mongo_port" || -z "$mongo_db" ]] \
+        && die "registry missing mongo_port / mongodb_database for '${tid}'"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[dry-run] would: stop bebop@${tid} → create SCRAM user 'bebop_${tid//-/_}' on db '${mongo_db}' via localhost exception → rewrite port.env with MONGO_AUTH_ARGS → daemon-reload + restart mongod@${tid} → rewrite config.env MONGODB_URL → start bebop@${tid}"
+        SUCCEEDED+=("$tid")
+        return 0
+    fi
+
+    log_info "step 1/6: stopping bebop@${tid}.service..."
+    run_privileged systemctl stop "bebop@${tid}.service" 2>/dev/null || true
+
+    log_info "step 2/6: ensuring mongod@${tid} is up (unauth) for user creation..."
+    run_privileged systemctl start "mongod@${tid}.service"
+    mongo_wait_ready "$mongo_port" 60 1 \
+        || die "mongod@${tid} did not become ready on port ${mongo_port}"
+
+    log_info "step 3/6: creating SCRAM user via localhost exception..."
+    local user="bebop_${tid//-/_}"
+    local pwd
+    pwd=$(mongo_generate_password)
+    mongo_create_user "$mongo_port" "$mongo_db" "$user" "$pwd" \
+        || die "SCRAM user creation failed for '${tid}'"
+
+    log_info "step 4/6: enabling auth in port.env + daemon-reload + restart mongod@${tid}..."
+    local tmp
+    tmp=$(mktemp)
+    printf 'MONGO_PORT=%s\nMONGO_AUTH_ARGS=--auth --keyFile /run/credentials/mongod@%s.service/keyfile\n' \
+        "$mongo_port" "$tid" > "$tmp"
+    run_privileged install -m 0640 "$tmp" "$port_env"
+    rm -f "$tmp"
+    run_privileged systemctl daemon-reload
+    run_privileged systemctl restart "mongod@${tid}.service"
+
+    log_info "step 5/6: verifying authenticated connection..."
+    local uri
+    uri=$(mongo_build_url_authed "$mongo_port" "$mongo_db" "$user" "$pwd")
+    mongo_wait_ready "$uri" 60 1 \
+        || die "mongod@${tid} did not answer authed ping after restart"
+
+    log_info "step 6/6: rewriting MONGODB_URL in ${cfg_env}..."
+    local cfg_tmp
+    cfg_tmp=$(mktemp)
+    # Preserve every other line; replace MONGODB_URL= if present, append if not.
+    if run_privileged grep -q '^MONGODB_URL=' "$cfg_env"; then
+        run_privileged sed -E "s|^MONGODB_URL=.*|MONGODB_URL=${uri}|" "$cfg_env" > "$cfg_tmp"
+    else
+        run_privileged cat "$cfg_env" > "$cfg_tmp"
+        printf 'MONGODB_URL=%s\n' "$uri" >> "$cfg_tmp"
+    fi
+    run_privileged install -m 0640 "$cfg_tmp" "${cfg_env}.new"
+    run_privileged mv -T "${cfg_env}.new" "$cfg_env"
+    rm -f "$cfg_tmp"
+
+    log_info "starting bebop@${tid}.service..."
+    run_privileged systemctl start "bebop@${tid}.service" \
+        || die "bebop@${tid} failed to start after migration"
+
+    log_info "migrated OK (user='${user}', role=dbOwner on '${mongo_db}')"
+    SUCCEEDED+=("$tid")
+}
+
+for t in "${TENANT_IDS[@]}"; do
+    if ( migrate_one "$t" ); then
+        :
+    else
+        FAILED+=("$t")
+        log_error "migrate-mongo-auth: ${t} FAILED — continuing with next tenant"
+    fi
+    BEBOP_TOOLING_TENANT_ID=""
+    export BEBOP_TOOLING_TENANT_ID
+done
+
+# === Summary ============================================================
+cat <<EOF
+
+==========================================================================
+  migrate-mongo-auth summary
+==========================================================================
+  Selected:   ${#TENANT_IDS[@]}
+  Migrated:   ${#SUCCEEDED[@]}  ${SUCCEEDED[*]:-}
+  Skipped:    ${#SKIPPED[@]}    ${SKIPPED[*]:-}   (already had auth)
+  Failed:     ${#FAILED[@]}     ${FAILED[*]:-}
+==========================================================================
+EOF
+
+if (( ${#FAILED[@]} > 0 )); then
+    notify_failure \
+        "[be-BOP tooling] migrate-mongo-auth FAILED on $(hostname)" \
+        "$(printf 'Failed tenants: %s\nSee: journalctl -t %s --since "1 hour ago"\n' \
+            "${FAILED[*]}" "$BEBOP_TOOLING_SYSLOG_IDENT")" \
+        || true
+    exit 1
+fi
+exit 0
