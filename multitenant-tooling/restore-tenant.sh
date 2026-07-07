@@ -190,10 +190,17 @@ ZIP_FILE="${WORKDIR}/backup.zip"
 EXTRACT_DIR="${WORKDIR}/extracted"
 
 log_info "downloading sftp://${SFTP_HOST}${SFTP_REMOTE_PATH}/${FTP_PATH}"
+# Provider-agnostic SFTP flags — mirror backup-tenants.sh. Compatible
+# with strict SFTP endpoints (Infomaniak Swiss Backup) and permissive
+# ones (OVH etc.) alike.
 rc_args=(
     --sftp-host "$SFTP_HOST"
     --sftp-port "${SFTP_PORT:-22}"
     --sftp-user "$SFTP_USER"
+    --sftp-set-modtime=false
+    --sftp-md5sum-command none
+    --sftp-sha1sum-command none
+    --sftp-disable-hashcheck
 )
 if [[ "$SFTP_PASSWORD_OR_KEY_PATH" == /* ]]; then
     rc_args+=(--sftp-key-file "$SFTP_PASSWORD_OR_KEY_PATH")

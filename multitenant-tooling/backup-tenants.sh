@@ -288,10 +288,19 @@ EOF
     # 8. upload to SFTP.
     local sftp_subpath="${tenant}/${timestamp}.zip.enc"
     log_info "backup: uploading to sftp://${SFTP_HOST}${SFTP_REMOTE_PATH}/${sftp_subpath}"
+    # Provider-agnostic SFTP flags. Infomaniak Swiss Backup rejects
+    # SetModTime and remote md5sum/sha1sum exec; OVH etc. accept both but
+    # don't require them. Skipping these features is compatible with any
+    # SFTP endpoint we've used — cost is one fewer integrity verification
+    # step on the remote after upload.
     local rc_args=(
         --sftp-host "$SFTP_HOST"
         --sftp-port "${SFTP_PORT:-22}"
         --sftp-user "$SFTP_USER"
+        --sftp-set-modtime=false
+        --sftp-md5sum-command none
+        --sftp-sha1sum-command none
+        --sftp-disable-hashcheck
     )
     if [[ "${SFTP_PASSWORD_OR_KEY_PATH}" == /* ]]; then
         rc_args+=(--sftp-key-file "$SFTP_PASSWORD_OR_KEY_PATH")

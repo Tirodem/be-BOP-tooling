@@ -599,10 +599,17 @@ upload_archive() {
     if [[ -z "${SFTP_HOST:-}" || -z "${SFTP_USER:-}" || -z "${SFTP_REMOTE_PATH:-}" ]]; then
         die "SFTP destination not fully configured (need SFTP_HOST/SFTP_USER/SFTP_REMOTE_PATH)"
     fi
+    # Provider-agnostic SFTP flags — mirror backup-tenants.sh. Works with
+    # strict endpoints (Infomaniak Swiss Backup) and permissive ones
+    # (OVH etc.) alike.
     local rc_args=(
         --sftp-host "$SFTP_HOST"
         --sftp-port "${SFTP_PORT:-22}"
         --sftp-user "$SFTP_USER"
+        --sftp-set-modtime=false
+        --sftp-md5sum-command none
+        --sftp-sha1sum-command none
+        --sftp-disable-hashcheck
     )
     if [[ "${SFTP_PASSWORD_OR_KEY_PATH:-}" == /* ]]; then
         rc_args+=(--sftp-key-file "$SFTP_PASSWORD_OR_KEY_PATH")
