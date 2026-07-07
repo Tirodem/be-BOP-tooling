@@ -127,6 +127,7 @@ chmod 0755 \
     "${INSTALL_DIR}/bebop-mongo-preflight.sh" \
     "${INSTALL_DIR}/tooling-mail-relay-preflight.sh" \
     "${INSTALL_DIR}/tenant-reaper.sh" \
+    "${INSTALL_DIR}/fix-acme-vhosts.sh" \
     "${INSTALL_DIR}/install.sh" 2>/dev/null || true
 # Hooks must be executable for certbot --manual-{auth,cleanup}-hook
 # to invoke them; safety net if the tarball didn't preserve +x.

@@ -651,7 +651,7 @@ class Handler(BaseHTTPRequestHandler):
             "bash", "-c",
             "source /usr/local/share/be-BOP-tooling/lib/log.sh; "
             "source /usr/local/share/be-BOP-tooling/lib/sudo.sh; "
-            "source /usr/local/share/be-BOP-tooling/lib/test-tenant.sh; "
+            "source /usr/local/share/be-BOP-tooling/lib/tenant.sh; "
             "test_tenant_expiry_init; test_tenant_expiry_lock; "
             f"test_tenant_expiry_add {tenant_id!r} {expires_at!r}; "
             "test_tenant_expiry_unlock",
@@ -672,7 +672,7 @@ class Handler(BaseHTTPRequestHandler):
                 "bash", "-c",
                 "source /usr/local/share/be-BOP-tooling/lib/log.sh; "
                 "source /usr/local/share/be-BOP-tooling/lib/sudo.sh; "
-                "source /usr/local/share/be-BOP-tooling/lib/test-tenant.sh; "
+                "source /usr/local/share/be-BOP-tooling/lib/tenant.sh; "
                 "test_tenant_expiry_lock; "
                 f"test_tenant_expiry_remove {tenant_id!r}; "
                 "test_tenant_expiry_unlock",

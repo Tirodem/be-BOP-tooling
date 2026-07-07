@@ -32,8 +32,8 @@ source "$BEBOP_TOOLING_LIB_DIR/log.sh"
 source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
 # shellcheck source=lib/notify.sh
 source "$BEBOP_TOOLING_LIB_DIR/notify.sh"
-# shellcheck source=lib/test-tenant.sh
-source "$BEBOP_TOOLING_LIB_DIR/test-tenant.sh"
+# shellcheck source=lib/tenant.sh
+source "$BEBOP_TOOLING_LIB_DIR/tenant.sh"
 
 BEBOP_TOOLING_SYSLOG_IDENT="tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 be-bop.io contributors
 #
-# test-tenant.sh — expiration tracking for ephemeral test tenants.
+# tenant.sh — expiration tracking for ephemeral test tenants.
 #
 # Test tenants created via the /deploy-test-tenant webhook are tracked in a
 # separate TSV file (NOT the main tenant registry, which is schema-locked at
