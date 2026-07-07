@@ -1669,9 +1669,12 @@ apply_deploy_defaults() {
     local file="$DEPLOY_DEFAULT_FILE"
     local phoenixd_def=true local_s3_def=true mail_relay_def=true
     if [[ -f "$file" ]] && jq -e . "$file" >/dev/null 2>&1; then
-        phoenixd_def=$(jq -r '.defaults.phoenixd // true' "$file")
-        local_s3_def=$(jq -r '.defaults.local_s3 // true' "$file")
-        mail_relay_def=$(jq -r '.defaults.mail_relay // true' "$file")
+        # NB: jq's `//` treats `false` as falsy, so `.k // true` returns
+        # true when .k is explicitly false. Use has() to only fall back
+        # on missing keys — preserves an explicit `false`.
+        phoenixd_def=$(jq -r 'if (.defaults | has("phoenixd")) then .defaults.phoenixd else true end' "$file")
+        local_s3_def=$(jq -r 'if (.defaults | has("local_s3")) then .defaults.local_s3 else true end' "$file")
+        mail_relay_def=$(jq -r 'if (.defaults | has("mail_relay")) then .defaults.mail_relay else true end' "$file")
     fi
     [[ -z "$ENABLE_PHOENIXD" ]] && ENABLE_PHOENIXD="$phoenixd_def"
     [[ -z "$ENABLE_MAIL_RELAY" ]] && ENABLE_MAIL_RELAY="$mail_relay_def"
