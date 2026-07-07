@@ -225,6 +225,16 @@ reset_secrets_to_template() {
     log "Reset $SECRETS_FILE from template"
 }
 
+DEPLOY_DEFAULT_TEMPLATE="${INSTALL_DIR}/templates/deploy-default.env.example"
+DEPLOY_DEFAULT_FILE="${SECRETS_DIR}/deploy-default.env"
+# Install deploy-default.env if missing. Never overwrite — operator's
+# deploy-time choices stay across install.sh re-runs. mode 0644 because
+# it's NOT secret (feature flags, not credentials).
+if [[ ! -f "$DEPLOY_DEFAULT_FILE" ]]; then
+    install -m 0644 "$DEPLOY_DEFAULT_TEMPLATE" "$DEPLOY_DEFAULT_FILE"
+    log "Created $DEPLOY_DEFAULT_FILE (mode 0644) — edit to change per-tenant defaults"
+fi
+
 if [[ ! -f "$SECRETS_FILE" ]]; then
     install -m 0600 "$TEMPLATE_PATH" "$SECRETS_FILE"
     seed_backup_encryption_key

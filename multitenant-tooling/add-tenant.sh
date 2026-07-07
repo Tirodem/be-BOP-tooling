@@ -128,10 +128,16 @@ readonly PHOENIXD_PASSWORD_INTERVAL=2
 
 # === CLI ================================================================
 SECRETS_FILE=/etc/be-BOP-tooling/secrets.env
+DEPLOY_DEFAULT_FILE=/etc/be-BOP-tooling/deploy-default.env
 TENANT_ID=""
 ADMIN_EMAIL=""
 EXTERNAL_DOMAIN=""    # set by --external-domain <fqdn>; empty = internal tenant
-NO_LOCAL_S3=false     # set by --no-local-s3; true = skip Garage/S3 plumbing
+# 3-state knobs: "" = not set by CLI (fall back to deploy-default.env then
+# hardcoded true), "true" / "false" = explicit CLI override.
+# Populated by apply_deploy_defaults() after sourcing deploy-default.env.
+NO_LOCAL_S3=""        # set by --local-s3 / --no-local-s3
+ENABLE_PHOENIXD=""    # set by --phoenixd / --no-phoenixd
+ENABLE_MAIL_RELAY=""  # set by --mail-relay / --no-mail-relay
 # Let's Encrypt staging mode. Use for repeated test provisionings so we
 # don't burn through prod's "5 duplicate certs per exact identifiers per
 # week" rate limit. Set via --staging on the CLI or BEBOP_LE_STAGING=true
@@ -139,7 +145,6 @@ NO_LOCAL_S3=false     # set by --no-local-s3; true = skip Garage/S3 plumbing
 # enable on tenants that will actually serve real traffic.
 : "${BEBOP_LE_STAGING:=false}"
 LE_STAGING="$BEBOP_LE_STAGING"
-ENABLE_PHOENIXD=true
 BEBOP_VERSION="latest"
 REACTIVATE=false
 DRY_RUN=false
@@ -173,7 +178,23 @@ Required:
                           account email AND for be-BOP tooling alerts
 
 Optional:
-  --no-phoenixd           skip the per-tenant phoenixd daemon (default: enabled)
+  --phoenixd / --no-phoenixd
+                          override the host default for the per-tenant
+                          phoenixd daemon (BEBOP_TENANT_DEFAULT_PHOENIXD
+                          in deploy-default.env)
+  --local-s3 / --no-local-s3
+                          override the host default for local Garage
+                          bucket + key provisioning (BEBOP_TENANT_DEFAULT_LOCAL_S3
+                          in deploy-default.env). --no-local-s3 implies
+                          no s3.<tenant>.<zone> DNS record, no S3 cert,
+                          no S3 nginx block; be-BOP starts with empty
+                          S3 env vars for external S3 config via the UI.
+  --mail-relay / --no-mail-relay
+                          override the host default for mail-relay
+                          provisioning (BEBOP_TENANT_DEFAULT_MAIL_RELAY
+                          in deploy-default.env). --no-mail-relay skips
+                          the phase entirely — the tenant has no outbound
+                          SMTP path.
   --bebop-version <tag>   GitHub release tag of be-BOP, or "latest" (default)
   --external-domain <fqdn>
                           deploy under <fqdn> instead of the default
@@ -184,11 +205,6 @@ Optional:
                           s3.<tenant_id>.<BEBOP_DNS_ZONE>. The main cert is
                           issued via HTTP-01 (separate from the S3 DNS-01
                           cert). Requires public IPv6 on the VDS.
-  --no-local-s3           do NOT provision a local Garage bucket + key for
-                          this tenant. be-BOP starts with empty S3 env vars
-                          so the merchant configures their own external S3
-                          via the be-BOP UI. Implies: no s3.<tenant>.<zone>
-                          DNS record, no S3 cert, no S3 nginx server block.
   --reactivate            restore a soft-deleted tenant (preserves data)
   --staging               issue certs against Let's Encrypt STAGING (untrusted
                           by browsers). Use for repeated test provisionings
@@ -225,7 +241,10 @@ while (( $# )); do
         --no-phoenixd)     ENABLE_PHOENIXD=false; shift ;;
         --bebop-version)   BEBOP_VERSION="$2"; shift 2 ;;
         --external-domain) EXTERNAL_DOMAIN="$2"; shift 2 ;;
+        --local-s3)        NO_LOCAL_S3=false; shift ;;
         --no-local-s3)     NO_LOCAL_S3=true; shift ;;
+        --mail-relay)      ENABLE_MAIL_RELAY=true; shift ;;
+        --no-mail-relay)   ENABLE_MAIL_RELAY=false; shift ;;
         --reactivate)      REACTIVATE=true; shift ;;
         --staging)         LE_STAGING=true; shift ;;
         --runtime-config)        parse_runtime_config_flag "false" "$2"; shift 2 ;;
@@ -1461,7 +1480,11 @@ run_fresh_creation() {
     phase_directories
     phase_release
     phase_phoenixd
-    phase_mail_relay
+    if [[ "$ENABLE_MAIL_RELAY" == "true" ]]; then
+        phase_mail_relay
+    else
+        log_info "phase 8b: mail-relay disabled (host default or --no-mail-relay) — skipping"
+    fi
     phase_config_env
     phase_certificate
     phase_nginx
@@ -1628,6 +1651,29 @@ preflight_purge_orphans() {
     fi
 }
 
+# Fill unset knobs (3-state: "" from CLI = not overridden) from the
+# deploy-default.env values, falling back to hardcoded "true" per knob
+# when the env var itself is unset. Called after sourcing both env
+# files, before phase execution.
+apply_deploy_defaults() {
+    if [[ -z "$ENABLE_PHOENIXD" ]]; then
+        ENABLE_PHOENIXD="${BEBOP_TENANT_DEFAULT_PHOENIXD:-true}"
+    fi
+    if [[ -z "$ENABLE_MAIL_RELAY" ]]; then
+        ENABLE_MAIL_RELAY="${BEBOP_TENANT_DEFAULT_MAIL_RELAY:-true}"
+    fi
+    if [[ -z "$NO_LOCAL_S3" ]]; then
+        # NO_LOCAL_S3 is the INVERSE of the LOCAL_S3 default — historical
+        # naming (--no-local-s3 opts out of the default-on behaviour).
+        if [[ "${BEBOP_TENANT_DEFAULT_LOCAL_S3:-true}" == "true" ]]; then
+            NO_LOCAL_S3=false
+        else
+            NO_LOCAL_S3=true
+        fi
+    fi
+    log_debug "deploy defaults resolved: phoenixd=${ENABLE_PHOENIXD} local_s3=$(if [[ "$NO_LOCAL_S3" == "false" ]]; then echo true; else echo false; fi) mail_relay=${ENABLE_MAIL_RELAY}"
+}
+
 main() {
     require_privileges
 
@@ -1636,6 +1682,16 @@ main() {
     fi
     # shellcheck disable=SC1090
     source "$SECRETS_FILE"
+
+    # Deploy defaults — non-secret ops config (feature toggles for the
+    # fresh tenant path). Missing file is tolerated (fall back to
+    # hardcoded "true" per knob) so hosts provisioned before the
+    # deploy-default introduction keep the pre-refactor behaviour.
+    if [[ -f "$DEPLOY_DEFAULT_FILE" ]]; then
+        # shellcheck disable=SC1090
+        source "$DEPLOY_DEFAULT_FILE"
+    fi
+    apply_deploy_defaults
 
     registry_init
     # The registry lock is NO LONGER held for the full duration of
