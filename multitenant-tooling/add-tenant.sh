@@ -934,10 +934,19 @@ phase_config_env() {
             "$marker" >> "$tmp"
     fi
     run_privileged install -d -m 0755 "/etc/be-BOP/${TENANT_ID}"
-    run_privileged install -m 0640 "$tmp" "$target"
+    # Atomic write: install then rename over the target. If a reapply is
+    # interrupted mid-run, the live config.env stays intact until the mv -T
+    # succeeds. Rename is atomic within the same filesystem.
+    local stage="${target}.new"
+    run_privileged install -m 0640 "$tmp" "$stage"
+    run_privileged mv -T "$stage" "$target"
     rm -f "$tmp"
-    txn_register_undo "config.env ${TENANT_ID}" \
-        "run_privileged rm -f '${target}'"
+    # rm-undo is destructive; register it ONLY on fresh creation. On reapply
+    # the tenant is live — a rollback that rm's config.env would 502 it.
+    if [[ "${DECISION_PATH:-fresh}" == "fresh" ]]; then
+        txn_register_undo "config.env ${TENANT_ID}" \
+            "run_privileged rm -f '${target}'"
+    fi
     log_info "config.env installed (mode 0640)"
 }
 
@@ -1165,11 +1174,19 @@ phase_nginx() {
             template_revision  "$TEMPLATE_REVISION" \
             >> "$tmp"
     fi
-    run_privileged install -m 0644 "$tmp" "$available"
+    # Atomic write: rename over the destination in the same filesystem so a
+    # reapply interrupted mid-write can't leave the live vhost broken.
+    local stage="${available}.new"
+    run_privileged install -m 0644 "$tmp" "$stage"
+    run_privileged mv -T "$stage" "$available"
     rm -f "$tmp"
     run_privileged ln -sfn "$available" "$enabled"
-    txn_register_undo "nginx vhost bebop-${TENANT_ID}" \
-        "run_privileged rm -f '${enabled}' '${available}' && run_privileged systemctl reload nginx"
+    # rm-undo is destructive; register it ONLY on fresh creation. A rollback
+    # of a live tenant that rm's its vhost yields immediate 502/404.
+    if [[ "${DECISION_PATH:-fresh}" == "fresh" ]]; then
+        txn_register_undo "nginx vhost bebop-${TENANT_ID}" \
+            "run_privileged rm -f '${enabled}' '${available}' && run_privileged systemctl reload nginx"
+    fi
     if [[ "$DRY_RUN" != "true" ]]; then
         # Quarantine any pre-existing broken vhost (cert missing or
         # syntax invalid) before `nginx -t` — otherwise a completely
