@@ -182,15 +182,34 @@ pre_swap_mongodump() {
     local new_tag_flat="${new_tag//\//_}"
     local dump_dir="${dump_root}/${ts}-${old_tag_flat}-${new_tag_flat}"
     run_privileged install -d -m 0700 "$dump_root"
+    # Cleanup: sweep entries left over from the pre-fix path bug — any
+    # top-level dir that DOESN'T contain bebop_<db> as an immediate child
+    # is a nested-tree crud (tag `/` were creating filesystem subdirs).
+    # Flat/valid dumps have bebop_<db>/ directly under the timestamp dir.
+    local entry entry_name
+    for entry in "$dump_root"/*/; do
+        [[ -d "$entry" ]] || continue
+        entry_name=$(basename "$entry")
+        if run_privileged test -d "${entry}bebop_${mongo_db}"; then
+            continue
+        fi
+        log_warn "pre-upgrade: removing malformed dump entry '${entry_name}' (nested layout from a pre-fix run)"
+        run_privileged rm -rf -- "$entry"
+    done
     run_privileged install -d -m 0700 "$dump_dir"
     log_info "pre-upgrade: mongodumping ${mongo_db} → ${dump_dir}"
     # Use the URI-aware mongo_dump_db helper.
     if ! mongo_dump_db "$conn_target" "$mongo_db" "$dump_dir"; then
         die "pre-upgrade dump FAILED — refusing to swap symlink (data integrity risk)"
     fi
+    # Retention: keep the last 5 dumps.
+    # NB: `(( var++ ))` returns the OLD value as exit status, so `(( 0++ ))`
+    # returns 1 (false) → under `set -e` that silently kills the script on
+    # the first iteration. Use pre-increment `(( ++var ))` which returns
+    # the NEW value (always ≥ 1 here → truthy → no set -e trigger).
     local keep=5 name kept=0
     while IFS= read -r name; do
-        (( kept < keep )) && { (( kept++ )); continue; }
+        (( kept < keep )) && { (( ++kept )); continue; }
         run_privileged rm -rf -- "${dump_root}/${name}"
     done < <(run_privileged bash -c "cd '${dump_root}' && ls -1t 2>/dev/null" || true)
 }
