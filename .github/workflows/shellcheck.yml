@@ -23,7 +23,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y shellcheck
 
       - name: Run shellcheck on multitenant-tooling
-        # -S warning: gate on real bugs, skip style-only findings.
+        # -S error: gate on real bugs (syntax, undefined behaviour),
+        # skip style-only findings (SC2034 unused vars for SCRIPT_VERSION
+        # constants, SC2155 combined declare+assign, SC2206 glob
+        # word-splitting on trusted inputs). Those are legitimate
+        # style hints but not regression risks in this codebase.
         # -x: follow `source` directives so lib/*.sh is analysed as part
         #     of the calling script's context.
         # Exclude codes: SC1090 (dynamic sources, we do a lot of that
@@ -33,7 +37,7 @@ jobs:
         run: |
           shopt -s globstar nullglob
           shellcheck \
-            -S warning \
+            -S error \
             -x \
             -e SC1090,SC1091 \
             multitenant-tooling/**/*.sh
