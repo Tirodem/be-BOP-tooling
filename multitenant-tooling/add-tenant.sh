@@ -654,7 +654,9 @@ phase_dns() {
 # Phase 4: per-tenant local mongod (port.env + start unit + init RS)
 phase_mongo() {
     log_info "phase 4: per-tenant mongod (port=${MONGO_PORT})..."
-    # Write port.env BEFORE starting the unit (EnvironmentFile= reads it).
+    # Write port.env WITHOUT auth first: we need the localhost exception
+    # window (no --auth active yet) to create the first user. Auth gets
+    # switched on further down after the user exists.
     run_privileged install -d -m 0755 "/etc/be-BOP-mongodb/${TENANT_ID}"
     local tmp
     tmp=$(mktemp)
@@ -672,9 +674,49 @@ phase_mongo() {
         mongo_wait_ready "$MONGO_PORT" 60 1 \
             || die "mongod@${TENANT_ID} did not become ready on 127.0.0.1:${MONGO_PORT} within 60s (check 'journalctl -u mongod@${TENANT_ID}')"
         mongo_init_rs "$MONGO_PORT"
+
+        # Create the tenant's SCRAM user via the localhost exception (mongod
+        # still running without --auth). Then enable auth in port.env and
+        # bounce mongod@ to activate --auth --keyFile. Every subsequent
+        # mongosh call in this run uses the authed URI.
+        MONGO_USER="bebop_${TENANT_ID//-/_}"
+        MONGO_PASSWORD=$(mongo_generate_password)
+        mongo_create_user "$MONGO_PORT" "$MONGO_DB_NAME" "$MONGO_USER" "$MONGO_PASSWORD" \
+            || die "phase_mongo: failed to create SCRAM user for tenant ${TENANT_ID}"
+
+        # Enable auth: rewrite port.env with MONGO_AUTH_ARGS, daemon-reload
+        # (needed for the LoadCredential= in the template to be picked up
+        # even though it's already there — safer against split states),
+        # then restart mongod@ so it comes up with --auth --keyFile.
+        _write_mongo_port_env_with_auth
+        run_privileged systemctl daemon-reload
+        run_privileged systemctl restart "mongod@${TENANT_ID}.service"
+        MONGO_URL=$(mongo_build_url_authed "$MONGO_PORT" "$MONGO_DB_NAME" \
+            "$MONGO_USER" "$MONGO_PASSWORD")
+        mongo_wait_ready "$MONGO_URL" 60 1 \
+            || die "mongod@${TENANT_ID} did not answer authed ping after --auth activation"
+        log_info "mongo: auth enabled for ${TENANT_ID} (user='${MONGO_USER}', role=dbOwner on '${MONGO_DB_NAME}')"
+    else
+        # In dry-run, still compute the URL so downstream phases have
+        # something coherent to render.
+        MONGO_USER="bebop_${TENANT_ID//-/_}"
+        MONGO_PASSWORD="dry-run-placeholder"
+        MONGO_URL=$(mongo_build_url_authed "$MONGO_PORT" "$MONGO_DB_NAME" \
+            "$MONGO_USER" "$MONGO_PASSWORD")
     fi
-    MONGO_URL=$(mongo_build_url "$MONGO_PORT" "$MONGO_DB_NAME")
-    log_info "Mongo: db=${MONGO_DB_NAME} on 127.0.0.1:${MONGO_PORT} (rs=rs0)"
+    log_info "Mongo: db=${MONGO_DB_NAME} on 127.0.0.1:${MONGO_PORT} (rs=rs0, auth=on)"
+}
+
+# Rewrite /etc/be-BOP-mongodb/<tid>/port.env with MONGO_AUTH_ARGS enabled.
+# Called from phase_mongo (fresh) and migrate-mongo-auth.sh — kept in
+# add-tenant.sh so both paths share the exact format.
+_write_mongo_port_env_with_auth() {
+    local tmp
+    tmp=$(mktemp)
+    printf 'MONGO_PORT=%s\nMONGO_AUTH_ARGS=--auth --keyFile /run/credentials/mongod@%s.service/keyfile\n' \
+        "$MONGO_PORT" "$TENANT_ID" > "$tmp"
+    run_privileged install -m 0640 "$tmp" "/etc/be-BOP-mongodb/${TENANT_ID}/port.env"
+    rm -f "$tmp"
 }
 
 # Phase 5: Garage bucket + key + grant + quota
@@ -1488,8 +1530,15 @@ run_reactivation() {
             PHOENIXD_HTTP_PASSWORD=$(run_privileged grep -oP '^http-password=\K\S+' "$conf" 2>/dev/null || true)
         fi
     fi
-    # Rebuild the local MONGO_URL from registry-stored port + db name.
-    MONGO_URL=$(mongo_build_url "$MONGO_PORT" "$MONGO_DB_NAME")
+    # Preserve the existing MONGODB_URL from config.env — for migrated /
+    # new tenants it carries the SCRAM user:password. Fallback to unauth
+    # URL only if config.env doesn't declare one (shouldn't happen on
+    # reactivate, safety net).
+    MONGO_URL=""
+    if run_privileged test -f "/etc/be-BOP/${TENANT_ID}/config.env"; then
+        MONGO_URL=$(run_privileged grep -oP '^MONGODB_URL=\K.*' "/etc/be-BOP/${TENANT_ID}/config.env" 2>/dev/null || true)
+    fi
+    [[ -z "$MONGO_URL" ]] && MONGO_URL=$(mongo_build_url "$MONGO_PORT" "$MONGO_DB_NAME")
     # Pull existing Garage creds (we don't recreate the key; secret is unknown).
     if run_privileged test -f "/etc/be-BOP/${TENANT_ID}/config.env"; then
         GARAGE_KEY_ID=$(run_privileged grep -oP '^S3_KEY_ID=\K.*' "/etc/be-BOP/${TENANT_ID}/config.env" 2>/dev/null || true)
@@ -1521,13 +1570,16 @@ run_reapply() {
     # mongod boot + RS init are guaranteed by bebop-mongo-preflight.sh at
     # bebop@ startup (ExecStartPre). Nothing to do here — the systemctl
     # restart at phase 12 will trigger the preflight.
-    MONGO_URL=$(mongo_build_url "$MONGO_PORT" "$MONGO_DB_NAME")
-    # Re-derive existing Garage creds + phoenixd password from current config.env.
+    MONGO_URL=""
+    # Re-derive existing Garage creds + phoenixd password from current config.env
+    # AND preserve the MONGODB_URL (with SCRAM creds for auth-enabled tenants).
     if run_privileged test -f "/etc/be-BOP/${TENANT_ID}/config.env"; then
+        MONGO_URL=$(run_privileged grep -oP '^MONGODB_URL=\K.*' "/etc/be-BOP/${TENANT_ID}/config.env" 2>/dev/null || true)
         GARAGE_KEY_ID=$(run_privileged grep -oP '^S3_KEY_ID=\K.*' "/etc/be-BOP/${TENANT_ID}/config.env" 2>/dev/null || true)
         GARAGE_KEY_SECRET=$(run_privileged grep -oP '^S3_KEY_SECRET=\K.*' "/etc/be-BOP/${TENANT_ID}/config.env" 2>/dev/null || true)
         PHOENIXD_HTTP_PASSWORD=$(run_privileged grep -oP '^PHOENIXD_HTTP_PASSWORD=\K.*' "/etc/be-BOP/${TENANT_ID}/config.env" 2>/dev/null || true)
     fi
+    [[ -z "$MONGO_URL" ]] && MONGO_URL=$(mongo_build_url "$MONGO_PORT" "$MONGO_DB_NAME")
     if [[ "$BEBOP_VERSION" != "latest" || -z "$(release_get_current_tag "$TENANT_ID")" ]]; then
         phase_release
     else

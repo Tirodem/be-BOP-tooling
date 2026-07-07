@@ -309,8 +309,15 @@ run_privileged systemctl stop "phoenixd@${TENANT_ID}.service" 2>/dev/null || tru
 # Mongo
 if $HAS_MONGO_DUMP; then
     log_info "mongo: dropping + restoring db=${MONGO_DB}"
-    mongo_db_drop "$MONGO_PORT" "$MONGO_DB" || true
-    mongo_restore_db "$MONGO_PORT" "$MONGO_DB" "${EXTRACT_DIR}/mongo-dump"
+    # Prefer authed URI from tenant's config.env (post-migration).
+    MONGO_TARGET="$MONGO_PORT"
+    CFG_FOR_MONGO="/etc/be-BOP/${TENANT_ID}/config.env"
+    if run_privileged test -r "$CFG_FOR_MONGO"; then
+        MONGODB_URL=$(run_privileged grep -oP '^MONGODB_URL=\K.*' "$CFG_FOR_MONGO" 2>/dev/null || true)
+        [[ -n "$MONGODB_URL" ]] && MONGO_TARGET="$MONGODB_URL"
+    fi
+    mongo_db_drop "$MONGO_TARGET" "$MONGO_DB" || true
+    mongo_restore_db "$MONGO_TARGET" "$MONGO_DB" "${EXTRACT_DIR}/mongo-dump"
 fi
 
 # Garage

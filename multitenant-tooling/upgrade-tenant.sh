@@ -159,8 +159,17 @@ pre_swap_mongodump() {
     mongo_db=$(registry_get_field "$tid" mongodb_database)
     [[ -z "$mongo_port" || -z "$mongo_db" ]] \
         && die "pre-upgrade dump: registry missing mongo_port / mongodb_database for ${tid}"
-    if ! mongo_wait_ready "$mongo_port" 60 1; then
-        die "pre-upgrade dump: mongod@${tid} not ready on port ${mongo_port}"
+    # Prefer the authed URI from config.env when present (post-migration
+    # tenants). Fallback to unauth port otherwise.
+    local conn_target="$mongo_port"
+    local cfg="/etc/be-BOP/${tid}/config.env"
+    if run_privileged test -r "$cfg"; then
+        local mongodb_url
+        mongodb_url=$(run_privileged grep -oP '^MONGODB_URL=\K.*' "$cfg" 2>/dev/null || true)
+        [[ -n "$mongodb_url" ]] && conn_target="$mongodb_url"
+    fi
+    if ! mongo_wait_ready "$conn_target" 60 1; then
+        die "pre-upgrade dump: mongod@${tid} not ready"
     fi
     local dump_root="/var/lib/be-BOP/${tid}/pre-upgrade-dumps"
     local ts
@@ -168,12 +177,9 @@ pre_swap_mongodump() {
     local dump_dir="${dump_root}/${ts}-${old_tag}-${new_tag}"
     run_privileged install -d -m 0700 "$dump_root"
     run_privileged install -d -m 0700 "$dump_dir"
-    log_info "pre-upgrade: mongodumping ${mongo_db} from 127.0.0.1:${mongo_port} to ${dump_dir}"
-    if ! run_privileged mongodump \
-        --host="127.0.0.1:${mongo_port}" \
-        --db="${mongo_db}" \
-        --out="${dump_dir}" \
-        --quiet; then
+    log_info "pre-upgrade: mongodumping ${mongo_db} → ${dump_dir}"
+    # Use the URI-aware mongo_dump_db helper.
+    if ! mongo_dump_db "$conn_target" "$mongo_db" "$dump_dir"; then
         die "pre-upgrade dump FAILED — refusing to swap symlink (data integrity risk)"
     fi
     local keep=5 name kept=0
@@ -249,9 +255,17 @@ main() {
         mongo_db=$(registry_get_field "$TENANT_ID" mongodb_database)
         [[ -z "$mongo_port" || -z "$mongo_db" ]] \
             && die "runtime-config: registry missing mongo_port / mongodb_database for ${TENANT_ID}"
+        # Same URI-preference logic as pre_swap_mongodump.
+        local conn_target="$mongo_port"
+        local cfg="/etc/be-BOP/${TENANT_ID}/config.env"
+        if run_privileged test -r "$cfg"; then
+            local mongodb_url
+            mongodb_url=$(run_privileged grep -oP '^MONGODB_URL=\K.*' "$cfg" 2>/dev/null || true)
+            [[ -n "$mongodb_url" ]] && conn_target="$mongodb_url"
+        fi
         log_info "applying ${#RUNTIME_CONFIG_OVERRIDES[@]} runtime-config override(s)..."
-        if ! mongo_wait_ready "$mongo_port" 60 1; then
-            die "runtime-config: mongod@${TENANT_ID} not ready on port ${mongo_port}"
+        if ! mongo_wait_ready "$conn_target" 60 1; then
+            die "runtime-config: mongod@${TENANT_ID} not ready"
         fi
         local entry lock rest key value
         for entry in "${RUNTIME_CONFIG_OVERRIDES[@]}"; do
@@ -259,7 +273,7 @@ main() {
             rest="${entry#*:}"
             key="${rest%%=*}"
             value="${rest#*=}"
-            mongo_runtime_config_upsert "$mongo_port" "$mongo_db" "$key" "$value" "$lock" \
+            mongo_runtime_config_upsert "$conn_target" "$mongo_db" "$key" "$value" "$lock" \
                 || die "runtime-config: upsert failed for ${key}"
         done
     fi

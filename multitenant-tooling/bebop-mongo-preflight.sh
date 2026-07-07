@@ -94,14 +94,42 @@ if ! systemctl is-active --quiet "mongod@${TENANT_ID}.service"; then
         || die "could not start mongod@${TENANT_ID}"
 fi
 
-# 2. Wait for the port to accept connections. 30s is a generous ceiling
-#    for a cold WiredTiger start on a small VDS.
-mongo_wait_ready "$MONGO_PORT" 30 1 \
+# 2. Detect auth mode. When MONGO_AUTH_ARGS is set (from port.env), the
+#    tenant has been migrated to authenticated mongod — an unauth port
+#    ping would fail. We fetch the MONGODB_URL from the tenant's
+#    config.env (contains SCRAM user:password) and use it as connection
+#    target for the wait + RS-status check.
+CONN_TARGET="$MONGO_PORT"
+if [[ -n "${MONGO_AUTH_ARGS:-}" ]]; then
+    CONFIG_ENV="/etc/be-BOP/${TENANT_ID}/config.env"
+    if [[ -r "$CONFIG_ENV" ]]; then
+        MONGODB_URL=$(grep -oP '^MONGODB_URL=\K.*' "$CONFIG_ENV" 2>/dev/null || true)
+        if [[ -n "$MONGODB_URL" ]]; then
+            CONN_TARGET="$MONGODB_URL"
+            log_debug "preflight: auth-enabled, using authenticated URI from ${CONFIG_ENV}"
+        fi
+    fi
+fi
+
+# 3. Wait for connections. 30s is a generous ceiling for a cold
+#    WiredTiger start on a small VDS.
+mongo_wait_ready "$CONN_TARGET" 30 1 \
     || die "mongod@${TENANT_ID} did not become ready on 127.0.0.1:${MONGO_PORT}"
 
-# 3. Initialise the single-node RS if needed. mongo_init_rs is idempotent
-#    (checks rs.status().ok first) — normal cost on a healthy tenant is
-#    one mongosh ping.
-mongo_init_rs "$MONGO_PORT"
+# 4. Verify or initialise the single-node RS.
+#    - Unauth mode: mongo_init_rs is idempotent (checks then initiates).
+#    - Auth mode: RS was initiated BEFORE auth was enabled (add-tenant.sh
+#      phase_mongo or migrate-mongo-auth.sh). We only VERIFY status here
+#      — re-initiating would fail without cluster-admin auth. If the RS
+#      is somehow broken on an auth-enabled tenant, that's out of the
+#      preflight's remit and needs operator intervention.
+if [[ -n "${MONGO_AUTH_ARGS:-}" ]]; then
+    if ! mongosh --quiet "$CONN_TARGET" --eval "rs.status().ok" 2>/dev/null \
+            | grep -q '^1$'; then
+        die "mongod@${TENANT_ID} RS not OK on auth-enabled tenant; preflight cannot recover — operator needed"
+    fi
+else
+    mongo_init_rs "$MONGO_PORT"
+fi
 
-log_info "preflight OK for '${TENANT_ID}' (mongo port=${MONGO_PORT})"
+log_info "preflight OK for '${TENANT_ID}' (mongo port=${MONGO_PORT}, auth=${MONGO_AUTH_ARGS:+on})"

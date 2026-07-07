@@ -193,7 +193,15 @@ do_backup_tenant() {
     # 1. mongodump (replica-set oplog gives a consistent snapshot).
     log_info "backup: mongodump db=${mongo_db} port=${mongo_port}"
     mkdir -p "${workdir}/mongo-dump"
-    mongo_dump_db "$mongo_port" "$mongo_db" "${workdir}/mongo-dump" \
+    # Prefer authed URI from config.env when present (post-migration).
+    local mongo_target="$mongo_port"
+    local cfg="/etc/be-BOP/${tenant}/config.env"
+    if run_privileged test -r "$cfg"; then
+        local mongodb_url
+        mongodb_url=$(run_privileged grep -oP '^MONGODB_URL=\K.*' "$cfg" 2>/dev/null || true)
+        [[ -n "$mongodb_url" ]] && mongo_target="$mongodb_url"
+    fi
+    mongo_dump_db "$mongo_target" "$mongo_db" "${workdir}/mongo-dump" \
         || die "mongodump failed for ${mongo_db}"
 
     # 2. Garage bucket sync (only when the tenant has a local Garage bucket).
