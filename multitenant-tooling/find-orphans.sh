@@ -67,7 +67,7 @@ source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
 # shellcheck source=lib/registry.sh
 source "$BEBOP_TOOLING_LIB_DIR/registry.sh"
 
-BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
+BEBOP_TOOLING_SYSLOG_IDENT="tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
 
 MODE="report"

@@ -2,19 +2,19 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 be-bop.io contributors
 #
-# test-tenant-reaper.sh — purge ephemeral test tenants past their TTL.
+# tenant-reaper.sh — purge ephemeral test tenants past their TTL.
 #
 # Reads /var/lib/be-BOP/test-tenant-expiry.tsv (managed by the deploy API
 # daemon + this script), finds every entry whose expires_at < now, runs
 # `remove-tenant.sh <id> --purge --i-know-what-im-doing --non-interactive`
 # on each, then drops the row from the expiry registry on success.
 #
-# Designed to run unattended via systemd timer (bebop-test-tenant-reaper.timer,
+# Designed to run unattended via systemd timer (tooling-tenant-reaper.timer,
 # default 5 min cadence). Safe to run by hand too; no flags.
 
 set -eEuo pipefail
 
-readonly SCRIPT_NAME="test-tenant-reaper"
+readonly SCRIPT_NAME="tenant-reaper"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ -d "$SCRIPT_DIR/lib" ]]; then
@@ -22,7 +22,7 @@ if [[ -d "$SCRIPT_DIR/lib" ]]; then
 elif [[ -d /usr/local/share/be-BOP-tooling/lib ]]; then
     BEBOP_TOOLING_LIB_DIR=/usr/local/share/be-BOP-tooling/lib
 else
-    echo "test-tenant-reaper: cannot locate lib/ directory" >&2
+    echo "tenant-reaper: cannot locate lib/ directory" >&2
     exit 1
 fi
 
@@ -35,7 +35,7 @@ source "$BEBOP_TOOLING_LIB_DIR/notify.sh"
 # shellcheck source=lib/test-tenant.sh
 source "$BEBOP_TOOLING_LIB_DIR/test-tenant.sh"
 
-BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
+BEBOP_TOOLING_SYSLOG_IDENT="tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
 
 main() {
@@ -82,7 +82,7 @@ main() {
         if (( orphans_count > 0 )); then
             log_warn "post-reap orphan check: ${orphans_count} orphan(s) detected"
             notify_failure \
-                "[be-BOP tooling] test-tenant-reaper: ${orphans_count} orphan(s) detected post-reap" \
+                "[be-BOP tooling] tenant-reaper: ${orphans_count} orphan(s) detected post-reap" \
                 "The reaper finished, but find-orphans.sh reports ${orphans_count} tenant id(s) with host artefacts and no registry entry. This usually means remove-tenant.sh's teardown missed one or more artefact classes.
 
 Full report:

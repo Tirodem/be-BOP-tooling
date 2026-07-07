@@ -9,7 +9,7 @@
 #
 # One entry per line, `#` for comments, empty lines ignored, lowercased at
 # load time. Reload on daemon restart:
-#     sudo systemctl restart bebop-test-tenant-api
+#     sudo systemctl restart tooling-tenant-api
 #
 # This file is the escape hatch for terms whose substring form would produce
 # unacceptable false positives on legitimate French/English tenant names.

@@ -133,4 +133,4 @@ monitor creation is currently not feasible against Kuma 1.x.)
 | `nginx -t` fails after re-run               | Hand-edited vhost? The default catch-all is regenerated on every run; unrelated vhosts under `sites-available` are not touched |
 | Uptime Kuma container `Exited (137)`        | OOM. Bump VDS RAM or set memory limit on the container |
 
-See also: `journalctl -t bebop-tooling-host-bootstrap`.
+See also: `journalctl -t tooling-host-bootstrap`.

@@ -12,7 +12,7 @@ OnBootSec=2min
 OnUnitActiveSec=5min
 AccuracySec=30s
 Persistent=true
-Unit=bebop-test-tenant-reaper.service
+Unit=tooling-tenant-reaper.service
 
 [Install]
 WantedBy=timers.target

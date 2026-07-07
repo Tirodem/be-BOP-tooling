@@ -276,7 +276,7 @@ registry_lock() {
         die "registry: lock already held in this process"
     fi
     exec {_REGISTRY_FD}>"$REGISTRY_LOCK_PATH"
-    # Timeout observed under concurrent onboarding via test-tenant-api :
+    # Timeout observed under concurrent onboarding via tenant-api :
     # add-tenant.sh holds the lock for the FULL run (phases 1-14, ~40-60s)
     # because critical section wasn't narrowed. 3 orders arriving within
     # 30s made the 3rd time out at 30s. Bumped to 120s so 4-5 concurrent

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 be-bop.io contributors
 #
-# bebop-mail-relay-preflight.sh — ExecStartPre for bebop-mail-relay.service.
+# tooling-mail-relay-preflight.sh — ExecStartPre for tooling-mail-relay.service.
 #
 # Guarantees that the tooling MongoDB (mongod@tooling on 127.0.0.1:27100)
 # is:
@@ -17,8 +17,8 @@
 
 set -eEuo pipefail
 
-readonly SCRIPT_NAME="bebop-mail-relay-preflight"
-readonly TOOLING_SERVICE="bebop-tooling-mongodb.service"
+readonly SCRIPT_NAME="tooling-mail-relay-preflight"
+readonly TOOLING_SERVICE="mailrelay-mongodb.service"
 readonly TOOLING_PORT=27100
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,9 +32,9 @@ else
     exit 1
 fi
 
-BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
+BEBOP_TOOLING_SYSLOG_IDENT="${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
-# Called with the '+' prefix in bebop-mail-relay.service — real root already.
+# Called with the '+' prefix in tooling-mail-relay.service — real root already.
 export RUNNING_AS_ROOT=true
 
 # shellcheck source=lib/log.sh

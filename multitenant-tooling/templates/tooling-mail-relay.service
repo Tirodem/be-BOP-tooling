@@ -7,7 +7,7 @@
 # design: swap the outbound side without changing anything tenant-side.
 #
 # State (tenants creds + send_log + alert_state) lives in
-# bebop-tooling-mongodb.service on 127.0.0.1:27100 (dedicated host-wide
+# mailrelay-mongodb.service on 127.0.0.1:27100 (dedicated host-wide
 # instance provisioned by host-bootstrap step_setup_tooling_mongodb).
 # ExecStartPre guarantees the instance is up + replica-set-initialised
 # before the daemon starts.
@@ -15,15 +15,15 @@
 [Unit]
 Description=be-BOP — mail relay (fake SMTP shim, forwards to transactional provider)
 Documentation=https://be-bop.io/
-After=network-online.target bebop-tooling-mongodb.service
-Wants=network-online.target bebop-tooling-mongodb.service
+After=network-online.target mailrelay-mongodb.service
+Wants=network-online.target mailrelay-mongodb.service
 
 [Service]
 Type=simple
 DynamicUser=yes
 EnvironmentFile=/etc/be-BOP-tooling/secrets.env
 EnvironmentFile=-/etc/be-BOP-tooling/mail-relay.env
-ExecStartPre=+/usr/local/bin/bebop-mail-relay-preflight.sh
+ExecStartPre=+/usr/local/bin/tooling-mail-relay-preflight.sh
 ExecStart=/usr/bin/python3 /usr/local/share/be-BOP-tooling/lib/mail-relay.py
 Restart=always
 RestartSec=5
@@ -32,7 +32,7 @@ TimeoutStopSec=15
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=bebop-mail-relay
+SyslogIdentifier=tooling-mail-relay
 
 # Hardening — the daemon only needs its state dir + network out, no privileges.
 NoNewPrivileges=yes

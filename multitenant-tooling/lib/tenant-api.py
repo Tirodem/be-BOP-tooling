@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 be-bop.io contributors
 """
-test-tenant-api.py — HTTP daemon that receives a paid-order webhook from
+tenant-api.py — HTTP daemon that receives a paid-order webhook from
 a be-BOP "spawn a test tenant" shop and provisions an ephemeral test tenant
 on this host.
 
@@ -54,7 +54,7 @@ from email.message import EmailMessage
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-LOG = logging.getLogger("test-tenant-api")
+LOG = logging.getLogger("tenant-api")
 
 # --- Config (env-driven; populated in main()) -------------------------------
 CFG: dict = {}

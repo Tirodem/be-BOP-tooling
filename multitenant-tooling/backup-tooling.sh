@@ -51,7 +51,7 @@ source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
 # shellcheck source=lib/notify.sh
 source "$BEBOP_TOOLING_LIB_DIR/notify.sh"
 
-BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
+BEBOP_TOOLING_SYSLOG_IDENT="tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
 
 SECRETS_FILE=/etc/be-BOP-tooling/secrets.env
@@ -119,7 +119,7 @@ collect_stage() {
                 | xargs -0 -r -I{} install -m 0600 "{}" "${stage}{}"
         done < <(find "$base" -mindepth 1 -maxdepth 1 -type d)
     done
-    # mongodump of the tooling database (bebop-tooling-mongodb, port
+    # mongodump of the tooling database (mailrelay-mongodb, port
     # 27100 by design). Dump lands under a stable relative path inside
     # the archive so restore-tooling can find it.
     install -d -m 0755 "${stage}/mongodump-tooling"

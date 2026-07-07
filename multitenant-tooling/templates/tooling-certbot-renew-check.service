@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 be-bop.io contributors
 #
-# bebop-certbot-renew-check.service — runs `certbot renew --dry-run` and
+# tooling-certbot-renew-check.service — runs `certbot renew --dry-run` and
 # notifies operators (Zulip + SMTP) on failure. Triggered weekly by
-# bebop-certbot-renew-check.timer; can also be invoked manually:
-#   sudo systemctl start bebop-certbot-renew-check.service
+# tooling-certbot-renew-check.timer; can also be invoked manually:
+#   sudo systemctl start tooling-certbot-renew-check.service
 #
 # Catches silent renewal failures for BOTH DNS-01 (internal tenants via the
 # provider-agnostic hook) AND HTTP-01 (external-domain tenants via the default vhost's
@@ -19,4 +19,4 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/certbot-renew-check.sh
-SyslogIdentifier=bebop-tooling-cert-renew-check
+SyslogIdentifier=tooling-certbot-renew-check

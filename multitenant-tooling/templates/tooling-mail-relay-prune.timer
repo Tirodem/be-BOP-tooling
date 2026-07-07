@@ -11,7 +11,7 @@ Documentation=https://be-bop.io/
 [Timer]
 OnCalendar=*-*-* 03:15:00 UTC
 Persistent=true
-Unit=bebop-mail-relay-prune.service
+Unit=tooling-mail-relay-prune.service
 
 [Install]
 WantedBy=timers.target

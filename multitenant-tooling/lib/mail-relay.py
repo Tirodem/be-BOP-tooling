@@ -12,7 +12,7 @@
 #
 # Design decisions locked in the design phase (see project discussion):
 #   - Per-VDS colocated relay (127.0.0.1 loopback only, one relay per VDS)
-#   - Python + aiosmtpd (consistency with lib/test-tenant-api.py)
+#   - Python + aiosmtpd (consistency with lib/tenant-api.py)
 #   - Mongo state on mongod@tooling (127.0.0.1:27100, db bebop_tooling)
 #   - Upstream credential in /etc/be-BOP-tooling/secrets.env
 #   - Provider-agnostic: swap MAIL_RELAY_UPSTREAM_* to change target.
@@ -97,7 +97,7 @@ MONGO_DB_NAME = os.environ.get("BEBOP_TOOLING_MONGO_DB", "bebop_tooling")
 LISTEN_HOST = os.environ.get("BEBOP_MAIL_RELAY_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("BEBOP_MAIL_RELAY_PORT", "2525"))
 
-LOG = logging.getLogger("bebop-mail-relay")
+LOG = logging.getLogger("tooling-mail-relay")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -721,7 +721,7 @@ class AuthController(Controller):
             authenticator=auth_check,
             auth_required=True,
             auth_require_tls=False,  # milestone 1: no TLS yet (see file header)
-            hostname="bebop-mail-relay",
+            hostname="tooling-mail-relay",
         )
 
 

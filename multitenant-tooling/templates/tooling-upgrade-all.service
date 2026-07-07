@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 be-bop.io contributors
 #
-# bebop-upgrade-all.service — fleet-wide be-BOP upgrade run, invoked by
-# bebop-upgrade-all.timer. Default schedule: daily at 04:00 server time.
+# tooling-upgrade-all.service — fleet-wide be-BOP upgrade run, invoked by
+# tooling-upgrade-all.timer. Default schedule: daily at 04:00 server time.
 # Installed (and toggled enable/disable) by host-bootstrap.sh based on
 # BEBOP_NIGHTLY_UPGRADE_ENABLED in /etc/be-BOP-tooling/secrets.env.
 
@@ -14,4 +14,4 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/upgrade-all.sh --continue-on-failure --non-interactive
-SyslogIdentifier=bebop-tooling-upgrade-all-cron
+SyslogIdentifier=tooling-upgrade-all

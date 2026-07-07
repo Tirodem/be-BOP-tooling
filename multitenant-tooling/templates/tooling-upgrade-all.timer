@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright (C) 2026 be-bop.io contributors
 #
-# bebop-upgrade-all.timer — daily trigger for bebop-upgrade-all.service.
+# tooling-upgrade-all.timer — daily trigger for tooling-upgrade-all.service.
 #   - OnCalendar 04:00 server time (per-tenant rollback handled by
 #     upgrade-tenant.sh; --continue-on-failure prevents one bad tenant
 #     from blocking the rest).

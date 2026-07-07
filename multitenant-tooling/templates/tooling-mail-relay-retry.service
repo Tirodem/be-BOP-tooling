@@ -11,7 +11,7 @@
 [Unit]
 Description=be-BOP — mail-relay upstream declaration sweep
 Documentation=https://be-bop.io/
-After=network-online.target bebop-mail-relay.service
+After=network-online.target tooling-mail-relay.service
 Wants=network-online.target
 
 [Service]
@@ -20,4 +20,4 @@ EnvironmentFile=/etc/be-BOP-tooling/secrets.env
 ExecStart=/usr/local/bin/mail-relay-ctl.sh retry-upstream --all
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=bebop-mail-relay-retry
+SyslogIdentifier=tooling-mail-relay-retry

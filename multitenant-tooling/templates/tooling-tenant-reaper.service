@@ -2,7 +2,7 @@
 # Copyright (C) 2026 be-bop.io contributors
 #
 # Periodic sweep that purges ephemeral test tenants past their TTL.
-# Triggered by bebop-test-tenant-reaper.timer (default 5 min cadence).
+# Triggered by tooling-tenant-reaper.timer (default 5 min cadence).
 
 [Unit]
 Description=be-BOP — purge expired test tenants
@@ -12,11 +12,11 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/test-tenant-reaper.sh
+ExecStart=/usr/local/bin/tenant-reaper.sh
 # Reaper exits non-zero only on actual scripting errors; per-tenant failures
 # are logged inside the sweep and retried next tick. Keep RemainAfterExit=no
 # so the service unit doesn't stick in `active (exited)` between ticks.
 RemainAfterExit=no
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=bebop-tooling-test-tenant-reaper
+SyslogIdentifier=tooling-tenant-reaper

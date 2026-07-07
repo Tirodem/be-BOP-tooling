@@ -4,7 +4,7 @@
 # (Unicode NFKD + ASCII fold + lowercase + `[^a-z0-9]+` collapsed to `-`).
 # One entry per line, `#` for comments, empty lines ignored, lowercased at
 # load time. Reload on daemon restart:
-#     sudo systemctl restart bebop-test-tenant-api
+#     sudo systemctl restart tooling-tenant-api
 #
 # Only put entries whose substring appearance in ANY legitimate French/English
 # tenant slug is essentially impossible (very low false-positive risk).

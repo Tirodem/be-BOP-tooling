@@ -7,7 +7,7 @@
 # per-tenant mongods to any code that scans by that convention
 # (find-orphans, list-tenants, backup-tenants…). A distinct service name
 # keeps that boundary crystal clear: `mongod@<X>` = per-tenant,
-# `bebop-tooling-mongodb` = host infrastructure.
+# `mailrelay-mongodb` = host infrastructure.
 #
 # Currently hosts the mail-relay state (tenants creds, send_log,
 # alert_state) in database `bebop_tooling`. Any future host-wide tool
@@ -40,7 +40,7 @@ LimitNOFILE=65536
 LimitMEMLOCK=infinity
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=bebop-tooling-mongodb
+SyslogIdentifier=mailrelay-mongodb
 
 # Hardening — same posture as mongod@.service.
 NoNewPrivileges=yes

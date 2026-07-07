@@ -60,7 +60,7 @@ source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
 # shellcheck source=lib/mongo.sh
 source "$BEBOP_TOOLING_LIB_DIR/mongo.sh"
 
-BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
+BEBOP_TOOLING_SYSLOG_IDENT="tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
 
 # retry-upstream needs SCALEWAY_TEM_* and provider DNS creds from
@@ -77,7 +77,7 @@ fi
 MONGO_PORT="${BEBOP_TOOLING_MONGO_PORT:-27100}"
 MONGO_DB="${BEBOP_TOOLING_MONGO_DB:-bebop_tooling}"
 
-# The tenant slug rules must match add-tenant.sh / test-tenant-api.py.
+# The tenant slug rules must match add-tenant.sh / tenant-api.py.
 # Enforced here as a defence-in-depth: any tenant_id we let through to
 # mongosh gets interpolated into a JS single-quoted string literal, so a
 # stray apostrophe would be a real risk without this whitelist.
@@ -341,7 +341,7 @@ cmd_retry_upstream() {
     # setup_domain, teardown_domain). This function only knows that surface.
     #
     # No-op if the operator hasn't set up an upstream yet — the fake SMTP
-    # works standalone. The timer (bebop-mail-relay-retry.timer) invokes
+    # works standalone. The timer (tooling-mail-relay-retry.timer) invokes
     # this every 15 min so provisioned tenants get their upstream declared
     # as soon as credentials appear in secrets.env. When invoked manually
     # by an operator (from CLI, single tenant), we surface the no-op as
@@ -461,7 +461,7 @@ _do_upstream_recheck() {
 main() {
     (( $# == 0 )) && { usage; exit 1; }
     require_privileges
-    # Verify bebop-tooling-mongodb is reachable AND its replica set is
+    # Verify mailrelay-mongodb is reachable AND its replica set is
     # in a state we can write against. A raw ping succeeds even when the
     # node is SECONDARY without a primary elected (or in STARTUP), so the
     # ping alone would let us continue to the actual command and hit the
@@ -469,14 +469,14 @@ main() {
     # cmd_create/cmd_delete/etc. mongo_init_rs is idempotent (skips if
     # rs.status().ok already), so calling it here on every invocation
     # both self-heals a fresh mongod (never started as part of a
-    # bebop-mail-relay boot cycle) and validates the RS state before any
+    # tooling-mail-relay boot cycle) and validates the RS state before any
     # write. Costs one mongosh ping on a healthy tenant.
     if ! run_privileged mongosh --quiet --port "$MONGO_PORT" \
             --eval 'db.runCommand({ping:1}).ok' "$MONGO_DB" >/dev/null 2>&1; then
-        die "cannot reach bebop-tooling-mongodb on 127.0.0.1:${MONGO_PORT} — is it running?"
+        die "cannot reach mailrelay-mongodb on 127.0.0.1:${MONGO_PORT} — is it running?"
     fi
     if ! mongo_init_rs "$MONGO_PORT" >/dev/null 2>&1; then
-        die "bebop-tooling-mongodb: replica set not initialised on 127.0.0.1:${MONGO_PORT} and mongo_init_rs failed"
+        die "mailrelay-mongodb: replica set not initialised on 127.0.0.1:${MONGO_PORT} and mongo_init_rs failed"
     fi
     local cmd="$1"; shift
     case "$cmd" in

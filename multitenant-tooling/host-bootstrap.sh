@@ -79,7 +79,7 @@ source "$BEBOP_TOOLING_LIB_DIR/dns_provider.sh"
 # shellcheck source=lib/nginx.sh
 source "$BEBOP_TOOLING_LIB_DIR/nginx.sh"
 
-BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
+BEBOP_TOOLING_SYSLOG_IDENT="tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
 
 # === Constants (overridable via environment) ===========================
@@ -707,14 +707,14 @@ EOF
 # catches silent renewal failures for BOTH DNS-01 (internal tenants) and
 # HTTP-01 (external-domain tenants). See B1 in BACKLOG.
 step_setup_cert_renewal_monitoring() {
-    log_info "Installing bebop-certbot-renew-check.{service,timer}..."
+    log_info "Installing tooling-certbot-renew-check.{service,timer}..."
     local u
-    for u in bebop-certbot-renew-check.service bebop-certbot-renew-check.timer; do
+    for u in tooling-certbot-renew-check.service tooling-certbot-renew-check.timer; do
         maybe_run run_privileged install -m 0644 \
             "${BEBOP_TOOLING_TEMPLATE_DIR}/${u}" "/etc/systemd/system/${u}"
     done
     maybe_run run_privileged systemctl daemon-reload
-    maybe_run run_privileged systemctl enable --now bebop-certbot-renew-check.timer
+    maybe_run run_privileged systemctl enable --now tooling-certbot-renew-check.timer
 }
 
 step_start_nginx() {
@@ -734,6 +734,41 @@ step_remove_legacy_ovh_ini() {
         log_info "Removing legacy /etc/letsencrypt/ovh.ini (now obsolete)..."
         maybe_run run_privileged rm -f /etc/letsencrypt/ovh.ini
     fi
+}
+
+# === Rename legacy systemd unit names ===================================
+# Historical unit names used `bebop-*`, `bebop-tooling-*`, `bebop-test-*`
+# prefixes inconsistently. The infra-scoped units are now uniformly
+# `tooling-*` (or `mailrelay-*` for the mail-relay mongo). This step
+# stops + disables + removes the old unit files on hosts that were
+# provisioned before the rename, so daemon-reload picks up the new
+# names cleanly and no stale duplicate keeps running.
+# Idempotent: absent files are silently skipped (2>/dev/null || true).
+step_cleanup_legacy_unit_names() {
+    log_info "Cleaning up any legacy unit names left over from pre-rename hosts..."
+    local u
+    for u in \
+            bebop-certbot-renew-check.service \
+            bebop-certbot-renew-check.timer \
+            bebop-mail-relay.service \
+            bebop-mail-relay-prune.service \
+            bebop-mail-relay-prune.timer \
+            bebop-mail-relay-retry.service \
+            bebop-mail-relay-retry.timer \
+            bebop-test-tenant-api.service \
+            bebop-test-tenant-reaper.service \
+            bebop-test-tenant-reaper.timer \
+            bebop-tooling-mongodb.service \
+            bebop-upgrade-all.service \
+            bebop-upgrade-all.timer; do
+        if [[ -f "/etc/systemd/system/${u}" ]]; then
+            log_info "  legacy unit ${u} → stop + disable + remove"
+            maybe_run run_privileged systemctl stop "$u" 2>/dev/null || true
+            maybe_run run_privileged systemctl disable "$u" 2>/dev/null || true
+            maybe_run run_privileged rm -f "/etc/systemd/system/${u}"
+        fi
+    done
+    maybe_run run_privileged systemctl daemon-reload
 }
 
 # === systemd template units =============================================
@@ -775,7 +810,7 @@ step_install_tooling_libs_and_scripts() {
     fi
     log_info "Installing per-tenant scripts to /usr/local/bin/..."
     local script
-    for script in add-tenant.sh remove-tenant.sh migrate-tenant.sh migrate-mongo-auth.sh upgrade-tenant.sh upgrade-all.sh list-tenants.sh find-orphans.sh mail-relay-ctl.sh mail-relay-upstream-sync.sh tenant-cli.sh gh-rate-limit.sh certbot-renew-check.sh backup-tenants.sh backup-tooling.sh restore-tenant.sh restore-tooling.sh freeze-tenant.sh bebop-exit-handler.sh bebop-exit-worker.sh bebop-mongo-preflight.sh bebop-mail-relay-preflight.sh test-tenant-reaper.sh; do
+    for script in add-tenant.sh remove-tenant.sh migrate-tenant.sh migrate-mongo-auth.sh upgrade-tenant.sh upgrade-all.sh list-tenants.sh find-orphans.sh mail-relay-ctl.sh mail-relay-upstream-sync.sh tenant-cli.sh gh-rate-limit.sh certbot-renew-check.sh backup-tenants.sh backup-tooling.sh restore-tenant.sh restore-tooling.sh freeze-tenant.sh bebop-exit-handler.sh bebop-exit-worker.sh bebop-mongo-preflight.sh tooling-mail-relay-preflight.sh tenant-reaper.sh; do
         if [[ -f "${SCRIPT_DIR}/${script}" ]]; then
             maybe_run run_privileged install -m 0755 "${SCRIPT_DIR}/${script}" "/usr/local/bin/${script}"
         else
@@ -785,26 +820,26 @@ step_install_tooling_libs_and_scripts() {
 }
 
 # === Nightly fleet upgrade timer (optional) ============================
-# Installs bebop-upgrade-all.{service,timer} unconditionally (cheap, no
+# Installs tooling-upgrade-all.{service,timer} unconditionally (cheap, no
 # behavior unless the timer is enabled). Then enables OR disables the
 # timer based on BEBOP_NIGHTLY_UPGRADE_ENABLED in secrets.env. Toggling
 # the var + re-running host-bootstrap.sh is the supported on/off switch.
 step_setup_nightly_upgrade() {
-    log_info "Installing bebop-upgrade-all.{service,timer} units..."
+    log_info "Installing tooling-upgrade-all.{service,timer} units..."
     local u
-    for u in bebop-upgrade-all.service bebop-upgrade-all.timer; do
+    for u in tooling-upgrade-all.service tooling-upgrade-all.timer; do
         maybe_run run_privileged install -m 0644 \
             "${BEBOP_TOOLING_TEMPLATE_DIR}/${u}" "/etc/systemd/system/${u}"
     done
     maybe_run run_privileged systemctl daemon-reload
     case "${BEBOP_NIGHTLY_UPGRADE_ENABLED:-}" in
         true|1|yes|on)
-            log_info "BEBOP_NIGHTLY_UPGRADE_ENABLED=true — enabling bebop-upgrade-all.timer (daily 04:00)"
-            maybe_run run_privileged systemctl enable --now bebop-upgrade-all.timer
+            log_info "BEBOP_NIGHTLY_UPGRADE_ENABLED=true — enabling tooling-upgrade-all.timer (daily 04:00)"
+            maybe_run run_privileged systemctl enable --now tooling-upgrade-all.timer
             ;;
         *)
-            log_info "BEBOP_NIGHTLY_UPGRADE_ENABLED unset/false — keeping bebop-upgrade-all.timer disabled"
-            maybe_run run_privileged systemctl disable --now bebop-upgrade-all.timer 2>/dev/null || true
+            log_info "BEBOP_NIGHTLY_UPGRADE_ENABLED unset/false — keeping tooling-upgrade-all.timer disabled"
+            maybe_run run_privileged systemctl disable --now tooling-upgrade-all.timer 2>/dev/null || true
             ;;
     esac
 }
@@ -1212,21 +1247,21 @@ EOF
 
 # Helper: install + enable the systemd units (daemon + reaper). Idempotent.
 _deploy_api_install_systemd() {
-    log_info "Installing bebop-test-tenant-api / -reaper systemd units..."
+    log_info "Installing tooling-tenant-api / -reaper systemd units..."
     local u
-    for u in bebop-test-tenant-api.service \
-             bebop-test-tenant-reaper.service \
-             bebop-test-tenant-reaper.timer; do
+    for u in tooling-tenant-api.service \
+             tooling-tenant-reaper.service \
+             tooling-tenant-reaper.timer; do
         run_privileged install -m 0644 \
             "${BEBOP_TOOLING_TEMPLATE_DIR}/${u}" "/etc/systemd/system/${u}"
     done
     run_privileged systemctl daemon-reload
-    run_privileged systemctl enable --now bebop-test-tenant-api.service
-    run_privileged systemctl enable --now bebop-test-tenant-reaper.timer
+    run_privileged systemctl enable --now tooling-tenant-api.service
+    run_privileged systemctl enable --now tooling-tenant-reaper.timer
     # See mail-relay note: `enable --now` on an active unit does not
     # re-exec the daemon. try-restart forces a re-exec when active,
-    # no-op otherwise. Ensures lib/test-tenant-api.py updates take effect.
-    run_privileged systemctl try-restart bebop-test-tenant-api.service
+    # no-op otherwise. Ensures lib/tenant-api.py updates take effect.
+    run_privileged systemctl try-restart tooling-tenant-api.service
 }
 
 # Helper: provision the optional public exposure layer (DNS + cert + nginx
@@ -1359,7 +1394,7 @@ step_setup_test_tenant_deploy_api() {
 }
 
 # === tooling MongoDB ====================================================
-# A dedicated `bebop-tooling-mongodb.service` instance holds the state
+# A dedicated `mailrelay-mongodb.service` instance holds the state
 # used by tools whose scope is host-wide (not per-tenant). Today that
 # means the mail-relay (tenants creds, send_log, alert_state). Runs on
 # a fixed port well above the per-tenant range so it can never collide
@@ -1375,7 +1410,7 @@ step_setup_test_tenant_deploy_api() {
 # its data dir — no merchant data ever landed there.
 step_setup_tooling_mongodb() {
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[dry-run] would install bebop-tooling-mongodb.service and migrate any old mongod@tooling"
+        log_info "[dry-run] would install mailrelay-mongodb.service and migrate any old mongod@tooling"
         return 0
     fi
     if run_privileged systemctl list-unit-files 'mongod@tooling.service' \
@@ -1388,13 +1423,13 @@ step_setup_tooling_mongodb() {
         run_privileged rm -rf /etc/be-BOP-mongodb/tooling /var/lib/be-BOP-mongodb/tooling
         run_privileged systemctl daemon-reload
     fi
-    log_info "Provisioning bebop-tooling-mongodb.service..."
+    log_info "Provisioning mailrelay-mongodb.service..."
     run_privileged install -m 0644 \
-        "${BEBOP_TOOLING_TEMPLATE_DIR}/bebop-tooling-mongodb.service" \
-        /etc/systemd/system/bebop-tooling-mongodb.service
+        "${BEBOP_TOOLING_TEMPLATE_DIR}/mailrelay-mongodb.service" \
+        /etc/systemd/system/mailrelay-mongodb.service
     run_privileged systemctl daemon-reload
-    run_privileged systemctl enable --now bebop-tooling-mongodb.service
-    log_info "bebop-tooling-mongodb listening on 127.0.0.1:27100 (db=bebop_tooling)"
+    run_privileged systemctl enable --now mailrelay-mongodb.service
+    log_info "mailrelay-mongodb listening on 127.0.0.1:27100 (db=bebop_tooling)"
 }
 
 # === mail-relay =========================================================
@@ -1404,32 +1439,32 @@ step_setup_tooling_mongodb() {
 # Idempotent — safe to re-run on updates.
 step_setup_mail_relay() {
     if [[ "$DRY_RUN" == "true" ]]; then
-        log_info "[dry-run] would install bebop-mail-relay + retry timer systemd units"
+        log_info "[dry-run] would install tooling-mail-relay + retry timer systemd units"
         return 0
     fi
-    log_info "Installing bebop-mail-relay systemd unit..."
+    log_info "Installing tooling-mail-relay systemd unit..."
     local u
-    for u in bebop-mail-relay.service \
-             bebop-mail-relay-retry.service \
-             bebop-mail-relay-retry.timer \
-             bebop-mail-relay-prune.service \
-             bebop-mail-relay-prune.timer; do
+    for u in tooling-mail-relay.service \
+             tooling-mail-relay-retry.service \
+             tooling-mail-relay-retry.timer \
+             tooling-mail-relay-prune.service \
+             tooling-mail-relay-prune.timer; do
         run_privileged install -m 0644 \
             "${BEBOP_TOOLING_TEMPLATE_DIR}/${u}" "/etc/systemd/system/${u}"
     done
     run_privileged systemctl daemon-reload
-    run_privileged systemctl enable --now bebop-mail-relay.service
-    run_privileged systemctl enable --now bebop-mail-relay-retry.timer
-    run_privileged systemctl enable --now bebop-mail-relay-prune.timer
+    run_privileged systemctl enable --now tooling-mail-relay.service
+    run_privileged systemctl enable --now tooling-mail-relay-retry.timer
+    run_privileged systemctl enable --now tooling-mail-relay-prune.timer
     # `enable --now` on an ALREADY active service is a no-op — it doesn't
     # re-exec the daemon, so any change to lib/mail-relay.py that we just
     # installed is NOT picked up. try-restart forces a re-exec when the
     # unit is active, no-op otherwise (fresh install where enable --now
     # just started it). Idempotent.
-    run_privileged systemctl try-restart bebop-mail-relay.service
-    log_info "bebop-mail-relay listening on 127.0.0.1:2525"
-    log_info "bebop-mail-relay-retry sweeping every 15 minutes"
-    log_info "bebop-mail-relay-prune firing nightly (03:15 UTC, 90-day retention)"
+    run_privileged systemctl try-restart tooling-mail-relay.service
+    log_info "tooling-mail-relay listening on 127.0.0.1:2525"
+    log_info "tooling-mail-relay-retry sweeping every 15 minutes"
+    log_info "tooling-mail-relay-prune firing nightly (03:15 UTC, 90-day retention)"
 }
 
 # Render a "Capabilities" block for the end-of-bootstrap summary. Each
@@ -1577,6 +1612,7 @@ main() {
     step_start_nginx
 
     step_remove_legacy_ovh_ini
+    step_cleanup_legacy_unit_names
     step_install_template_units
     step_install_tooling_libs_and_scripts
     step_init_registry

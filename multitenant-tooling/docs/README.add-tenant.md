@@ -125,7 +125,7 @@ but don't abort the rollback.
 | `mongod@<id> did not become ready within 60s`    | Check `journalctl -u mongod@<id>`; usually a port collision, dbPath permissions, or AVX-missing CPU. |
 | Rollback also failed (network glitch)            | Check the alert email/Zulip for the list of un-undone steps; clean them by hand or via `remove-tenant.sh --purge` then re-run |
 | `cert: timeout waiting for DNS-01 propagation`   | Re-run; DNS-provider propagation is usually < 60 s but can spike. Or increase `--dns-propagation-seconds` in phase_certificate (currently 60). |
-| `pnpm install failed`                            | Network or disk issue. Check `journalctl -t bebop-tooling-add-tenant`, fix, re-run. |
+| `pnpm install failed`                            | Network or disk issue. Check `journalctl -t tooling-add-tenant`, fix, re-run. |
 | `healthcheck failed for https://<id>.<zone>/`    | Service crashed at startup. Check `journalctl -u bebop@<id>` and `journalctl -u phoenixd@<id>`. The rollback will still complete. |
 
 ## Concurrency

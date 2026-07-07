@@ -49,7 +49,7 @@ source "$BEBOP_TOOLING_LIB_DIR/healthcheck.sh"
 # shellcheck source=lib/notify.sh
 source "$BEBOP_TOOLING_LIB_DIR/notify.sh"
 
-BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
+BEBOP_TOOLING_SYSLOG_IDENT="tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
 
 # === CLI ================================================================

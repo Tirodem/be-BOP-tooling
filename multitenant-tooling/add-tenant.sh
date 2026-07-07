@@ -85,7 +85,7 @@ on_script_exit() {
         local body
         body=$(printf 'Tenant: %s\nDecision path: %s\nFailure exit code: %d\nUndo steps attempted: %d\n\nSee journalctl -t %s --since "1 hour ago" for the full log.\n' \
             "${TENANT_ID:-(unset)}" "${DECISION_PATH:-fresh}" "$rc" \
-            "$(txn_size 2>/dev/null || echo 0)" "${BEBOP_TOOLING_SYSLOG_IDENT:-bebop-tooling-add-tenant}")
+            "$(txn_size 2>/dev/null || echo 0)" "${BEBOP_TOOLING_SYSLOG_IDENT:-tooling-add-tenant}")
         notify_failure \
             "[be-BOP tooling] add-tenant ${TENANT_ID:-(unset)} FAILED" \
             "$body" || true
@@ -279,7 +279,7 @@ has_local_s3()    { [[ "$NO_LOCAL_S3" != "true" ]]; }
 
 # Tag log lines with the tenant id from now on.
 BEBOP_TOOLING_TENANT_ID="$TENANT_ID"
-BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
+BEBOP_TOOLING_SYSLOG_IDENT="tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_TENANT_ID BEBOP_TOOLING_SYSLOG_IDENT
 export RUN_NON_INTERACTIVE VERBOSE DRY_RUN
 
@@ -847,7 +847,7 @@ phase_phoenixd() {
 # is decoupled from provisioning: a separate systemd-timer sweep scans
 # the relay for tenants with upstream_domain_id IS NULL and declares
 # them upstream when the operator has provided provider credentials.
-# See mail-upstream-sync.sh + bebop-mail-relay-upstream-sync.timer.
+# See mail-upstream-sync.sh + tooling-mail-relay-upstream-sync.timer.
 #
 # Idempotent: skipped if the operator queued a manual --runtime-config
 # smtp=... override (BYO or migration), or if the tenant already has a
@@ -1413,7 +1413,7 @@ EOF
     if [[ "${DECISION_PATH:-fresh}" == "fresh" && "$ENABLE_PHOENIXD" == "true" ]]; then
         # phoenixd seed + HTTP password control the merchant's Lightning wallet.
         # Print them ONLY if stdout is an interactive TTY. Otherwise (piped, tee,
-        # captured by a daemon like test-tenant-api) write them to a root-owned
+        # captured by a daemon like tenant-api) write them to a root-owned
         # 0600 file and print only its path — prevents leak into install.log,
         # journal captures, notification bodies, etc.
         if [[ -t 1 ]]; then
@@ -1480,7 +1480,7 @@ run_fresh_creation() {
 # Fire-and-forget: kick a detached systemd-run transient unit that runs
 # the upstream sync script (5 attempts × 60 s) in the background. The
 # main deploy critical path — including the API endpoint of
-# test-tenant-api.py — returns as soon as systemd-run has scheduled the
+# tenant-api.py — returns as soon as systemd-run has scheduled the
 # unit (sub-second). Nothing here waits on Scaleway's async validation.
 #
 # Skipped when the upstream provider isn't configured (the retry timer
@@ -1504,7 +1504,7 @@ spawn_upstream_sync() {
     # --collect: systemd garbage-collects the transient unit after exit.
     # Unique unit name per tenant so concurrent onboardings don't clash
     # and an operator can inspect one at a time via `systemctl status`.
-    local unit="bebop-mail-relay-upstream-sync-${TENANT_ID}"
+    local unit="tooling-mail-relay-upstream-sync-${TENANT_ID}"
     if run_privileged systemd-run --collect \
             --unit="$unit" \
             --description="Scaleway TEM sync for ${TENANT_ID} (5x60s)" \

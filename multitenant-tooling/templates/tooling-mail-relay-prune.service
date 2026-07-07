@@ -9,12 +9,12 @@
 [Unit]
 Description=be-BOP — nightly prune of the mail-relay send_log
 Documentation=https://be-bop.io/
-After=bebop-mail-relay.service
-Wants=bebop-mail-relay.service
+After=tooling-mail-relay.service
+Wants=tooling-mail-relay.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/mail-relay-ctl.sh prune-send-log --older-than-days=90
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=bebop-mail-relay-prune
+SyslogIdentifier=tooling-mail-relay-prune

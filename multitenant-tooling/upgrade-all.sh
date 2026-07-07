@@ -106,7 +106,7 @@ while (( $# )); do
     esac
 done
 
-BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
+BEBOP_TOOLING_SYSLOG_IDENT="tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
 export RUN_NON_INTERACTIVE VERBOSE DRY_RUN
 
@@ -154,7 +154,7 @@ main() {
     require_privileges
 
     # Global mutex: prevent a manual upgrade-all run from overlapping with
-    # the nightly bebop-upgrade-all.timer (or a second manual invocation).
+    # the nightly tooling-upgrade-all.timer (or a second manual invocation).
     # Concurrent runs would double-restart the same tenants, double-consume
     # the GitHub quota, and race on rollback logic. `flock -n` returns
     # immediately if the lock is held — bail cleanly with a clear error.

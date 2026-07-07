@@ -7,7 +7,7 @@
 # Best-effort background sync of a tenant's upstream sending domain to
 # the transactional provider (Scaleway TEM in V1). Spawned as a detached
 # systemd-run transient unit at the end of add-tenant.sh, so the deploy
-# critical path (and the API endpoint of test-tenant-api.py) never waits
+# critical path (and the API endpoint of tenant-api.py) never waits
 # on Scaleway's async DNS re-verification.
 #
 # Behaviour:
@@ -22,11 +22,11 @@
 #        `status == "checked"`.
 #
 #   If all attempts are exhausted without status=checked, exits 1 with
-#   a WARN — the 15-min bebop-mail-relay-retry.timer is still there as
+#   a WARN — the 15-min tooling-mail-relay-retry.timer is still there as
 #   a safety net.
 #
 # Observability:
-#   journalctl -u bebop-mail-relay-upstream-sync-<tenant_id>.service
+#   journalctl -u tooling-mail-relay-upstream-sync-<tenant_id>.service
 #
 # Not intended for interactive use; the operator equivalent is
 # `sudo mail-relay-ctl.sh retry-upstream <tid>`.
@@ -60,7 +60,7 @@ if [[ -r "$SECRETS_FILE" ]]; then
     source "$SECRETS_FILE"
 fi
 
-BEBOP_TOOLING_SYSLOG_IDENT="bebop-mail-relay-upstream-sync"
+BEBOP_TOOLING_SYSLOG_IDENT="tooling-mail-relay-upstream-sync"
 BEBOP_TOOLING_TENANT_ID="$TENANT_ID"
 export BEBOP_TOOLING_SYSLOG_IDENT BEBOP_TOOLING_TENANT_ID
 
@@ -113,5 +113,5 @@ for (( attempt = 1; attempt <= RETRY_ATTEMPTS; attempt++ )); do
     fi
 done
 
-log_warn "exhausted ${RETRY_ATTEMPTS} × ${RETRY_INTERVAL_SECONDS}s attempts without status=checked for '${TENANT_ID}' — bebop-mail-relay-retry.timer (15 min) will keep trying"
+log_warn "exhausted ${RETRY_ATTEMPTS} × ${RETRY_INTERVAL_SECONDS}s attempts without status=checked for '${TENANT_ID}' — tooling-mail-relay-retry.timer (15 min) will keep trying"
 exit 1

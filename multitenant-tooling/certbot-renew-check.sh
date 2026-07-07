@@ -3,7 +3,7 @@
 # Copyright (C) 2026 be-bop.io contributors
 #
 # certbot-renew-check.sh — run `certbot renew --dry-run` and notify on
-# failure. Invoked by bebop-certbot-renew-check.timer (weekly) or manually.
+# failure. Invoked by tooling-certbot-renew-check.timer (weekly) or manually.
 #
 # Why a separate check (vs relying on certbot's own daily timer):
 # certbot's daily timer DOES renew but does NOT notify on failure — a
@@ -27,7 +27,7 @@ else
     exit 1
 fi
 
-BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
+BEBOP_TOOLING_SYSLOG_IDENT="tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
 
 # shellcheck source=lib/log.sh

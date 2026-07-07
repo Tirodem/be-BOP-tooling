@@ -19,7 +19,7 @@ Wants=network-online.target
 Type=simple
 EnvironmentFile=/etc/be-BOP-tooling/secrets.env
 EnvironmentFile=-/etc/be-BOP-tooling/deploy-api.env
-ExecStart=/usr/bin/python3 /usr/local/share/be-BOP-tooling/lib/test-tenant-api.py
+ExecStart=/usr/bin/python3 /usr/local/share/be-BOP-tooling/lib/tenant-api.py
 Restart=always
 RestartSec=5
 TimeoutStartSec=30
@@ -27,7 +27,7 @@ TimeoutStopSec=15
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=bebop-tooling-test-tenant-api
+SyslogIdentifier=tooling-tenant-api
 
 # We deliberately do NOT sandbox aggressively (DynamicUser=no, no
 # ProtectSystem=strict): the daemon forks add-tenant.sh which writes to

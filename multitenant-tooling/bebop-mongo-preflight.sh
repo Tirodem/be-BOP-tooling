@@ -48,7 +48,7 @@ else
     exit 1
 fi
 
-BEBOP_TOOLING_SYSLOG_IDENT="bebop-tooling-${SCRIPT_NAME}"
+BEBOP_TOOLING_SYSLOG_IDENT="tooling-${SCRIPT_NAME}"
 BEBOP_TOOLING_TENANT_ID="$TENANT_ID"
 export BEBOP_TOOLING_SYSLOG_IDENT BEBOP_TOOLING_TENANT_ID
 # Invoked with the '+' prefix in bebop@.service, i.e. as real root —
