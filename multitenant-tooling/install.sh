@@ -42,6 +42,21 @@
 #   --reset-secrets   Force the reset path (back up + re-seed) even when
 #                     the existing secrets.env has filled values. Useful in
 #                     --non-interactive runs where the default is "keep".
+#   --clean           Wipe /opt/be-BOP-tooling AND /etc/be-BOP-tooling
+#                     before running the fresh install. Refuses if
+#                     /var/lib/be-BOP/tenants.tsv has any tenant row —
+#                     you must remove-tenant.sh them first, or use
+#                     --force-clean to override (destroys the registry).
+#   --force-clean     Same as --clean but skips the tenant safeguard.
+#                     NEVER use this on a host that serves live tenants.
+# NOTE — what --clean does NOT touch:
+#   /var/lib/be-BOP/           (tenant state, ports, releases)
+#   /var/lib/be-BOP-mongodb/   (per-tenant mongod data)
+#   /var/lib/phoenixd/         (Lightning wallet seeds)
+#   /etc/systemd/system/       (installed unit files — host-bootstrap
+#                                re-installs them cleanly)
+#   apt-installed packages     (Node, Garage, phoenixd, certbot, etc.)
+#   /etc/letsencrypt/          (issued certs)
 
 set -eEuo pipefail
 
@@ -55,14 +70,18 @@ log()  { printf '[install] %s\n' "$*"; }
 warn() { printf '[install] WARN: %s\n' "$*" >&2; }
 die()  { printf '[install] FATAL: %s\n' "$*" >&2; exit 1; }
 
-# Filter our own --reset-secrets out of the args before forwarding to
-# host-bootstrap.sh, which does not understand it.
+# Filter install.sh-specific flags out of the args before forwarding to
+# host-bootstrap.sh, which does not understand them.
 RESET_SECRETS=false
 NON_INTERACTIVE_FLAG=false
+CLEAN_INSTALL=false
+FORCE_CLEAN=false
 forwarded_args=()
 for a in "$@"; do
     case "$a" in
         --reset-secrets)   RESET_SECRETS=true ;;
+        --clean)           CLEAN_INSTALL=true ;;
+        --force-clean)     CLEAN_INSTALL=true; FORCE_CLEAN=true ;;
         --non-interactive) NON_INTERACTIVE_FLAG=true; forwarded_args+=("$a") ;;
         *)                 forwarded_args+=("$a") ;;
     esac
@@ -77,6 +96,27 @@ done
 
 if (( EUID != 0 )); then
     die "this installer must run as root (use sudo)"
+fi
+
+# 1.5. --clean : wipe previous install artefacts so the operator can
+# restart from a truly blank state without having to `rm -rf` anything by
+# hand. Refuses when the tenant registry has any row, unless
+# --force-clean overrides — the registry is what tracks live merchants,
+# blowing it away with tenants running would strand them.
+if [[ "$CLEAN_INSTALL" == "true" ]]; then
+    if [[ "$FORCE_CLEAN" != "true" && -f /var/lib/be-BOP/tenants.tsv ]]; then
+        # Header is line 1; any additional line = at least one tenant.
+        row_count=$(($(wc -l < /var/lib/be-BOP/tenants.tsv) - 1))
+        if (( row_count > 0 )); then
+            die "--clean refused: /var/lib/be-BOP/tenants.tsv has ${row_count} tenant row(s). Remove them via remove-tenant.sh first, or pass --force-clean if you really want to wipe the registry (destructive)."
+        fi
+    fi
+    log "--clean: wiping ${INSTALL_DIR} and ${SECRETS_DIR}..."
+    rm -rf "$INSTALL_DIR" "$SECRETS_DIR"
+    if [[ "$FORCE_CLEAN" == "true" && -f /var/lib/be-BOP/tenants.tsv ]]; then
+        warn "--force-clean: also wiping /var/lib/be-BOP/tenants.tsv"
+        rm -f /var/lib/be-BOP/tenants.tsv
+    fi
 fi
 
 # 2. Download + extract tarball.
