@@ -276,9 +276,11 @@ done
 if [[ -z "$TENANT_ID" ]]; then
     usage; die "tenant_id is required"
 fi
-if [[ -z "$ADMIN_EMAIL" ]]; then
-    die "--admin-email is required"
-fi
+# --admin-email is only strictly required for FRESH cert issuance. When
+# omitted on reapply, phase_certificate recovers the email from the LE
+# account regr.json linked to the existing cert. If no cert exists AND
+# recovery fails AND no CLI email was passed, phase_certificate dies loud
+# with an actionable message. See recover_admin_email_from_cert.
 if [[ ! "$TENANT_ID" =~ $TENANT_REGEX ]]; then
     die "invalid tenant_id '${TENANT_ID}' (must match ${TENANT_REGEX})"
 fi
@@ -1032,6 +1034,27 @@ phase_config_env() {
 # zone from secrets.env (BEBOP_DNS_ZONE) and delegate the actual DNS
 # mutation to lib/dns_provider.sh, so a narrowly-scoped token per
 # provider suffices.
+# Recover the LE account email associated with an existing cert. Reads
+# /etc/letsencrypt/renewal/<cert>.conf to find the account hash + server host,
+# then jq-extracts .body.contact[0] from the corresponding regr.json and
+# strips the 'mailto:' prefix. Prints the email on stdout (or empty on any
+# failure). Non-fatal — caller decides what to do with an empty result.
+recover_admin_email_from_cert() {
+    local cert_name="$1"
+    local renewal="/etc/letsencrypt/renewal/${cert_name}.conf"
+    run_privileged test -f "$renewal" || return 0
+    local account_hash server_host
+    account_hash=$(run_privileged grep -oP '^account\s*=\s*\K\S+' "$renewal" 2>/dev/null || true)
+    server_host=$(run_privileged grep -oP '^server\s*=\s*https?://\K[^/]+' "$renewal" 2>/dev/null || true)
+    [[ -z "$account_hash" || -z "$server_host" ]] && return 0
+    local regr="/etc/letsencrypt/accounts/${server_host}/directory/${account_hash}/regr.json"
+    run_privileged test -f "$regr" || return 0
+    local contact
+    contact=$(run_privileged jq -r '.body.contact[0] // empty' "$regr" 2>/dev/null || true)
+    [[ -z "$contact" ]] && return 0
+    printf '%s\n' "${contact#mailto:}"
+}
+
 phase_certificate() {
     local hooks_dir="/usr/local/share/be-BOP-tooling/hooks"
     if [[ -d "${SCRIPT_DIR}/hooks" ]]; then
@@ -1043,6 +1066,25 @@ phase_certificate() {
     # ephemeral tenants from distinct buyer emails). If you hit the limit,
     # rate-limit the spawn shop upstream.
     local acme_email="$ADMIN_EMAIL"
+
+    # Reapply path: recover the original email from the existing cert's LE
+    # account registration when the operator didn't repeat --admin-email.
+    # Idempotence of _issue_cert_* means the recovered email is only actually
+    # consumed if a NEW cert has to be issued (which shouldn't happen on a
+    # routine reapply — cert dir already exists).
+    if [[ -z "$acme_email" ]]; then
+        acme_email=$(recover_admin_email_from_cert "$CERT_NAME")
+        if [[ -n "$acme_email" ]]; then
+            log_info "phase 10: recovered admin-email '${acme_email}' from '${CERT_NAME}' LE account"
+        fi
+    fi
+    # No email at all AND a new cert would be issued: fail loud with an
+    # actionable message. This can only trigger on reapply/reactivate where
+    # the tenant is in the registry but its cert was manually deleted or its
+    # fresh-creation rollback misfired — rare, requires operator attention.
+    if [[ -z "$acme_email" ]] && ! run_privileged test -d "/etc/letsencrypt/live/${CERT_NAME}"; then
+        die "phase 10: cert '${CERT_NAME}' does not exist and admin-email is unknown (not passed via --admin-email, not recoverable from LE account). Re-run with --admin-email <original> to issue a new cert."
+    fi
 
     # Four combinations:
     #   external + has_local_s3 : main HTTP-01  + s3 DNS-01  (two certs)

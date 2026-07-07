@@ -1576,9 +1576,13 @@ step_propagate_template_changes() {
         return 0
     fi
     log_info "template propagation: reapplying ${#drifted[@]} drifted tenant(s): ${drifted[*]}"
+    # add-tenant.sh has no --reapply flag: passing just <tenant_id> on an
+    # already-active tenant auto-detects the reapply path. --admin-email
+    # is omitted — phase_certificate recovers the original email from the
+    # existing LE cert's regr.json (see recover_admin_email_from_cert).
     local failed=() ok=()
     for tid in "${drifted[@]}"; do
-        if "$add_tenant" --reapply "$tid"; then
+        if "$add_tenant" "$tid" --non-interactive; then
             ok+=("$tid")
         else
             failed+=("$tid")
