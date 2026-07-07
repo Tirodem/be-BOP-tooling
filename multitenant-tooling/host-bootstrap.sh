@@ -1602,8 +1602,14 @@ main() {
 
     step_check_prerequisites
     step_load_secrets
-    step_verify_dns_provider_connectivity
 
+    # Base system + tooling install runs FIRST — so a failure in the
+    # external validation below (DNS ping, Kuma admin, cert issuance)
+    # leaves a host with libs, scripts and templates in place. The
+    # operator can debug (source /usr/local/share/be-BOP-tooling/lib/*
+    # and call dns_provider_ping directly) or fix secrets.env and
+    # re-run host-bootstrap.sh — no need to `--clean` and start over
+    # just because Infomaniak had a hiccup.
     step_install_apt_packages
     step_install_nodejs_pnpm
     step_install_mongodb
@@ -1627,6 +1633,11 @@ main() {
     step_install_template_units
     step_install_tooling_libs_and_scripts
     step_init_registry
+
+    # External DNS validation — moved AFTER lib install (see rationale
+    # above). Must run BEFORE any step that mutates DNS (Kuma cert,
+    # Netdata cert, deploy-API cert).
+    step_verify_dns_provider_connectivity
 
     step_setup_docker
     step_install_uptime_kuma

@@ -125,6 +125,10 @@ if [[ "$CLEAN_INSTALL" == "true" ]]; then
     # it. --force-clean OR --non-interactive skips the prompt (scripting
     # path — operator explicitly opted into the destructive behaviour
     # via a flag).
+    # Ask what to do with secrets.env — the one file that's expensive
+    # to re-create (API tokens, encryption key, notification setup).
+    # Default: keep. Operator can explicitly opt into wiping it.
+    KEEP_SECRETS=true
     if [[ "$FORCE_CLEAN" != "true" && "$NON_INTERACTIVE_FLAG" != "true" ]]; then
         readonly CLEAN_CONFIRMATION_PHRASE="I KNOW WHAT I WANT BUDDY TRUST ME"
         if [[ -t 0 && -t 1 ]]; then
@@ -139,13 +143,39 @@ if [[ "$CLEAN_INSTALL" == "true" ]]; then
             if [[ "$confirm" != "$CLEAN_CONFIRMATION_PHRASE" ]]; then
                 die "--clean aborted (confirmation did not match)"
             fi
+
+            echo
+            echo "  [k] Keep secrets.env — backup + restore after wipe (default)"
+            echo "  [w] Wipe secrets.env too — full nuke, edit from template on re-run"
+            read -r -p "Choose [k/w] (default: k): " sec_choice
+            case "${sec_choice:-k}" in
+                w|W) KEEP_SECRETS=false ;;
+                *)   KEEP_SECRETS=true ;;
+            esac
         else
             die "--clean requires an interactive TTY for confirmation; use --force-clean or --non-interactive to skip the prompt (destructive!)"
         fi
     fi
 
+    # If we're keeping secrets.env, stash it in a tmp location before
+    # the wipe, restore it after. Simpler than adding conditional rm
+    # patterns.
+    KEEP_TMP=""
+    if [[ "$KEEP_SECRETS" == "true" && -f "$SECRETS_FILE" ]]; then
+        KEEP_TMP=$(mktemp)
+        cp -a "$SECRETS_FILE" "$KEEP_TMP"
+        log "--clean: staging ${SECRETS_FILE} for restore after wipe"
+    fi
+
     log "--clean: wiping ${INSTALL_DIR} and ${SECRETS_DIR}..."
     rm -rf "$INSTALL_DIR" "$SECRETS_DIR"
+
+    if [[ -n "$KEEP_TMP" ]]; then
+        install -d -m 0700 "$SECRETS_DIR"
+        install -m 0600 "$KEEP_TMP" "$SECRETS_FILE"
+        rm -f "$KEEP_TMP"
+        log "--clean: restored ${SECRETS_FILE}"
+    fi
     # Also wipe Uptime Kuma docker state — an existing container from a
     # previous install carries admin creds inside its /app/data volume.
     # host-bootstrap's step_setup_kuma_admin dies with "Kuma has been
