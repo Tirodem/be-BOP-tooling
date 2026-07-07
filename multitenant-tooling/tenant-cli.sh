@@ -494,9 +494,27 @@ install_release() {
     # --force: wipe the host cache entry BEFORE ensure so the download +
     # pnpm install re-runs even on cache hit. Useful when a branch SHA was
     # rebuilt (same cache key, new artifact) or when an install was corrupted.
+    # Guard: if ANOTHER active tenant currently symlinks its releases/current
+    # into this cache entry, refuse. Wiping it would break their next start
+    # for the whole re-download window (minutes). Operator must archive /
+    # migrate those tenants off this release first.
     if [[ "$FORCE_REFRESH" == "true" ]]; then
         local force_dir
         force_dir=$(release_cache_dir "$target_name")
+        local other_users=()
+        while IFS= read -r other_t; do
+            [[ -z "$other_t" || "$other_t" == "$TENANT_ID" ]] && continue
+            local other_tag other_target
+            other_tag=$(release_get_current_tag "$other_t") || continue
+            [[ -z "$other_tag" ]] && continue
+            other_target=$(release_cache_dir "$other_tag")
+            if [[ "$other_target" == "$force_dir" ]]; then
+                other_users+=("$other_t")
+            fi
+        done < <(registry_list_by_status active)
+        if (( ${#other_users[@]} > 0 )); then
+            die "--force refused: cache entry ${force_dir} is currently in use by ${#other_users[@]} other active tenant(s): ${other_users[*]}. Wiping it would 502 them during the re-download. Move them off this release first (upgrade-tenant.sh --version ... or archive)."
+        fi
         log_info "--force: removing host cache entry ${force_dir}"
         run_privileged rm -rf "$force_dir"
     fi
