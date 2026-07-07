@@ -71,9 +71,20 @@ _dns_provider_load_backend() {
 # call-time, so `dns_provider_ping "$@"` on the last line hits the
 # real impl (which the source just installed), not this stub — no
 # infinite recursion.
-dns_provider_is_configured()      { _dns_provider_load_backend; dns_provider_is_configured "$@"; }
-dns_provider_ping()               { _dns_provider_load_backend; dns_provider_ping "$@"; }
-dns_provider_dns_record_find()    { _dns_provider_load_backend; dns_provider_dns_record_find "$@"; }
-dns_provider_dns_record_create()  { _dns_provider_load_backend; dns_provider_dns_record_create "$@"; }
-dns_provider_dns_record_delete()  { _dns_provider_load_backend; dns_provider_dns_record_delete "$@"; }
-dns_provider_dns_zone_refresh()   { _dns_provider_load_backend; dns_provider_dns_zone_refresh "$@"; }
+#
+# CANONICAL PATTERN for any future <thing>_provider.sh (sms, mail,
+# payment, storage, ...): each wrapper is
+#     wrapper() { _<thing>_load_backend || return 1; wrapper "$@"; }
+# The `|| return 1` is LOAD-BEARING: if the load fails (empty
+# <THING>_PROVIDER envvar → we return 1 to let the caller skip
+# gracefully), the wrapper MUST propagate that instead of falling
+# through. Otherwise the recursive call goes right back to itself
+# (backend never sourced → wrapper is still the current definition)
+# and you get a bash stack overflow → segfault on the operator's
+# console. Ask 2026-07-07's install debugging how we found out.
+dns_provider_is_configured()      { _dns_provider_load_backend || return 1; dns_provider_is_configured "$@"; }
+dns_provider_ping()               { _dns_provider_load_backend || return 1; dns_provider_ping "$@"; }
+dns_provider_dns_record_find()    { _dns_provider_load_backend || return 1; dns_provider_dns_record_find "$@"; }
+dns_provider_dns_record_create()  { _dns_provider_load_backend || return 1; dns_provider_dns_record_create "$@"; }
+dns_provider_dns_record_delete()  { _dns_provider_load_backend || return 1; dns_provider_dns_record_delete "$@"; }
+dns_provider_dns_zone_refresh()   { _dns_provider_load_backend || return 1; dns_provider_dns_zone_refresh "$@"; }

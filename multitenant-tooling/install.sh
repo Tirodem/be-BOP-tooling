@@ -279,31 +279,62 @@ if [[ ! -f "$SECRETS_FILE" ]]; then
     install -m 0600 "$TEMPLATE_PATH" "$SECRETS_FILE"
     seed_backup_encryption_key
     log "Created $SECRETS_FILE (mode 0600)"
-elif ! secrets_have_values; then
-    log "$SECRETS_FILE has no required credentials filled in; replacing with the current template"
+fi
+
+# Present a choice on the secrets.env state — applies uniformly whether
+# the file was JUST created (fresh install / --clean), was found empty
+# from a previous aborted run, or was found filled with real values.
+# Three options:
+#   [e] Edit now    — open the file in $EDITOR / nano before bootstrap
+#                     runs. Best when creds are ready to hand and DNS
+#                     connectivity should be checked immediately.
+#   [k] Keep as-is  — proceed with whatever's currently in the file.
+#                     Filled values → bootstrap without --defer-secrets.
+#                     Empty values → bootstrap with --defer-secrets +
+#                     final "please edit and re-run" warning.
+#   [r] Reset       — backup + replace with the template (empty). Same
+#                     as [k]+empty for the follow-through.
+# Non-interactive (--non-interactive, no TTY) or --reset-secrets short-
+# circuits to the closest equivalent without prompting.
+if [[ "$RESET_SECRETS" == "true" ]]; then
+    log "--reset-secrets given; backing up and resetting from template"
     reset_secrets_to_template
-else
-    # Existing secrets.env has values worth preserving.
-    if [[ "$RESET_SECRETS" == "true" ]]; then
-        log "--reset-secrets given; backing up and resetting from template"
-        reset_secrets_to_template
-    elif [[ -t 0 && -t 1 && "$NON_INTERACTIVE_FLAG" != "true" ]]; then
-        echo
+elif [[ -t 0 && -t 1 && "$NON_INTERACTIVE_FLAG" != "true" ]]; then
+    echo
+    if secrets_have_values; then
         echo "${SECRETS_FILE} already has credentials filled in."
-        echo "  [r] Reset  — backup to ${SECRETS_FILE}.bak.<ts>, replace with"
-        echo "              the template, then re-edit interactively."
-        echo "  [k] Keep   — resume the setup using the existing values"
-        echo "              (skips the editor; DNS provider credentials checked now)."
-        read -r -p "Choose [r/k] (default: k): " choice
-        case "${choice:-k}" in
-            r|R) reset_secrets_to_template ;;
-            *)   log "Keeping existing $SECRETS_FILE"
-                 RESUME_FROM_EXISTING=true ;;
-        esac
     else
-        log "Non-interactive mode: keeping existing $SECRETS_FILE (use --reset-secrets to override)"
-        RESUME_FROM_EXISTING=true
+        echo "${SECRETS_FILE} has EMPTY required credentials (DNS_PROVIDER, BEBOP_DNS_ZONE, etc.)."
     fi
+    echo "  [e] Edit now  — open the file in \$EDITOR / nano before bootstrap"
+    echo "  [k] Keep as-is — bootstrap with whatever's in the file"
+    echo "                    (empty values → --defer-secrets + warn at end)"
+    echo "  [r] Reset     — backup + replace with the empty template"
+    read -r -p "Choose [e/k/r] (default: k): " choice
+    case "${choice:-k}" in
+        e|E)
+            editor="${EDITOR:-nano}"
+            if command -v "$editor" >/dev/null 2>&1; then
+                log "Opening ${SECRETS_FILE} in ${editor}..."
+                "$editor" "$SECRETS_FILE"
+            else
+                warn "editor '${editor}' not found — proceeding with current values"
+            fi
+            ;;
+        r|R)
+            reset_secrets_to_template
+            ;;
+        *)
+            log "Keeping existing $SECRETS_FILE"
+            ;;
+    esac
+else
+    log "Non-interactive mode: keeping existing $SECRETS_FILE as-is (use --reset-secrets to override)"
+fi
+
+# Decide bootstrap mode: filled → normal (DNS ping runs), empty → defer.
+if secrets_have_values; then
+    RESUME_FROM_EXISTING=true
 fi
 
 # 5. Run host-bootstrap.sh. Resume path skips --defer-secrets so DNS
@@ -317,16 +348,18 @@ else
     "${INSTALL_DIR}/host-bootstrap.sh" --defer-secrets "${forwarded_args[@]+"${forwarded_args[@]}"}"
 fi
 
-# 6. Open secrets.env in the operator's editor — only when starting from a
-# fresh / reset template (resume path skips this; the file is already filled).
-if [[ "$RESUME_FROM_EXISTING" != "true" ]]; then
-    editor="${EDITOR:-nano}"
-    if [[ -t 0 && -t 1 ]] && command -v "$editor" >/dev/null 2>&1; then
-        log "Opening ${SECRETS_FILE} in ${editor}..."
-        "$editor" "$SECRETS_FILE"
-    else
-        warn "non-interactive shell — edit ${SECRETS_FILE} manually before continuing"
-    fi
+# 6. Final state — if secrets.env is still empty (operator chose keep +
+# defer, or --non-interactive proceeded on an empty file), print the
+# explicit "fichier foireux, merci de modifier" warning so it lands as
+# the LAST thing on the terminal, hard to miss.
+if ! secrets_have_values; then
+    echo
+    warn "==========================================================================="
+    warn "  ${SECRETS_FILE} has EMPTY required credentials."
+    warn "  Fill DNS_PROVIDER, BEBOP_DNS_ZONE, and the provider-specific keys, then"
+    warn "  re-run: sudo bash /opt/be-BOP-tooling/install.sh"
+    warn "  (or continue directly: sudo /opt/be-BOP-tooling/host-bootstrap.sh)"
+    warn "==========================================================================="
 fi
 
 # 7. Final instructions.

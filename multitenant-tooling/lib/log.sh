@@ -81,6 +81,24 @@ die() {
     exit 1
 }
 
+# defer_die <message>
+# Config-tolerant die: in --defer-secrets install mode (DEFER_SECRETS=true
+# in the calling script's env), warn and return 1 so the caller can skip
+# the step. In normal mode, dies loudly with the usual exit 1.
+# Use this for ANY envvar / secrets / config-completeness check — never
+# raw die on missing config, otherwise a fresh install (or a --clean +
+# re-run) crashes instead of gracefully proceeding to the "fill your
+# secrets.env and re-run" state. Real system failures (arch unsupported,
+# corepack missing, sha256 mismatch, service didn't come up) still use
+# die directly.
+defer_die() {
+    if [[ "${DEFER_SECRETS:-false}" == "true" ]]; then
+        log_warn "$@"
+        return 1
+    fi
+    die "$@"
+}
+
 # Filter stdin → stdout, redacting common secret patterns.
 # Use it when piping subprocess output that may contain credentials.
 mask_secrets() {
