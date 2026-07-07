@@ -1704,7 +1704,7 @@ apply_profile() {
         die "--profile '${PROFILE}' requested but ${file} is missing or invalid JSON"
     fi
     if ! jq -e --arg p "$PROFILE" '.profiles | has($p)' "$file" >/dev/null; then
-        die "profile '${PROFILE}' not defined in ${file}. Available: $(jq -r '.profiles | keys | map(select(startswith("$") | not) | select(startswith("_example") | not)) | join(", ")' "$file")"
+        die "profile '${PROFILE}' not defined"
     fi
     local -a profile_entries=()
     local key value
