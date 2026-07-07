@@ -174,7 +174,13 @@ pre_swap_mongodump() {
     local dump_root="/var/lib/be-BOP/${tid}/pre-upgrade-dumps"
     local ts
     ts=$(date -u +%Y%m%dT%H%M%SZ)
-    local dump_dir="${dump_root}/${ts}-${old_tag}-${new_tag}"
+    # Tags like `rel/2026-07-06/7be5ae3` contain slashes → replace with
+    # '_' so dump_dir stays a flat direct child of dump_root. Sinon
+    # install crée un arbre nested, ls -1t rate les dumps profonds, et
+    # deux runs partageant le préfixe collisionnent.
+    local old_tag_flat="${old_tag//\//_}"
+    local new_tag_flat="${new_tag//\//_}"
+    local dump_dir="${dump_root}/${ts}-${old_tag_flat}-${new_tag_flat}"
     run_privileged install -d -m 0700 "$dump_root"
     run_privileged install -d -m 0700 "$dump_dir"
     log_info "pre-upgrade: mongodumping ${mongo_db} → ${dump_dir}"
