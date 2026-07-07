@@ -42,7 +42,14 @@ _dns_provider_load_backend() {
     [[ -n "${_BEBOP_DNS_PROVIDER_BACKEND_SOURCED:-}" ]] && return 0
     case "${DNS_PROVIDER:-}" in
         "")
-            die "dns_provider: DNS_PROVIDER is empty. Set it explicitly to 'ovh' or 'infomaniak' in ${SECRETS_FILE:-/etc/be-BOP-tooling/secrets.env}."
+            # Not configured — return non-zero without dying.
+            # Global install logic: an empty/broken env var must NEVER
+            # abort an install action. Callers (dns_provider_is_configured
+            # in --defer-secrets, tests, etc.) propagate the false back to
+            # their context and skip the DNS-dependent work. The operator
+            # gets a warn from host-bootstrap.sh's secrets-check step and
+            # is expected to fill DNS_PROVIDER before re-running.
+            return 1
             ;;
         ovh)
             # shellcheck source=ovh.sh

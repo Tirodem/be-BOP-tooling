@@ -43,12 +43,17 @@
 #                     the existing secrets.env has filled values. Useful in
 #                     --non-interactive runs where the default is "keep".
 #   --clean           Wipe /opt/be-BOP-tooling AND /etc/be-BOP-tooling
-#                     before running the fresh install. Refuses if
+#                     before running the fresh install. Requires an
+#                     interactive TTY and a typed "WIPE" (case
+#                     sensitive) confirmation. Refuses if
 #                     /var/lib/be-BOP/tenants.tsv has any tenant row —
 #                     you must remove-tenant.sh them first, or use
 #                     --force-clean to override (destroys the registry).
-#   --force-clean     Same as --clean but skips the tenant safeguard.
-#                     NEVER use this on a host that serves live tenants.
+#   --force-clean     Same as --clean but skips BOTH the tenant
+#                     safeguard AND the WIPE confirmation. Also skips
+#                     the confirmation under --non-interactive. NEVER
+#                     use --force-clean on a host that serves live
+#                     tenants.
 # NOTE — what --clean does NOT touch:
 #   /var/lib/be-BOP/           (tenant state, ports, releases)
 #   /var/lib/be-BOP-mongodb/   (per-tenant mongod data)
@@ -111,6 +116,33 @@ if [[ "$CLEAN_INSTALL" == "true" ]]; then
             die "--clean refused: /var/lib/be-BOP/tenants.tsv has ${row_count} tenant row(s). Remove them via remove-tenant.sh first, or pass --force-clean if you really want to wipe the registry (destructive)."
         fi
     fi
+
+    # Hard confirmation — --clean wipes /opt and /etc. Even after the
+    # tenants-tsv safeguard above, this is a destructive operation that
+    # will nuke any local edits to secrets.env, deploy-default.json,
+    # kuma-admin.env, etc. We require the operator to type WIPE (case
+    # sensitive) so a typo or muscle-memory Enter can't trigger it.
+    # --force-clean OR --non-interactive skips the prompt (scripting
+    # path — operator explicitly opted into the destructive behaviour
+    # via a flag).
+    if [[ "$FORCE_CLEAN" != "true" && "$NON_INTERACTIVE_FLAG" != "true" ]]; then
+        if [[ -t 0 && -t 1 ]]; then
+            echo
+            warn "About to WIPE:"
+            warn "  ${INSTALL_DIR}"
+            warn "  ${SECRETS_DIR}"
+            warn "This will delete secrets.env, deploy-default.json, kuma-admin.env,"
+            warn "netdata-admin.env, deploy-api.env, and any other local ops files."
+            echo
+            read -r -p "Type WIPE (case sensitive) to confirm: " confirm
+            if [[ "$confirm" != "WIPE" ]]; then
+                die "--clean aborted (confirmation did not match)"
+            fi
+        else
+            die "--clean requires an interactive TTY for confirmation; use --force-clean or --non-interactive to skip the prompt (destructive!)"
+        fi
+    fi
+
     log "--clean: wiping ${INSTALL_DIR} and ${SECRETS_DIR}..."
     rm -rf "$INSTALL_DIR" "$SECRETS_DIR"
     if [[ "$FORCE_CLEAN" == "true" && -f /var/lib/be-BOP/tenants.tsv ]]; then
