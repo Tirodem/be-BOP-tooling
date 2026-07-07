@@ -713,7 +713,13 @@ phase_mongo() {
 _write_mongo_port_env_with_auth() {
     local tmp
     tmp=$(mktemp)
-    printf 'MONGO_PORT=%s\nMONGO_AUTH_ARGS=--auth --keyFile /run/credentials/mongod@%s.service/keyfile\n' \
+    # MONGO_AUTH_ARGS value MUST be double-quoted: systemd EnvironmentFile
+    # accepts spaces fine, but bebop-mongo-preflight.sh sources the file
+    # via bash `source`, and bash's shell parser treats
+    #   KEY=value1 value2
+    # as "run 'value2' with KEY=value1". Quoting collapses the whole
+    # thing into a single VAR value for both consumers.
+    printf 'MONGO_PORT=%s\nMONGO_AUTH_ARGS="--auth --keyFile /run/credentials/mongod@%s.service/keyfile"\n' \
         "$MONGO_PORT" "$TENANT_ID" > "$tmp"
     run_privileged install -m 0640 "$tmp" "/etc/be-BOP-mongodb/${TENANT_ID}/port.env"
     rm -f "$tmp"

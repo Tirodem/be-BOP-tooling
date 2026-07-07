@@ -214,7 +214,9 @@ migrate_one() {
     log_info "step 4/6: enabling auth in port.env + daemon-reload + restart mongod@${tid}..."
     local tmp
     tmp=$(mktemp)
-    printf 'MONGO_PORT=%s\nMONGO_AUTH_ARGS=--auth --keyFile /run/credentials/mongod@%s.service/keyfile\n' \
+    # See add-tenant.sh:_write_mongo_port_env_with_auth for the quoting
+    # rationale (systemd EnvironmentFile OK, bash `source` requires quotes).
+    printf 'MONGO_PORT=%s\nMONGO_AUTH_ARGS="--auth --keyFile /run/credentials/mongod@%s.service/keyfile"\n' \
         "$mongo_port" "$tid" > "$tmp"
     run_privileged install -m 0640 "$tmp" "$port_env"
     rm -f "$tmp"
