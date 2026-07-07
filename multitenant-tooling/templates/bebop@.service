@@ -17,8 +17,9 @@
 [Unit]
 Description=be-BOP Application Server (%i)
 Documentation=https://github.com/be-BOP-io-SA/be-BOP
-After=network.target garage.service
-Wants=network.target garage.service
+Requires=mongod@%i.service
+After=network-online.target garage.service mongod@%i.service phoenixd@%i.service
+Wants=network-online.target garage.service phoenixd@%i.service
 
 [Service]
 Type=simple
@@ -41,14 +42,15 @@ ExecStart=/usr/bin/node build/index.js
 #   100      restart on same version
 #   101      update to latest GitHub release
 #   110-119  rollback to N-k (k = code - 109)
-# Restart=on-failure honors "0 = stop permanently" by default; the protocol
-# codes are then explicitly forced via RestartForceExitStatus= AND marked as
-# success via SuccessExitStatus= so they don't pollute the journal as failed.
-# ExecStopPost= runs as root (the '+' prefix overrides DynamicUser=) to let
-# the handler swap the releases/current symlink BEFORE systemd relaunches.
+# Restart=on-failure honors "0 = stop permanently" by default. Codes 100/
+# 101/110-119 are marked as clean via SuccessExitStatus= (no journal noise).
+# Only code 100 (restart same version) is force-restarted by systemd —
+# for 101 (update-latest) and 110-119 (rollback), bebop-exit-handler.sh
+# spawns bebop-exit-worker.sh via `systemd-run --no-block` which does the
+# heavy download+swap OUTSIDE TimeoutStopSec, then re-starts bebop@ itself.
 Restart=on-failure
 SuccessExitStatus=100 101 110 111 112 113 114 115 116 117 118 119
-RestartForceExitStatus=100 101 110 111 112 113 114 115 116 117 118 119
+RestartForceExitStatus=100
 ExecStopPost=+/usr/local/bin/bebop-exit-handler.sh %i
 RestartSec=5
 TimeoutStartSec=60

@@ -127,6 +127,22 @@ handle_restart_same() {
         "Tenant ${TENANT_ID} requested a restart on its current release. systemd is relaunching the unit."
 }
 
+# Spawn bebop-exit-worker.sh via systemd-run --no-block so the heavy
+# work (download + pnpm install + swap) happens OUTSIDE the ExecStopPost
+# TimeoutStopSec=30s window. The handler exits fast; the worker starts
+# bebop@<tenant> once done. If the worker crashes, its EXIT trap still
+# starts bebop@ so the tenant is never left permanently down.
+_spawn_exit_worker() {
+    local target_tag="$1"
+    local unit="bebop-exit-worker-${TENANT_ID}-$(date +%s)"
+    run_privileged systemd-run \
+        --no-block \
+        --collect \
+        --unit="$unit" \
+        /usr/local/bin/bebop-exit-worker.sh "$TENANT_ID" "$target_tag"
+    log_info "exit-handler: ${TENANT_ID}: spawned async worker as systemd unit '${unit}' for ${target_tag}"
+}
+
 handle_update_latest() {
     log_info "exit-handler: ${TENANT_ID}: update to latest requested (exit 101)"
     local current_tag latest_tag
@@ -134,12 +150,14 @@ handle_update_latest() {
     if [[ -z "$current_tag" ]]; then
         notify_protocol_failure "update-latest" \
             "tenant has no current release symlink (deploy state corrupted?)" ""
+        run_privileged systemctl --no-block start "bebop@${TENANT_ID}.service" || true
         return 0
     fi
     if ! latest_tag=$(release_resolve_version latest); then
         notify_protocol_failure "update-latest" \
             "could not resolve 'latest' from GitHub API (rate-limit, network, or no matching release)" \
             "$current_tag"
+        run_privileged systemctl --no-block start "bebop@${TENANT_ID}.service" || true
         return 0
     fi
     if [[ "$latest_tag" == "$current_tag" ]]; then
@@ -147,19 +165,10 @@ handle_update_latest() {
         notify_success \
             "[be-BOP tooling] ${TENANT_ID}: update-latest no-op" \
             "Tenant ${TENANT_ID} requested update to latest but is already on it (${current_tag}). No change."
+        run_privileged systemctl --no-block start "bebop@${TENANT_ID}.service" || true
         return 0
     fi
-    if ! release_cache_ensure "$latest_tag"; then
-        notify_protocol_failure "update-latest" \
-            "cache ensure failed for ${latest_tag} (download, unzip, or pnpm install)" \
-            "$current_tag"
-        return 0
-    fi
-    release_cache_set_current "$TENANT_ID" "$latest_tag"
-    notify_success \
-        "[be-BOP tooling] ${TENANT_ID}: updated to latest (${latest_tag})" \
-        "Tenant ${TENANT_ID}: ${current_tag} → ${latest_tag}
-Symlink swapped. systemd will relaunch the unit on the new release."
+    _spawn_exit_worker "$latest_tag"
 }
 
 handle_rollback() {
@@ -170,25 +179,17 @@ handle_rollback() {
     if [[ -z "$current_tag" ]]; then
         notify_protocol_failure "rollback N-${k}" \
             "tenant has no current release symlink (deploy state corrupted?)" ""
+        run_privileged systemctl --no-block start "bebop@${TENANT_ID}.service" || true
         return 0
     fi
     if ! target_tag=$(release_resolve_nth_before "$current_tag" "$k"); then
         notify_protocol_failure "rollback N-${k}" \
             "cannot resolve N-${k} on GitHub (k > history, current tag '${current_tag}' not in matching-asset list, or API unreachable)" \
             "$current_tag"
+        run_privileged systemctl --no-block start "bebop@${TENANT_ID}.service" || true
         return 0
     fi
-    if ! release_cache_ensure "$target_tag"; then
-        notify_protocol_failure "rollback N-${k}" \
-            "cache ensure failed for ${target_tag} (download, unzip, or pnpm install)" \
-            "$current_tag"
-        return 0
-    fi
-    release_cache_set_current "$TENANT_ID" "$target_tag"
-    notify_success \
-        "[be-BOP tooling] ${TENANT_ID}: rolled back N-${k} (${target_tag})" \
-        "Tenant ${TENANT_ID}: ${current_tag} → ${target_tag}
-Symlink swapped. systemd will relaunch the unit on the rollback target."
+    _spawn_exit_worker "$target_tag"
 }
 
 case "$SD_EXIT_STATUS" in
