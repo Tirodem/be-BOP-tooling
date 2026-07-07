@@ -153,6 +153,19 @@ upgrade_tenant_argv() {
 main() {
     require_privileges
 
+    # Global mutex: prevent a manual upgrade-all run from overlapping with
+    # the nightly bebop-upgrade-all.timer (or a second manual invocation).
+    # Concurrent runs would double-restart the same tenants, double-consume
+    # the GitHub quota, and race on rollback logic. `flock -n` returns
+    # immediately if the lock is held — bail cleanly with a clear error.
+    : "${BEBOP_UPGRADE_ALL_LOCK_PATH:=/var/lib/be-BOP/.upgrade-all.lock}"
+    install -d -m 0755 /var/lib/be-BOP
+    touch "$BEBOP_UPGRADE_ALL_LOCK_PATH"
+    exec {UPGRADE_ALL_LOCK_FD}<"$BEBOP_UPGRADE_ALL_LOCK_PATH"
+    if ! flock -n "$UPGRADE_ALL_LOCK_FD"; then
+        die "another upgrade-all is already running (lock=$BEBOP_UPGRADE_ALL_LOCK_PATH). Wait for it to finish or check its journal."
+    fi
+
     if [[ ! -f "$SECRETS_FILE" ]]; then
         die "secrets file not found: ${SECRETS_FILE}"
     fi
@@ -232,7 +245,13 @@ main() {
                 for t in "${to_upgrade[@]}"; do
                     log_info "==== upgrading ${t} (rolling) ===="
                     local rc=0
-                    "$upgrade_tenant_path" $(upgrade_tenant_argv "$t") || rc=$?
+                    # mapfile+quoted array so args with spaces or globs
+                    # survive intact — a bare $(upgrade_tenant_argv "$t")
+                    # would be word-split by the shell, undoing the
+                    # one-arg-per-line contract of upgrade_tenant_argv.
+                    local -a argv
+                    mapfile -t argv < <(upgrade_tenant_argv "$t")
+                    "$upgrade_tenant_path" "${argv[@]}" || rc=$?
                     if (( rc == 0 )); then
                         succeeded+=("$t")
                     else
@@ -245,21 +264,52 @@ main() {
                 done
                 ;;
             parallel)
-                local pids=() pid t_for_pid=()
+                # Cap the concurrency so a big fleet doesn't spawn N
+                # upgrade-tenant.sh processes at once (registry lock queue,
+                # pnpm install RAM footprint, GitHub API burst). Default 4;
+                # override via BEBOP_UPGRADE_ALL_PARALLEL_MAX in secrets.env.
+                : "${BEBOP_UPGRADE_ALL_PARALLEL_MAX:=4}"
+                local pids=() t_for_pid=()
+                local finished_pid rc
+                _upgrade_all_reap_one() {
+                    # Wait for ANY tracked child to finish, capture its exit
+                    # status, move its tenant to succeeded / failed, prune
+                    # from pids / t_for_pid.
+                    finished_pid=""
+                    rc=0
+                    wait -n -p finished_pid "${pids[@]}" || rc=$?
+                    [[ -z "$finished_pid" ]] && return
+                    local i idx=-1
+                    for (( i=0; i<${#pids[@]}; i++ )); do
+                        if [[ "${pids[$i]}" == "$finished_pid" ]]; then
+                            idx=$i
+                            break
+                        fi
+                    done
+                    (( idx < 0 )) && return
+                    local t_done="${t_for_pid[$idx]}"
+                    if (( rc == 0 )); then
+                        succeeded+=("$t_done")
+                    else
+                        failed+=("$t_done")
+                    fi
+                    unset 'pids[idx]' 't_for_pid[idx]'
+                    pids=("${pids[@]}")
+                    t_for_pid=("${t_for_pid[@]}")
+                }
                 for t in "${to_upgrade[@]}"; do
-                    log_info "==== launching upgrade for ${t} (parallel) ===="
-                    "$upgrade_tenant_path" $(upgrade_tenant_argv "$t") &
-                    pid=$!
-                    pids+=("$pid")
+                    while (( ${#pids[@]} >= BEBOP_UPGRADE_ALL_PARALLEL_MAX )); do
+                        _upgrade_all_reap_one
+                    done
+                    log_info "==== launching upgrade for ${t} (parallel, ${#pids[@]}/${BEBOP_UPGRADE_ALL_PARALLEL_MAX} slots in flight) ===="
+                    local -a argv
+                    mapfile -t argv < <(upgrade_tenant_argv "$t")
+                    "$upgrade_tenant_path" "${argv[@]}" &
+                    pids+=("$!")
                     t_for_pid+=("$t")
                 done
-                local i
-                for (( i=0; i<${#pids[@]}; i++ )); do
-                    if wait "${pids[$i]}" 2>/dev/null; then
-                        succeeded+=("${t_for_pid[$i]}")
-                    else
-                        failed+=("${t_for_pid[$i]}")
-                    fi
+                while (( ${#pids[@]} > 0 )); do
+                    _upgrade_all_reap_one
                 done
                 ;;
         esac
