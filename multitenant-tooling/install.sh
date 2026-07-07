@@ -146,6 +146,21 @@ if [[ "$CLEAN_INSTALL" == "true" ]]; then
 
     log "--clean: wiping ${INSTALL_DIR} and ${SECRETS_DIR}..."
     rm -rf "$INSTALL_DIR" "$SECRETS_DIR"
+    # Also wipe Uptime Kuma docker state — an existing container from a
+    # previous install carries admin creds inside its /app/data volume.
+    # host-bootstrap's step_setup_kuma_admin dies with "Kuma has been
+    # initialized" otherwise. Silent no-op if docker isn't installed yet
+    # (very fresh VDS) or if the container was never created.
+    if command -v docker >/dev/null 2>&1; then
+        if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -qx 'bebop-uptime-kuma'; then
+            log "--clean: removing bebop-uptime-kuma container"
+            docker rm -f bebop-uptime-kuma >/dev/null 2>&1 || true
+        fi
+    fi
+    if [[ -d /var/lib/uptime-kuma ]]; then
+        log "--clean: wiping /var/lib/uptime-kuma"
+        rm -rf /var/lib/uptime-kuma
+    fi
     if [[ "$FORCE_CLEAN" == "true" && -f /var/lib/be-BOP/tenants.tsv ]]; then
         warn "--force-clean: also wiping /var/lib/be-BOP/tenants.tsv"
         rm -f /var/lib/be-BOP/tenants.tsv
@@ -281,58 +296,73 @@ if [[ ! -f "$SECRETS_FILE" ]]; then
     log "Created $SECRETS_FILE (mode 0600)"
 fi
 
-# Present a choice on the secrets.env state — applies uniformly whether
-# the file was JUST created (fresh install / --clean), was found empty
-# from a previous aborted run, or was found filled with real values.
-# Three options:
-#   [e] Edit now    — open the file in $EDITOR / nano before bootstrap
-#                     runs. Best when creds are ready to hand and DNS
-#                     connectivity should be checked immediately.
-#   [k] Keep as-is  — proceed with whatever's currently in the file.
-#                     Filled values → bootstrap without --defer-secrets.
-#                     Empty values → bootstrap with --defer-secrets +
-#                     final "please edit and re-run" warning.
-#   [r] Reset       — backup + replace with the template (empty). Same
-#                     as [k]+empty for the follow-through.
-# Non-interactive (--non-interactive, no TTY) or --reset-secrets short-
-# circuits to the closest equivalent without prompting.
+# --- Reconciling secrets.env ---
+# Three real-world scenarios:
+#   (a) File is EMPTY (just created from template — fresh VDS, or
+#       --clean, or aborted previous run). There's nothing to "keep"
+#       or "reset" against — just open the editor and let the operator
+#       fill it. No pointless prompt.
+#   (b) File is FILLED (previous install left real values). Ask
+#       [k]eep / [r]eset / [e]dit — the operator has something worth
+#       preserving.
+#   (c) Non-interactive OR --reset-secrets: short-circuit without
+#       prompting.
 if [[ "$RESET_SECRETS" == "true" ]]; then
     log "--reset-secrets given; backing up and resetting from template"
     reset_secrets_to_template
-elif [[ -t 0 && -t 1 && "$NON_INTERACTIVE_FLAG" != "true" ]]; then
-    echo
-    if secrets_have_values; then
-        echo "${SECRETS_FILE} already has credentials filled in."
-    else
-        echo "${SECRETS_FILE} has EMPTY required credentials (DNS_PROVIDER, BEBOP_DNS_ZONE, etc.)."
-    fi
-    echo "  [e] Edit now  — open the file in \$EDITOR / nano before bootstrap"
-    echo "  [k] Keep as-is — bootstrap with whatever's in the file"
-    echo "                    (empty values → --defer-secrets + warn at end)"
-    echo "  [r] Reset     — backup + replace with the empty template"
-    read -r -p "Choose [e/k/r] (default: k): " choice
-    case "${choice:-k}" in
-        e|E)
-            editor="${EDITOR:-nano}"
-            if command -v "$editor" >/dev/null 2>&1; then
-                log "Opening ${SECRETS_FILE} in ${editor}..."
-                "$editor" "$SECRETS_FILE"
-            else
-                warn "editor '${editor}' not found — proceeding with current values"
-            fi
-            ;;
-        r|R)
-            reset_secrets_to_template
-            ;;
-        *)
-            log "Keeping existing $SECRETS_FILE"
-            ;;
-    esac
-else
-    log "Non-interactive mode: keeping existing $SECRETS_FILE as-is (use --reset-secrets to override)"
+    # After reset we fall through to (a) below — file is empty again.
 fi
 
-# Decide bootstrap mode: filled → normal (DNS ping runs), empty → defer.
+if secrets_have_values; then
+    # Scenario (b): filled file, prompt keep/reset/edit.
+    if [[ -t 0 && -t 1 && "$NON_INTERACTIVE_FLAG" != "true" ]]; then
+        echo
+        echo "${SECRETS_FILE} already has credentials filled in."
+        echo "  [k] Keep as-is — bootstrap with existing values (DNS ping runs)"
+        echo "  [e] Edit       — open the file in \$EDITOR / nano before bootstrap"
+        echo "  [r] Reset      — backup + replace with the empty template + edit"
+        read -r -p "Choose [k/e/r] (default: k): " choice
+        case "${choice:-k}" in
+            e|E)
+                editor="${EDITOR:-nano}"
+                if command -v "$editor" >/dev/null 2>&1; then
+                    log "Opening ${SECRETS_FILE} in ${editor}..."
+                    "$editor" "$SECRETS_FILE"
+                else
+                    warn "editor '${editor}' not found — proceeding with current values"
+                fi
+                ;;
+            r|R)
+                reset_secrets_to_template
+                ;;
+            *)
+                log "Keeping existing $SECRETS_FILE"
+                ;;
+        esac
+    else
+        log "Non-interactive mode: keeping existing $SECRETS_FILE as-is (use --reset-secrets to override)"
+    fi
+fi
+
+# After potential prompt or reset — if the file is EMPTY now, open the
+# editor directly (scenario (a)). --non-interactive skips this and
+# proceeds in --defer-secrets. The final warn at the end catches the
+# empty state so the operator sees "please fill and re-run".
+if ! secrets_have_values; then
+    if [[ -t 0 && -t 1 && "$NON_INTERACTIVE_FLAG" != "true" ]]; then
+        editor="${EDITOR:-nano}"
+        if command -v "$editor" >/dev/null 2>&1; then
+            echo
+            log "Opening ${SECRETS_FILE} in ${editor} — fill in DNS_PROVIDER, BEBOP_DNS_ZONE, then save + exit"
+            "$editor" "$SECRETS_FILE"
+        else
+            warn "editor '${editor}' not found — proceeding with empty file"
+        fi
+    fi
+fi
+
+# Decide bootstrap mode: filled after all the above → normal (DNS ping
+# runs), still empty → defer.
 if secrets_have_values; then
     RESUME_FROM_EXISTING=true
 fi
