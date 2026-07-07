@@ -103,6 +103,12 @@ def cmd_add_monitor(args):
                 f"(id={existing[0]['id']}); no-op"
             )
             return 0
+        # Proactive TLS-expiry alerting for HTTPS targets: Kuma will fire a
+        # notification 7/14/21 days before the cert expires (thresholds are
+        # a Kuma-side default) as soon as the monitor sees it. Detects the
+        # class of failure — dead cron, wrong DNS creds, revoked LE token —
+        # BEFORE the tenant actually goes offline with an expired cert.
+        expiry_notification = args.target.startswith("https://")
         result = api.add_monitor(
             type=MonitorType.HTTP,
             name=args.name,
@@ -111,9 +117,11 @@ def cmd_add_monitor(args):
             maxretries=3,
             retryInterval=20,
             accepted_statuscodes=["200-299", "301", "302", "307"],
+            expiryNotification=expiry_notification,
         )
         mid = result.get("monitorID") or result.get("id") or "?"
-        print(f"kuma-cli: created monitor '{args.name}' (id={mid}, target={args.target})")
+        exp_tag = " +cert-expiry" if expiry_notification else ""
+        print(f"kuma-cli: created monitor '{args.name}' (id={mid}, target={args.target}){exp_tag}")
         return 0
     except Exception as e:
         print(f"kuma-cli: add-monitor failed: {e}", file=sys.stderr)
