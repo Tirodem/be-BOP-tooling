@@ -120,12 +120,13 @@ if [[ "$CLEAN_INSTALL" == "true" ]]; then
     # Hard confirmation — --clean wipes /opt and /etc. Even after the
     # tenants-tsv safeguard above, this is a destructive operation that
     # will nuke any local edits to secrets.env, deploy-default.json,
-    # kuma-admin.env, etc. We require the operator to type WIPE (case
-    # sensitive) so a typo or muscle-memory Enter can't trigger it.
-    # --force-clean OR --non-interactive skips the prompt (scripting
+    # kuma-admin.env, etc. Long typed phrase (case sensitive) so a typo,
+    # muscle-memory Enter, or accidental clipboard paste can't trigger
+    # it. --force-clean OR --non-interactive skips the prompt (scripting
     # path — operator explicitly opted into the destructive behaviour
     # via a flag).
     if [[ "$FORCE_CLEAN" != "true" && "$NON_INTERACTIVE_FLAG" != "true" ]]; then
+        readonly CLEAN_CONFIRMATION_PHRASE="I KNOW WHAT I WANT BUDDY TRUST ME"
         if [[ -t 0 && -t 1 ]]; then
             echo
             warn "About to WIPE:"
@@ -134,8 +135,8 @@ if [[ "$CLEAN_INSTALL" == "true" ]]; then
             warn "This will delete secrets.env, deploy-default.json, kuma-admin.env,"
             warn "netdata-admin.env, deploy-api.env, and any other local ops files."
             echo
-            read -r -p "Type WIPE (case sensitive) to confirm: " confirm
-            if [[ "$confirm" != "WIPE" ]]; then
+            read -r -p "Type '${CLEAN_CONFIRMATION_PHRASE}' (case sensitive) to confirm: " confirm
+            if [[ "$confirm" != "$CLEAN_CONFIRMATION_PHRASE" ]]; then
                 die "--clean aborted (confirmation did not match)"
             fi
         else
