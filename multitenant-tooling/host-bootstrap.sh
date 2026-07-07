@@ -1530,6 +1530,68 @@ CAPS
     printf '%s\n' "$out"
 }
 
+# === Template propagation to already-deployed tenants ==================
+# Gated on defaults.propagate_template_changes in /etc/be-BOP-tooling/
+# deploy-default.json (default false — opt-in). When true, every active
+# tenant whose stored '# tooling-fingerprint:' in config.env differs from
+# the current TEMPLATE_REVISION triggers a full add-tenant.sh --reapply
+# (config.env re-render + nginx reload + bebop@ restart). Preserves the
+# operator custom block under the scissor marker.
+step_propagate_template_changes() {
+    local deploy_file=/etc/be-BOP-tooling/deploy-default.json
+    local enabled=false
+    if [[ -f "$deploy_file" ]] && jq -e . "$deploy_file" >/dev/null 2>&1; then
+        enabled=$(jq -r 'if (.defaults | has("propagate_template_changes")) then .defaults.propagate_template_changes else false end' "$deploy_file")
+    fi
+    if [[ "$enabled" != "true" ]]; then
+        log_info "template propagation: skipped (defaults.propagate_template_changes=${enabled} in ${deploy_file})"
+        return 0
+    fi
+    local add_tenant=/usr/local/bin/add-tenant.sh
+    if [[ ! -x "$add_tenant" ]]; then
+        log_warn "template propagation: ${add_tenant} not installed — skipping"
+        return 0
+    fi
+    local current_rev
+    current_rev=$(grep -oP '^readonly TEMPLATE_REVISION="\K[^"]+' "$add_tenant" 2>/dev/null || echo "")
+    if [[ -z "$current_rev" ]]; then
+        log_warn "template propagation: cannot read TEMPLATE_REVISION from ${add_tenant} — skipping"
+        return 0
+    fi
+    log_info "template propagation: checking drift against TEMPLATE_REVISION=${current_rev}..."
+    local drifted=() up_to_date=() tid stored cfg
+    while IFS= read -r tid; do
+        [[ -z "$tid" ]] && continue
+        cfg="/etc/be-BOP/${tid}/config.env"
+        [[ -f "$cfg" ]] || continue
+        stored=$(grep -oP '^# tooling-fingerprint: \K\S+' "$cfg" 2>/dev/null || echo "")
+        if [[ "$stored" == "$current_rev" ]]; then
+            up_to_date+=("$tid")
+        else
+            drifted+=("$tid")
+        fi
+    done < <(registry_list_by_status active)
+    if (( ${#drifted[@]} == 0 )); then
+        log_info "template propagation: no drift (${#up_to_date[@]} tenant(s) already on ${current_rev})"
+        return 0
+    fi
+    log_info "template propagation: reapplying ${#drifted[@]} drifted tenant(s): ${drifted[*]}"
+    local failed=() ok=()
+    for tid in "${drifted[@]}"; do
+        if "$add_tenant" --reapply "$tid"; then
+            ok+=("$tid")
+        else
+            failed+=("$tid")
+            log_warn "template propagation: reapply failed for '${tid}' — continuing with next tenant"
+        fi
+    done
+    if (( ${#failed[@]} > 0 )); then
+        log_warn "template propagation: ${#ok[@]} OK, ${#failed[@]} FAILED (${failed[*]}) — investigate before next bootstrap"
+    else
+        log_info "template propagation: ${#ok[@]} tenant(s) reapplied OK"
+    fi
+}
+
 # === Summary ===========================================================
 step_print_summary() {
     local title="be-BOP multi-tenant host bootstrap COMPLETE"
@@ -1655,6 +1717,8 @@ main() {
     step_setup_test_tenant_deploy_api
     step_setup_tooling_mongodb
     step_setup_mail_relay
+
+    step_propagate_template_changes
 
     step_print_summary
 }

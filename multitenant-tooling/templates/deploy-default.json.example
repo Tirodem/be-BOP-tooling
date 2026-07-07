@@ -5,7 +5,10 @@
     "$note": "Feature knobs applied to every new tenant unless a CLI flag overrides. Mongo is always ON (main storage, no knob).",
     "phoenixd": true,
     "local_s3": true,
-    "mail_relay": true
+    "mail_relay": true,
+
+    "$propagate_note": "When true, host-bootstrap.sh reapplies every active tenant whose stored template_revision differs from the tooling's current one (drift detection). Restarts the tenant's bebop@ service. Default false: template changes require an explicit add-tenant.sh --reapply per tenant.",
+    "propagate_template_changes": false
   },
 
   "profiles": {
