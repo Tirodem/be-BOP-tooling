@@ -1273,8 +1273,11 @@ apply_runtime_config_overrides() {
         done
         return 0
     fi
-    if ! mongo_wait_ready "$MONGO_PORT" 60 1; then
-        die "runtime-config: mongod@${TENANT_ID} not ready on port ${MONGO_PORT}"
+    # Use the authed URI ($MONGO_URL) set by phase_mongo, not the raw
+    # port — after phase_mongo enables --auth on mongod@, an unauth port
+    # connect returns "not authorized" on runtimeConfig.updateOne.
+    if ! mongo_wait_ready "$MONGO_URL" 60 1; then
+        die "runtime-config: mongod@${TENANT_ID} not ready"
     fi
     local entry lock rest key value trimmed
     for entry in "${RUNTIME_CONFIG_OVERRIDES[@]}"; do
@@ -1291,10 +1294,10 @@ apply_runtime_config_overrides() {
         trimmed="${value#"${value%%[![:space:]]*}"}"
         if [[ "$trimmed" == "{"* || "$trimmed" == "["* ]] \
                 && printf '%s' "$value" | jq -e . >/dev/null 2>&1; then
-            mongo_runtime_config_upsert_obj "$MONGO_PORT" "$MONGO_DB_NAME" "$key" "$value" "$lock" \
+            mongo_runtime_config_upsert_obj "$MONGO_URL" "$MONGO_DB_NAME" "$key" "$value" "$lock" \
                 || die "runtime-config: upsert (object) failed for ${key}"
         else
-            mongo_runtime_config_upsert "$MONGO_PORT" "$MONGO_DB_NAME" "$key" "$value" "$lock" \
+            mongo_runtime_config_upsert "$MONGO_URL" "$MONGO_DB_NAME" "$key" "$value" "$lock" \
                 || die "runtime-config: upsert failed for ${key}"
         fi
     done
