@@ -86,11 +86,11 @@ export BEBOP_TOOLING_SYSLOG_IDENT
 : "${NODEJS_MAJOR_VERSION:=20}"
 : "${GARAGE_VERSION:=2.2.0}"
 : "${PHOENIXD_VERSION:=0.6.2}"
-# Pin pnpm so bootstraps are reproducible across days. `corepack prepare
-# pnpm@latest` would install whatever pnpm was tagged latest on that
-# clock, and produce subtly different lockfile resolutions from one host
-# to another. Bump this in a dedicated commit + note the change.
-: "${PNPM_VERSION:=9.15.1}"
+# Pin pnpm so bootstraps are reproducible across days AND aligned with
+# the `packageManager` field of be-BOP's own package.json — same pnpm
+# version dev/CI/prod = zero lockfile drift. Bump this in the same
+# commit that syncs to a new be-BOP packageManager version.
+: "${PNPM_VERSION:=9.15.9}"
 # Optional SHA256 for the Garage and phoenixd binaries. When set, the
 # downloader verifies the hash before installing — a corrupted download
 # or a swapped upstream artefact fails loudly instead of running as root
@@ -357,6 +357,15 @@ step_install_nodejs_pnpm() {
     log_info "Enabling corepack and pinning pnpm@${PNPM_VERSION}..."
     maybe_run run_privileged corepack enable
     maybe_run run_privileged corepack prepare "pnpm@${PNPM_VERSION}" --activate
+    # Fail-fast guard: if the pinned pnpm can't run (Node/pnpm ABI
+    # mismatch introduced by a future bump), we crash HERE with a
+    # meaningful message instead of leaving a broken pnpm for the first
+    # add-tenant to hit at `pnpm install` time — where the operator has
+    # no context to diagnose.
+    if [[ "$DRY_RUN" != "true" ]]; then
+        pnpm --version >/dev/null 2>&1 \
+            || die "pnpm cassé — corepack a livré pnpm@${PNPM_VERSION} incompatible avec Node ${NODEJS_MAJOR_VERSION} sur cet host. Vérifie l'accord PNPM_VERSION / NODEJS_MAJOR_VERSION."
+    fi
 }
 
 # Verify sha256 of a downloaded binary. Empty $expected → warn + skip
