@@ -340,11 +340,14 @@ mongo_collection_upsert_doc() {
     coll_json=$(printf '%s' "$coll" | jq -Rsa .)
     doc_b64=$(printf '%s' "$doc" | base64 -w0)
     # Base64 → we don't fight quote escaping inside mongosh --eval.
-    # atob is a Node global (mongosh runs on Node 16+). EJSON.parse
-    # resolves { "$oid": "..." } → ObjectId, { "$date": ... } → Date, etc.
+    # Buffer.from(b64, 'base64').toString('utf8') decodes the payload as
+    # UTF-8 explicitly. atob() would decode to a Latin-1 string, mangling
+    # any non-ASCII byte pair (e.g. "é" → "Ã©") before EJSON.parse can
+    # see the JSON. Buffer is a Node global available in mongosh.
+    # EJSON.parse resolves { "$oid": "..." } → ObjectId, etc.
     local js
     js=$(cat <<JS
-const doc = EJSON.parse(atob("${doc_b64}"));
+const doc = EJSON.parse(Buffer.from("${doc_b64}", "base64").toString("utf8"));
 const now = new Date();
 const _id = doc._id;
 delete doc._id;
