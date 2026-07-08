@@ -68,8 +68,14 @@ server {
         proxy_set_header Host $host;
     }
 
-    # The single business endpoint. IP whitelisted; HMAC verified by daemon.
-    location = /deploy-test-tenant {
+    # The business endpoint. IP whitelisted; HMAC verified by daemon.
+    # Regex match so both /deploy-test-tenant (no profile) and
+    # /deploy-test-tenant/<profile> (with profile suffix) are routed to
+    # the daemon. A prior `location = /deploy-test-tenant` (exact match)
+    # sent the profile path to the catch-all `return 444`, which HTTP/2
+    # surfaces to the client as PROTOCOL_ERROR (stream reset with no
+    # clean response).
+    location ~ ^/deploy-test-tenant(/|$) {
 @allow_block@
         proxy_pass http://127.0.0.1:@daemon_port@;
         proxy_set_header Host $host;
