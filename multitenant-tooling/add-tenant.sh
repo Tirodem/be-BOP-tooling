@@ -1371,6 +1371,67 @@ apply_runtime_config_overrides() {
     done
 }
 
+# Materialise the `seeds` sub-object of a deploy-default.json profile:
+# upsert every document under seeds.<collection> into that collection on
+# the tenant's mongo. Fresh-only path (mirrors apply_profile — reapply
+# doesn't re-seed to avoid stomping merchant edits).
+#
+# Guardrails:
+#   - 'runtimeConfig' is refused (use locked/unlocked in the profile).
+#   - System collections (system.*, __*, local.*) are refused.
+#   - Each doc MUST carry an "_id" field (upsert key).
+#
+# See mongo_collection_upsert_doc for the mongosh JS and BSON caveat.
+apply_collection_seeds() {
+    [[ -z "$PROFILE" ]] && return 0
+    local file="$DEPLOY_DEFAULT_FILE"
+    [[ ! -f "$file" ]] && return 0
+    local has_seeds
+    has_seeds=$(jq -r --arg p "$PROFILE" \
+        'if .profiles[$p] | has("seeds") then "true" else "false" end' \
+        "$file" 2>/dev/null || echo "false")
+    [[ "$has_seeds" != "true" ]] && return 0
+
+    log_info "applying collection seeds for profile '${PROFILE}'..."
+    if [[ "$DRY_RUN" == "true" ]]; then
+        jq -c --arg p "$PROFILE" \
+            '.profiles[$p].seeds | to_entries[] as $e | $e.value[] | {c: $e.key, d: .}' \
+            "$file" \
+            | while IFS= read -r line; do
+                log_info "[dry-run] collection-seed: ${line}"
+            done
+        return 0
+    fi
+
+    if ! mongo_wait_ready "$MONGO_URL" 60 1; then
+        die "collection-seeds: mongod@${TENANT_ID} not ready"
+    fi
+
+    local coll
+    while IFS= read -r coll; do
+        [[ -z "$coll" ]] && continue
+        if [[ "$coll" == "runtimeConfig" ]]; then
+            die "collection-seeds: refusing to seed 'runtimeConfig' via seeds/ — use locked/unlocked in the profile instead"
+        fi
+        if [[ "$coll" == system.* || "$coll" == __* || "$coll" == local.* ]]; then
+            die "collection-seeds: refusing to seed system/local collection '${coll}'"
+        fi
+        local doc_count=0
+        local doc_json
+        while IFS= read -r doc_json; do
+            [[ -z "$doc_json" ]] && continue
+            if ! printf '%s' "$doc_json" | jq -e 'has("_id")' >/dev/null 2>&1; then
+                die "collection-seeds: doc in '${coll}' is missing _id: ${doc_json}"
+            fi
+            mongo_collection_upsert_doc "$MONGO_URL" "$MONGO_DB_NAME" "$coll" "$doc_json" \
+                || die "collection-seeds: upsert failed for '${coll}': ${doc_json}"
+            (( ++doc_count ))
+        done < <(jq -c --arg p "$PROFILE" --arg c "$coll" \
+            '.profiles[$p].seeds[$c][]' "$file")
+        log_info "collection '${coll}': ${doc_count} doc(s) upserted"
+    done < <(jq -r --arg p "$PROFILE" '.profiles[$p].seeds | keys[]' "$file")
+}
+
 # Phase 12: bebop service
 phase_bebop_service() {
     log_info "phase 12: bebop@${TENANT_ID}.service..."
@@ -1382,6 +1443,7 @@ phase_bebop_service() {
     # tenant, pointing at the local fake SMTP on 127.0.0.1:2525, which
     # then relays to the configured upstream provider).
     apply_runtime_config_overrides
+    apply_collection_seeds
     # Register the undo BEFORE the enable — if `systemctl enable --now` fails
     # (e.g. ExecStartPre error), `set -e` triggers exit immediately and the
     # rollback loop must know about the unit to disable it. Registering after

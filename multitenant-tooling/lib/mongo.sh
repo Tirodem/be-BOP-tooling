@@ -296,3 +296,38 @@ mongo_runtime_config_upsert_obj() {
     fi
     log_info "mongo: runtimeConfig.${key} upserted as object (lock=${lock})"
 }
+
+# mongo_collection_upsert_doc <target> <db> <collection> <doc_json>
+# Upsert an arbitrary document into <collection>, keyed by its `_id` field.
+# The doc's own fields are $set; `createdAt` is $setOnInsert; `updatedAt`
+# is stamped with now. Used by add-tenant.sh apply_collection_seeds to
+# materialise the `seeds` sub-object of a deploy-default.json profile
+# (typically vatProfiles, deliveryProfiles, and other reference tables
+# that live in dedicated collections rather than runtimeConfig).
+#
+# Constraint: doc_json MUST contain "_id". JSON extended types (ObjectId,
+# ISODate) are NOT supported — plain JSON only. Operators writing seeds
+# use string or numeric _ids, not BSON extended notation.
+mongo_collection_upsert_doc() {
+    local target="$1" db="$2" coll="$3" doc="$4"
+    if ! printf '%s' "$doc" | jq -e 'has("_id")' >/dev/null 2>&1; then
+        log_error "mongo_collection_upsert_doc: doc missing _id: ${doc}"
+        return 1
+    fi
+    _mongo_conn_argv "$target"
+    local db_json coll_json id_json
+    db_json=$(printf '%s' "$db" | jq -Rsa .)
+    coll_json=$(printf '%s' "$coll" | jq -Rsa .)
+    id_json=$(printf '%s' "$doc" | jq -c '._id')
+    # Object.assign(doc, {updatedAt: now}) so the operator-provided fields
+    # win over any accidental collision with our timestamp, EXCEPT
+    # updatedAt itself which we override deliberately.
+    local js
+    js=$(printf 'const now = new Date(); db.getSiblingDB(%s).getCollection(%s).updateOne({_id: %s}, { $set: Object.assign(%s, { updatedAt: now }), $setOnInsert: { createdAt: now } }, {upsert: true});' \
+        "$db_json" "$coll_json" "$id_json" "$doc")
+    if ! mongosh --quiet "${MONGO_CONN_ARGV[@]}" --eval "$js" >/dev/null 2>&1; then
+        log_error "mongo_collection_upsert_doc: failed for _id=${id_json} on ${db}.${coll}"
+        return 1
+    fi
+    log_info "mongo: ${coll}._id=${id_json} upserted"
+}

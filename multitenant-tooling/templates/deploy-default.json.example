@@ -28,6 +28,13 @@
       "unlocked": {
         "websiteTitle": "My be-BOP Shop",
         "logoUrl": "https://example.com/logo.png"
+      },
+      "$seeds_note": "Optional. Each key under 'seeds' is a target Mongo collection name in the tenant's DB; each value is an array of documents to upsert by _id. Fresh-creation only (like locked/unlocked) — reapply skips seeds to avoid stomping merchant edits. Refuses 'runtimeConfig' (use locked/unlocked) and system collections. Plain JSON only, no BSON extended notation (no ObjectId / ISODate literals).",
+      "seeds": {
+        "vatProfiles": [
+          { "_id": "xx-standard",    "rate": 20,  "label": "Taux normal" },
+          { "_id": "xx-intermediate", "rate": 10, "label": "Taux intermédiaire" }
+        ]
       }
     }
   }
