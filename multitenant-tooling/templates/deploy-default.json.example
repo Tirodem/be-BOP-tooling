@@ -29,11 +29,12 @@
         "websiteTitle": "My be-BOP Shop",
         "logoUrl": "https://example.com/logo.png"
       },
-      "$seeds_note": "Optional. Each key under 'seeds' is a target Mongo collection name in the tenant's DB; each value is an array of documents to upsert by _id. Fresh-creation only (like locked/unlocked) — reapply skips seeds to avoid stomping merchant edits. Refuses 'runtimeConfig' (use locked/unlocked) and system collections. Plain JSON only, no BSON extended notation (no ObjectId / ISODate literals).",
+      "$seeds_note": "Optional. Each key under 'seeds' is a target Mongo collection name in the tenant's DB; each value is an array of documents to upsert by _id. Fresh-creation only (like locked/unlocked) — reapply skips seeds to avoid stomping merchant edits. Refuses 'runtimeConfig' (use locked/unlocked) and system collections.",
+      "$id_forms": "_id accepts: (a) {\"$oid_from\": \"<slug>\"} → tooling derives a stable ObjectId via sha256(slug)[0..24]. Use this whenever the target collection is read by be-BOP with new ObjectId(_id) (e.g. vatProfiles). (b) {\"$oid\": \"<24-hex>\"} → explicit ObjectId literal (EJSON). (c) plain string/number → stored as-is (only safe when be-BOP doesn't wrap _id in ObjectId).",
       "seeds": {
         "vatProfiles": [
-          { "_id": "xx-standard",    "rate": 20,  "label": "Taux normal" },
-          { "_id": "xx-intermediate", "rate": 10, "label": "Taux intermédiaire" }
+          { "_id": { "$oid_from": "vatProfiles/xx/standard" },     "name": "Taux normal",        "rates": { "XX": 20 } },
+          { "_id": { "$oid_from": "vatProfiles/xx/intermediate" }, "name": "Taux intermédiaire", "rates": { "XX": 10 } }
         ]
       }
     }

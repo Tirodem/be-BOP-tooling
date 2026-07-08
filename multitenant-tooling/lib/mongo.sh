@@ -305,29 +305,60 @@ mongo_runtime_config_upsert_obj() {
 # (typically vatProfiles, deliveryProfiles, and other reference tables
 # that live in dedicated collections rather than runtimeConfig).
 #
-# Constraint: doc_json MUST contain "_id". JSON extended types (ObjectId,
-# ISODate) are NOT supported — plain JSON only. Operators writing seeds
-# use string or numeric _ids, not BSON extended notation.
+# `_id` handling (bash-side rewrite, then mongosh EJSON.parse):
+#   { "$oid_from": "<slug>" }  →  ObjectId(sha256(<slug>)[0..24])
+#       Deterministic derivation from a human-readable slug. Same slug
+#       always yields the same ObjectId, so re-seeds are idempotent
+#       (upsert matches the existing _id) and be-BOP's admin path
+#       (`new ObjectId(_id)`) works because we stored a real ObjectId.
+#   { "$oid": "<24-hex>" }     →  ObjectId(<24-hex>) via EJSON literal
+#   "<any string>"             →  kept as-is (string _id; only safe for
+#                                 collections that don't do `new ObjectId(_id)`)
+#   <number>                   →  kept as-is
+#
+# Required: doc_json MUST contain "_id". Other EJSON extended types
+# (ISODate, NumberDecimal…) pass through EJSON.parse as-is if the caller
+# writes them, but tooling doesn't derive them.
 mongo_collection_upsert_doc() {
     local target="$1" db="$2" coll="$3" doc="$4"
     if ! printf '%s' "$doc" | jq -e 'has("_id")' >/dev/null 2>&1; then
         log_error "mongo_collection_upsert_doc: doc missing _id: ${doc}"
         return 1
     fi
+    # Detect { "$oid_from": <slug> } and rewrite to { "$oid": <hash24> }.
+    # sha256sum output = "<hex64>  -\n"; awk grabs field 1, cut narrows to 24.
+    if printf '%s' "$doc" | jq -e '._id | type == "object" and has("$oid_from")' >/dev/null 2>&1; then
+        local slug hash24
+        slug=$(printf '%s' "$doc" | jq -r '._id["$oid_from"]')
+        hash24=$(printf '%s' "$slug" | sha256sum | awk '{print $1}' | cut -c1-24)
+        doc=$(printf '%s' "$doc" | jq --arg h "$hash24" '._id = {"$oid": $h}')
+        log_info "mongo: ${coll} derived _id ObjectId(\"${hash24}\") from \"${slug}\""
+    fi
     _mongo_conn_argv "$target"
-    local db_json coll_json id_json
+    local db_json coll_json doc_b64
     db_json=$(printf '%s' "$db" | jq -Rsa .)
     coll_json=$(printf '%s' "$coll" | jq -Rsa .)
-    id_json=$(printf '%s' "$doc" | jq -c '._id')
-    # Object.assign(doc, {updatedAt: now}) so the operator-provided fields
-    # win over any accidental collision with our timestamp, EXCEPT
-    # updatedAt itself which we override deliberately.
+    doc_b64=$(printf '%s' "$doc" | base64 -w0)
+    # Base64 → we don't fight quote escaping inside mongosh --eval.
+    # atob is a Node global (mongosh runs on Node 16+). EJSON.parse
+    # resolves { "$oid": "..." } → ObjectId, { "$date": ... } → Date, etc.
     local js
-    js=$(printf 'const now = new Date(); db.getSiblingDB(%s).getCollection(%s).updateOne({_id: %s}, { $set: Object.assign(%s, { updatedAt: now }), $setOnInsert: { createdAt: now } }, {upsert: true});' \
-        "$db_json" "$coll_json" "$id_json" "$doc")
+    js=$(cat <<JS
+const doc = EJSON.parse(atob("${doc_b64}"));
+const now = new Date();
+const _id = doc._id;
+delete doc._id;
+doc.updatedAt = now;
+db.getSiblingDB(${db_json}).getCollection(${coll_json}).updateOne(
+    { _id: _id },
+    { \$set: doc, \$setOnInsert: { createdAt: now } },
+    { upsert: true }
+);
+JS
+)
     if ! mongosh --quiet "${MONGO_CONN_ARGV[@]}" --eval "$js" >/dev/null 2>&1; then
-        log_error "mongo_collection_upsert_doc: failed for _id=${id_json} on ${db}.${coll}"
+        log_error "mongo_collection_upsert_doc: failed on ${db}.${coll} (doc=${doc})"
         return 1
     fi
-    log_info "mongo: ${coll}._id=${id_json} upserted"
+    log_info "mongo: ${coll} doc upserted"
 }
