@@ -18,5 +18,5 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/backup-tenants.sh --all --non-interactive
+ExecStart=/usr/local/bin/backup-tenants.sh --all
 SyslogIdentifier=tooling-backup-tenants
