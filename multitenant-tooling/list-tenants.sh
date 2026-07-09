@@ -97,15 +97,49 @@ if ! run_privileged test -f "$REGISTRY_PATH"; then
     exit 0
 fi
 
-# read_tsv: emit the (optionally filtered) registry on stdout, header included.
-# The status column is index 11 (post the mongo_port schema bump).
+# read_tsv: emit the (optionally filtered) registry on stdout AFTER a
+# display-only reshape. Registry file itself is untouched. Transformations:
+#   - domain            → domain:bebop_port      (e.g. "shop.example.com:3005")
+#   - ln_port           = ex-phoenixd_port       (renamed for compactness)
+#   - mongodb_database  → mongodb_database:mongo_port  (e.g. "bebop_x:27030")
+#   - garage_key        DROPPED (long, rarely needed for triage)
+#   - bebop_port / phoenixd_port / mongo_port DROPPED as standalone columns
+#   - expires_at        appended from test-tenant-expiry.tsv (empty if untracked)
+# Column headers in emitted output reflect the new schema.
 read_tsv() {
-    if [[ -n "$STATUS_FILTER" ]]; then
-        run_privileged awk -F'\t' -v s="$STATUS_FILTER" \
-            'NR==1 || $11==s' "$REGISTRY_PATH"
-    else
-        run_privileged cat "$REGISTRY_PATH"
+    local expiry_path="${TEST_TENANT_EXPIRY_PATH:-/var/lib/be-BOP/test-tenant-expiry.tsv}"
+    local expiry_content=""
+    if run_privileged test -f "$expiry_path"; then
+        expiry_content=$(run_privileged cat "$expiry_path")
     fi
+    local status_filter="${STATUS_FILTER:-}"
+    # Registry columns: 1=tenant_id 2=domain 3=bebop_port 4=phoenixd_port
+    # 5=mongo_port 6=mongodb_database 7=garage_bucket 8=garage_key
+    # 9=bebop_version 10=created_at 11=status 12=external.
+    run_privileged cat "$REGISTRY_PATH" | awk -F'\t' -v OFS='\t' \
+        -v sfilter="$status_filter" -v expiry_data="$expiry_content" '
+        BEGIN {
+            if (expiry_data != "") {
+                n = split(expiry_data, lines, "\n")
+                for (i = 2; i <= n; i++) {
+                    if (lines[i] == "") continue
+                    split(lines[i], f, "\t")
+                    if (f[1] != "") expiry[f[1]] = f[2]
+                }
+            }
+        }
+        NR == 1 {
+            print "tenant_id", "domain", "ln_port", "mongodb_database", \
+                  "garage_bucket", "bebop_version", "created_at", "status", \
+                  "external", "expires_at"
+            next
+        }
+        {
+            if (sfilter != "" && $11 != sfilter) next
+            expires = ($1 in expiry) ? expiry[$1] : ""
+            print $1, $2 ":" $3, $4, $6 ":" $5, $7, $9, $10, $11, $12, expires
+        }
+    '
 }
 
 systemd_state_for() {
