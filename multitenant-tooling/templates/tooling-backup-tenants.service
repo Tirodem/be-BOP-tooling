@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# tooling-backup-tenants.service — nightly backup of all active tenants,
+# invoked by tooling-backup-tenants.timer. Default schedule: daily at
+# 02:30 UTC. Installed (and toggled enable/disable) by host-bootstrap.sh
+# based on BEBOP_NIGHTLY_BACKUP_ENABLED in /etc/be-BOP-tooling/secrets.env.
+#
+# backup-tenants.sh handles per-tenant dump + local retention + SFTP push
+# when BEBOP_BACKUP_SFTP_* secrets are set. Ordered BEFORE the tooling
+# backup timer so the tenant dumps are complete when the host-level
+# backup captures the registry.
+
+[Unit]
+Description=be-BOP nightly backup — all active tenants
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/backup-tenants.sh --all --non-interactive
+SyslogIdentifier=tooling-backup-tenants

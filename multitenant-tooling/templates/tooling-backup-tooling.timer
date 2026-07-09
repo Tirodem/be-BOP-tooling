@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# Daily at 03:00 UTC. Persistent=true so a missed run on a stopped VDS
+# catches up on next boot. 30 min after tooling-backup-tenants so the
+# per-tenant dumps have already landed.
+
+[Unit]
+Description=be-BOP nightly backup — host-level tooling state
+Documentation=https://be-bop.io/
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 UTC
+Persistent=true
+Unit=tooling-backup-tooling.service
+
+[Install]
+WantedBy=timers.target

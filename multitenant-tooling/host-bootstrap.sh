@@ -830,6 +830,35 @@ step_install_tooling_libs_and_scripts() {
     done
 }
 
+# === Nightly backup timers (optional) ==================================
+# Two timers: tenants first (02:30), then host-level tooling state (03:00),
+# ordered so per-tenant dumps land before the registry snapshot. Both are
+# installed unconditionally (cheap, no behavior unless enabled) and
+# toggled on/off by BEBOP_NIGHTLY_BACKUP_ENABLED in secrets.env. Toggling
+# the var + re-running host-bootstrap.sh is the supported switch.
+step_setup_nightly_backup() {
+    log_info "Installing tooling-backup-tenants / -tooling systemd units..."
+    local u
+    for u in tooling-backup-tenants.service tooling-backup-tenants.timer \
+             tooling-backup-tooling.service tooling-backup-tooling.timer; do
+        maybe_run run_privileged install -m 0644 \
+            "${BEBOP_TOOLING_TEMPLATE_DIR}/${u}" "/etc/systemd/system/${u}"
+    done
+    maybe_run run_privileged systemctl daemon-reload
+    case "${BEBOP_NIGHTLY_BACKUP_ENABLED:-}" in
+        true|1|yes|on)
+            log_info "BEBOP_NIGHTLY_BACKUP_ENABLED=true — enabling backup timers (02:30 UTC tenants, 03:00 UTC host)"
+            maybe_run run_privileged systemctl enable --now tooling-backup-tenants.timer
+            maybe_run run_privileged systemctl enable --now tooling-backup-tooling.timer
+            ;;
+        *)
+            log_info "BEBOP_NIGHTLY_BACKUP_ENABLED unset/false — keeping backup timers disabled"
+            maybe_run run_privileged systemctl disable --now tooling-backup-tenants.timer 2>/dev/null || true
+            maybe_run run_privileged systemctl disable --now tooling-backup-tooling.timer 2>/dev/null || true
+            ;;
+    esac
+}
+
 # === Nightly fleet upgrade timer (optional) ============================
 # Installs tooling-upgrade-all.{service,timer} unconditionally (cheap, no
 # behavior unless the timer is enabled). Then enables OR disables the
@@ -1717,6 +1746,7 @@ main() {
     step_install_certbot_nginx_reload_hook
     step_setup_cert_renewal_monitoring
     step_setup_nightly_upgrade
+    step_setup_nightly_backup
 
     step_setup_test_tenant_deploy_api
     step_setup_tooling_mongodb

@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# tooling-backup-tooling.service — nightly backup of host-level tooling
+# state (registry, deploy-default.json, secrets sidecars, mail-relay DB),
+# invoked by tooling-backup-tooling.timer. Default schedule: daily at
+# 03:00 UTC. Installed (and toggled enable/disable) by host-bootstrap.sh
+# based on BEBOP_NIGHTLY_BACKUP_ENABLED in /etc/be-BOP-tooling/secrets.env.
+#
+# Scheduled 30 min after tooling-backup-tenants so per-tenant dumps
+# are on disk before this snapshot captures the registry.
+
+[Unit]
+Description=be-BOP nightly backup — host-level tooling state
+After=network-online.target tooling-backup-tenants.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/backup-tooling.sh --non-interactive
+SyslogIdentifier=tooling-backup-tooling
