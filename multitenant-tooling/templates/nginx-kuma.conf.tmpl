@@ -25,6 +25,17 @@ server {
     listen [::]:80;
     server_name @kuma_hostname@;
 
+    # HTTP-01 webroot for certbot renewals. Must live BEFORE `location /`
+    # so the redirect to HTTPS does not intercept the challenge path —
+    # otherwise LE follows the 307 to https://…/.well-known/acme-challenge/
+    # and hits Kuma's HTML app, which returns 200 with the wrong body
+    # (validation failure: "Invalid response ... <!DOCTYPE html>").
+    location /.well-known/acme-challenge/ {
+        root /var/lib/letsencrypt/;
+        default_type "text/plain";
+        allow all;
+    }
+
     location / {
         return 307 https://$host$request_uri;
     }
