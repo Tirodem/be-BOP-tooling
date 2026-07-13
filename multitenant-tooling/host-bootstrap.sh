@@ -1034,6 +1034,51 @@ step_install_netdata() {
     maybe_run run_privileged systemctl enable --now netdata
 }
 
+# _cert_covers_hostname <cert_name> <hostname> — does the LE cert
+# at /etc/letsencrypt/live/<cert_name>/fullchain.pem include <hostname>
+# in its Subject Alternative Names? Returns 0 if yes, non-zero if no
+# (including "cert does not exist yet").
+#
+# WHY THIS EXISTS: the host-service setup steps (netdata, kuma,
+# deploy-api) used to guard their `certbot certonly` with just
+# `test -d /etc/letsencrypt/live/<name>` — which meant that once a cert
+# had been issued, changing KUMA/NETDATA/DEPLOY_API_PUBLIC_HOSTNAME in
+# secrets.env and re-running host-bootstrap.sh was a no-op: the vhost
+# got the new server_name but nginx kept loading the stale cert whose
+# SAN no longer matched. Browsers saw a CN mismatch and `certbot renew`
+# eventually failed on a defunct DNS provider. This helper turns the
+# guard into an actual coverage check.
+_cert_covers_hostname() {
+    local cert_name="$1" hostname="$2"
+    local pem="/etc/letsencrypt/live/${cert_name}/fullchain.pem"
+    run_privileged test -f "$pem" || return 1
+    # The SANs live in the "X509v3 Subject Alternative Name" extension
+    # as "DNS:foo, DNS:bar". `grep -oE 'DNS:[^,]+'` + sed strip yields
+    # one SAN per line; `grep -Fxq` matches whole-line, fixed-string,
+    # against the target hostname.
+    run_privileged openssl x509 -in "$pem" -noout -text 2>/dev/null \
+        | grep -oE 'DNS:[^,]+' \
+        | sed 's/^DNS: *//' \
+        | grep -Fxq "$hostname"
+}
+
+# _reissue_cert_if_stale <cert_name> <hostname> — if a cert with this
+# name exists but no longer covers <hostname>, delete it so the caller's
+# subsequent `certbot certonly --cert-name <name> -d <hostname>` produces
+# a fresh cert with the correct SAN. No-op if the cert already covers
+# the hostname OR does not exist at all.
+_reissue_cert_if_stale() {
+    local cert_name="$1" hostname="$2"
+    if _cert_covers_hostname "$cert_name" "$hostname"; then
+        return 0
+    fi
+    if run_privileged test -d "/etc/letsencrypt/live/${cert_name}"; then
+        log_warn "Cert ${cert_name} does not cover ${hostname} (hostname changed?) — deleting so it can be reissued"
+        run_privileged certbot delete --cert-name "$cert_name" -n \
+            || log_warn "certbot delete ${cert_name} failed; certonly may still recover via --expand"
+    fi
+}
+
 # === Netdata public reverse-proxy (optional, opt-in via secrets.env) ====
 # When NETDATA_PUBLIC_HOSTNAME is set, expose the Netdata UI publicly
 # behind nginx + Let's Encrypt + HTTP basic auth. The hostname must
@@ -1077,8 +1122,9 @@ step_setup_netdata_public_access() {
     dns_provider_dns_zone_refresh
 
     # 2. TLS cert (single-domain, via our certbot --manual hooks).
-    if run_privileged test -d /etc/letsencrypt/live/netdata-host; then
-        log_info "Cert netdata-host already issued ✓"
+    _reissue_cert_if_stale netdata-host "$hostname"
+    if _cert_covers_hostname netdata-host "$hostname"; then
+        log_info "Cert netdata-host already covers ${hostname} ✓"
     else
         local acme_email="${LE_OPERATOR_EMAIL:-${ADMIN_EMAIL:-}}"
         if [[ -z "$acme_email" ]]; then
@@ -1197,8 +1243,9 @@ step_setup_kuma_public_access() {
     dns_provider_dns_zone_refresh
 
     # 2. TLS cert (single-domain, via certbot --manual + our hooks).
-    if run_privileged test -d /etc/letsencrypt/live/kuma-host; then
-        log_info "Cert kuma-host already issued ✓"
+    _reissue_cert_if_stale kuma-host "$hostname"
+    if _cert_covers_hostname kuma-host "$hostname"; then
+        log_info "Cert kuma-host already covers ${hostname} ✓"
     else
         local acme_email="${LE_OPERATOR_EMAIL:-${ADMIN_EMAIL:-}}"
         if [[ -z "$acme_email" ]]; then
@@ -1328,8 +1375,9 @@ _deploy_api_install_public_exposure() {
     dns_provider_dns_record_create "$sub" A "$host_ip" >/dev/null
     dns_provider_dns_zone_refresh
 
-    if run_privileged test -d /etc/letsencrypt/live/bebop-deploy-api; then
-        log_info "Cert bebop-deploy-api already issued ✓"
+    _reissue_cert_if_stale bebop-deploy-api "$hostname"
+    if _cert_covers_hostname bebop-deploy-api "$hostname"; then
+        log_info "Cert bebop-deploy-api already covers ${hostname} ✓"
     else
         local acme_email="${LE_OPERATOR_EMAIL:-}"
         if [[ -z "$acme_email" ]]; then
