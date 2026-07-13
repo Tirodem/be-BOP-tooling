@@ -236,6 +236,7 @@ chmod 0755 \
     "${INSTALL_DIR}/gh-rate-limit.sh" \
     "${INSTALL_DIR}/certbot-renew-check.sh" \
     "${INSTALL_DIR}/migrate-certbot-renewals.sh" \
+    "${INSTALL_DIR}/dns-external.sh" \
     "${INSTALL_DIR}/backup-tenants.sh" \
     "${INSTALL_DIR}/backup-tooling.sh" \
     "${INSTALL_DIR}/restore-tenant.sh" \
