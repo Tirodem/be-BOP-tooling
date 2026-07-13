@@ -91,13 +91,22 @@ fi
 
 IP4="${BEBOP_HOST_IP:-}"
 if [[ -z "$IP4" ]]; then
-    IP4=$(curl -sS -4 --max-time 10 https://api.ipify.org 2>/dev/null || true)
+    # Mirror add-tenant.sh detect_host_ip: same endpoint, no -4 flag
+    # forcing (api.ipify.org has only an A record so curl picks v4
+    # automatically).
+    IP4=$(curl -sS --max-time 10 https://api.ipify.org 2>/dev/null || true)
 fi
 [[ -z "$IP4" ]] && die "could not determine the VDS IPv4 (set BEBOP_HOST_IP in secrets.env or check network)"
 
 IP6="${BEBOP_HOST_IPV6:-}"
 if [[ -z "$IP6" ]]; then
-    IP6=$(curl -sS -6 --max-time 10 https://api64.ipify.org 2>/dev/null || true)
+    # Use api6.ipify.org (v6-only endpoint), NOT api64.ipify.org — the
+    # dual-stack endpoint can return a truncated prefix like
+    # `2a02:xxxx:yyyy:zzzz::` on some VDS setups, which then mismatches
+    # what add-tenant.sh sees via api6 (`…::1`). Client sets the wrong
+    # AAAA and the external-domain pre-flight blows up. Same source ==
+    # same answer.
+    IP6=$(curl -sS --max-time 10 https://api6.ipify.org 2>/dev/null || true)
 fi
 [[ -z "$IP6" ]] && die "could not determine the VDS IPv6 — external-domain tenants require IPv6 on the VDS. Set BEBOP_HOST_IPV6 in secrets.env or enable IPv6 on the network stack."
 
