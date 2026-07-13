@@ -235,7 +235,7 @@ chmod 0755 \
     "${INSTALL_DIR}/tenant-cli.sh" \
     "${INSTALL_DIR}/gh-rate-limit.sh" \
     "${INSTALL_DIR}/certbot-renew-check.sh" \
-    "${INSTALL_DIR}/migrate-certbot-multi-zone.sh" \
+    "${INSTALL_DIR}/migrate-certbot-renewals.sh" \
     "${INSTALL_DIR}/backup-tenants.sh" \
     "${INSTALL_DIR}/backup-tooling.sh" \
     "${INSTALL_DIR}/restore-tenant.sh" \
@@ -251,6 +251,11 @@ chmod 0755 \
 # Hooks must be executable for certbot --manual-{auth,cleanup}-hook
 # to invoke them; safety net if the tarball didn't preserve +x.
 chmod 0755 "${INSTALL_DIR}/hooks/"*.sh 2>/dev/null || true
+
+# Purge scripts renamed in-flight so a stale copy doesn't linger and get
+# picked up by muscle memory (`sudo migrate-certbot-multi-zone.sh` → not
+# what we ship anymore; use migrate-certbot-renewals.sh).
+rm -f "${INSTALL_DIR}/migrate-certbot-multi-zone.sh"
 
 # 4. Reconcile secrets.env: fresh / reset / resume.
 install -d -m 0700 "$SECRETS_DIR"
