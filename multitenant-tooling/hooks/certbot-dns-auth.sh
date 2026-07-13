@@ -49,19 +49,22 @@ source "${BEBOP_TOOLING_LIB_DIR}/dns_provider.sh"
 if [[ -z "${CERTBOT_DOMAIN:-}" || -z "${CERTBOT_VALIDATION:-}" ]]; then
     die "certbot-dns-auth: CERTBOT_DOMAIN / CERTBOT_VALIDATION not set in env"
 fi
-if [[ -z "${BEBOP_DNS_ZONE:-}" ]]; then
-    die "certbot-dns-auth: BEBOP_DNS_ZONE not set in $SECRETS_FILE"
-fi
+
+# Resolve the (zone, provider) covering CERTBOT_DOMAIN — matches against
+# BEBOP_DNS_ZONE (canonical) + BEBOP_DNS_EXTRA_ZONES (extras, "zone:provider"
+# space-separated). Side-effects: BEBOP_DNS_ZONE + DNS_PROVIDER now reflect
+# the resolved pair, and the matching backend is loaded. Dies if no zone
+# matches, which lets certbot skip this cert and continue with the others
+# instead of stalling the whole `certbot renew` batch.
+dns_provider_resolve_for_domain "$CERTBOT_DOMAIN"
 
 zone="$BEBOP_DNS_ZONE"
 domain="$CERTBOT_DOMAIN"
 if [[ "$domain" == "$zone" ]]; then
     sub="_acme-challenge"
-elif [[ "$domain" == *".${zone}" ]]; then
+else
     prefix="${domain%.${zone}}"
     sub="_acme-challenge.${prefix}"
-else
-    die "certbot-dns-auth: domain '${domain}' is not within zone '${zone}'"
 fi
 
 log_info "certbot-dns-auth: publishing TXT ${sub}.${zone} for ACME challenge"

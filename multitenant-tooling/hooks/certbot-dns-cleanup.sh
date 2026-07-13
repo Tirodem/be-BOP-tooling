@@ -30,8 +30,16 @@ source "${BEBOP_TOOLING_LIB_DIR}/log.sh"
 # shellcheck disable=SC1090
 source "${BEBOP_TOOLING_LIB_DIR}/dns_provider.sh"
 
-if [[ -z "${CERTBOT_DOMAIN:-}" || -z "${BEBOP_DNS_ZONE:-}" ]]; then
-    log_warn "certbot-dns-cleanup: missing CERTBOT_DOMAIN or BEBOP_DNS_ZONE; nothing to clean"
+if [[ -z "${CERTBOT_DOMAIN:-}" ]]; then
+    log_warn "certbot-dns-cleanup: missing CERTBOT_DOMAIN; nothing to clean"
+    exit 0
+fi
+
+# Cleanup runs even when auth failed, so resolution failures are downgraded
+# to a warn+exit-0 (best-effort semantics; certbot's overall flow shouldn't
+# fail over a stale cleanup). Auth-side already surfaced the real error.
+if ! dns_provider_resolve_for_domain "$CERTBOT_DOMAIN" 2>/dev/null; then
+    log_warn "certbot-dns-cleanup: no zone matches '${CERTBOT_DOMAIN}'; skipping"
     exit 0
 fi
 
@@ -39,12 +47,9 @@ zone="$BEBOP_DNS_ZONE"
 domain="$CERTBOT_DOMAIN"
 if [[ "$domain" == "$zone" ]]; then
     sub="_acme-challenge"
-elif [[ "$domain" == *".${zone}" ]]; then
+else
     prefix="${domain%.${zone}}"
     sub="_acme-challenge.${prefix}"
-else
-    log_warn "certbot-dns-cleanup: domain '${domain}' not within zone '${zone}'; skipping"
-    exit 0
 fi
 
 record_id=$(dns_provider_dns_record_find "$sub" TXT 2>/dev/null || true)
