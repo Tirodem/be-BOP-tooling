@@ -30,6 +30,15 @@
 #                                    looks for.
 #   reset-tenant <tenant_id>        rotate password (rare — compromise
 #                                    recovery); prints new password on stdout
+#   seed-smtp <tenant_id> --scaleway-domain-id <id>
+#                                    first-time seeding for a tenant whose
+#                                    Scaleway sending domain was created
+#                                    out-of-band (typical for --external-domain
+#                                    tenants: the tooling doesn't own the
+#                                    domain but the operator wants runtimeConfig.smtp
+#                                    seeded anyway). Refuses if a mail-relay
+#                                    row already exists — use reset-tenant to
+#                                    rotate.
 #   prune-send-log [--older-than-days=90]
 #                                    delete send_log rows past retention
 #   retry-upstream <tenant_id>|--all  declare the tenant's sending domain
@@ -98,6 +107,7 @@ Usage:
   mail-relay-ctl set-status <tenant_id> {active|disabled}
   mail-relay-ctl set-upstream-id <tenant_id> <domain_id>|-
   mail-relay-ctl reset-tenant <tenant_id>
+  mail-relay-ctl seed-smtp <tenant_id> --scaleway-domain-id <id>
   mail-relay-ctl prune-send-log [--older-than-days=90]
   mail-relay-ctl retry-upstream <tenant_id>|--all
   mail-relay-ctl -h | --help
@@ -315,6 +325,93 @@ cmd_reset_tenant() {
     log_warn "password rotated for '${tenant_id}' — reseed runtimeConfig.smtp on the tenant side"
 }
 
+# cmd_seed_smtp <tenant_id> --scaleway-domain-id <id>
+# First-time seeding for a tenant whose phase_mail_relay never ran (typical
+# --external-domain path where the operator disabled mail_relay in
+# deploy-default.json and provisioned the Scaleway sending domain by hand).
+#
+# Steps:
+#   1. Refuse if a mail-relay tenants row already exists (rotate = explicit
+#      reset-tenant + manual reseed).
+#   2. Fetch the sending domain's canonical full_name from Scaleway (via
+#      scaleway_tem_domain_get) using the id passed by the operator — we
+#      never compose the name ourselves here (external tenants often live
+#      under an operator-owned zone distinct from BEBOP_DNS_ZONE, e.g.
+#      be-bop.shop vs be-bop.dev).
+#   3. Generate + bcrypt-hash a fresh password, insert the tenants row with
+#      upstream_domain_id pre-set (so retry-upstream sweep doesn't try to
+#      re-create the domain on Scaleway).
+#   4. Write runtimeConfig.smtp into the tenant's DB (port 2525 fake SMTP
+#      local, user=<tid>, from=noreply@<full_name>).
+cmd_seed_smtp() {
+    local tenant_id="${1:-}"
+    _check_tenant_id "$tenant_id"
+    shift
+    local scaleway_domain_id=""
+    while (( $# )); do
+        case "$1" in
+            --scaleway-domain-id) scaleway_domain_id="$2"; shift 2 ;;
+            *) die "seed-smtp: unknown option '$1'" ;;
+        esac
+    done
+    [[ -z "$scaleway_domain_id" ]] \
+        && die "seed-smtp: --scaleway-domain-id required (Scaleway TEM sending domain UUID pre-created for this tenant)"
+    # Defence-in-depth against JS interpolation. UUIDs + Scaleway ids are
+    # hex/dash only in practice; anything outside this alphabet is rejected.
+    [[ "$scaleway_domain_id" =~ ^[A-Za-z0-9._-]+$ ]] \
+        || die "seed-smtp: --scaleway-domain-id contains unexpected characters"
+
+    local exists
+    exists=$(_mongo "print(db.tenants.countDocuments({_id:'${tenant_id}'}));")
+    [[ "$exists" != "0" ]] \
+        && die "tenant '${tenant_id}' already has a mail-relay row — use 'reset-tenant' to rotate (WARN: invalidates the current SMTP creds on the tenant side; be-BOP will fail to send until runtimeConfig.smtp is re-written)"
+
+    # shellcheck source=lib/scaleway.sh
+    source "${BEBOP_TOOLING_LIB_DIR}/scaleway.sh"
+    local domain_json full_name
+    if ! domain_json=$(scaleway_tem_domain_get "$scaleway_domain_id" 2>/dev/null); then
+        die "seed-smtp: could not query Scaleway for domain id '${scaleway_domain_id}' (check id + SCALEWAY_TEM_* creds in secrets.env)"
+    fi
+    full_name=$(printf '%s' "$domain_json" | jq -r '.name // empty')
+    [[ -z "$full_name" ]] \
+        && die "seed-smtp: Scaleway response missing .name for id '${scaleway_domain_id}'"
+
+    local tenant_cfg="/etc/be-BOP/${tenant_id}/config.env"
+    run_privileged test -f "$tenant_cfg" \
+        || die "seed-smtp: ${tenant_cfg} not found — is the tenant provisioned?"
+    local url db_name
+    url=$(run_privileged grep -oP '^MONGODB_URL=\K.*' "$tenant_cfg" 2>/dev/null || true)
+    db_name=$(run_privileged grep -oP '^MONGODB_DB=\K.*' "$tenant_cfg" 2>/dev/null || true)
+    [[ -z "$url" ]]     && die "seed-smtp: MONGODB_URL absent from ${tenant_cfg}"
+    [[ -z "$db_name" ]] && die "seed-smtp: MONGODB_DB absent from ${tenant_cfg}"
+    # Strip replicaSet + append directConnection so mongosh talks straight
+    # to the per-tenant mongod port — cf. reference_mongo_tenant_connect
+    # (RS discovery redirects to 127.0.0.1:27017 which is masked).
+    url="${url/&replicaSet=rs0/}&directConnection=true"
+
+    local password hash
+    password=$(_gen_password)
+    hash=$(_bcrypt_hash "$password")
+    _mongo "db.tenants.insertOne({_id:'${tenant_id}', pass_hash:'${hash}', mail_status:'active', upstream_domain_id:'${scaleway_domain_id}', created_at:new Date()});" >/dev/null
+
+    local smtp_value
+    smtp_value=$(jq -nc \
+        --arg host "127.0.0.1" \
+        --argjson port 2525 \
+        --arg user "$tenant_id" \
+        --arg pass "$password" \
+        --arg from "noreply@${full_name}" \
+        --argjson fake false \
+        '{host: $host, port: $port, user: $user, password: $pass, from: $from, fake: $fake}')
+
+    if ! mongo_runtime_config_upsert_obj "$url" "$db_name" "smtp" "$smtp_value" "false"; then
+        die "seed-smtp: failed to write runtimeConfig.smtp on ${db_name}"
+    fi
+
+    log_info "seed-smtp: tenant '${tenant_id}' seeded (from=noreply@${full_name}, upstream_domain_id=${scaleway_domain_id})"
+    log_info "seed-smtp: SMTP AUTH creds — user=${tenant_id} password=${password}"
+}
+
 cmd_prune_send_log() {
     local days=90
     for arg in "$@"; do
@@ -488,6 +585,7 @@ main() {
         set-status)      cmd_set_status "$@" ;;
         set-upstream-id) cmd_set_upstream_id "$@" ;;
         reset-tenant)    cmd_reset_tenant "$@" ;;
+        seed-smtp)       cmd_seed_smtp "$@" ;;
         prune-send-log)  cmd_prune_send_log "$@" ;;
         retry-upstream)  cmd_retry_upstream "$@" ;;
         -h|--help|help)  usage ;;
