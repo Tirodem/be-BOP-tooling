@@ -386,6 +386,30 @@ _verify_sha256() {
     log_info "sha256: ${label} verified ✓"
 }
 
+# Point the stow target at <pkg>, retiring any other version first.
+#
+# `stow --restow <new>` on its own does NOT switch versions. The symlinks in
+# the target belong to the previously stowed package; stow refuses to take
+# them over and leaves them alone. The new binary then sits unused in its
+# package directory while every caller keeps running the old one — silently,
+# since the restow itself doesn't fail the script. Observed on a phoenixd
+# 0.6.2 → 0.9.1 bump: /usr/local/bin/phoenixd still resolved to 0.6.2 after
+# a successful re-run of this script.
+#
+# So: unstow the siblings, then stow the wanted one. Idempotent — on a
+# re-run with no version change there is no sibling to retire.
+_stow_switch() {
+    local stow_dir="$1" pkg="$2" path other
+    for path in "${stow_dir}"/*/; do
+        [[ -d "$path" ]] || continue
+        other=$(basename "$path")
+        [[ "$other" == "$pkg" ]] && continue
+        log_info "stow: retiring ${other}"
+        ( cd "$stow_dir" && maybe_run run_privileged stow --delete "$other" ) || true
+    done
+    ( cd "$stow_dir" && maybe_run run_privileged stow --restow "$pkg" )
+}
+
 # === Garage binary ======================================================
 step_install_garage_binary() {
     local stow_dir="/usr/local/garage"
@@ -416,7 +440,7 @@ step_install_garage_binary() {
         trap - RETURN
     fi
     log_info "Stowing Garage..."
-    ( cd "${stow_dir}" && maybe_run run_privileged stow --restow "garage-v${GARAGE_VERSION}" )
+    _stow_switch "${stow_dir}" "garage-v${GARAGE_VERSION}"
 }
 
 # === phoenixd binary ====================================================
@@ -451,7 +475,7 @@ step_install_phoenixd_binary() {
         trap - RETURN
     fi
     log_info "Stowing phoenixd..."
-    ( cd "${stow_dir}" && maybe_run run_privileged stow --restow "phoenixd-${PHOENIXD_VERSION}" )
+    _stow_switch "${stow_dir}" "phoenixd-${PHOENIXD_VERSION}"
 }
 
 # === Filesystem skeleton ================================================
