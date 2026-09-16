@@ -85,7 +85,7 @@ export BEBOP_TOOLING_SYSLOG_IDENT
 # === Constants (overridable via environment) ===========================
 : "${NODEJS_MAJOR_VERSION:=20}"
 : "${GARAGE_VERSION:=2.2.0}"
-: "${PHOENIXD_VERSION:=0.6.2}"
+: "${PHOENIXD_VERSION:=0.9.1}"
 # Pin pnpm so bootstraps are reproducible across days AND aligned with
 # the `packageManager` field of be-BOP's own package.json — same pnpm
 # version dev/CI/prod = zero lockfile drift. Bump this in the same
