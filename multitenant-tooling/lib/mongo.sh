@@ -163,7 +163,11 @@ mongo_wait_ready_uri() {
 # (unauth, backward-compat, or pre-auth setup) or a full URI (post-auth).
 _mongo_conn_argv() {
     MONGO_CONN_ARGV=()
-    if [[ "$1" == mongodb://* ]]; then
+    # `mongodb+srv://` is accepted alongside `mongodb://`. It was never
+    # reachable here before — every tenant used a local mongod — but a
+    # tenant whose config.env declares an external cluster now flows
+    # through these helpers, and the scheme test is what routes it.
+    if [[ "$1" == mongodb://* || "$1" == mongodb+srv://* ]]; then
         MONGO_CONN_ARGV=("$1")
     else
         MONGO_CONN_ARGV=(--port "$1")

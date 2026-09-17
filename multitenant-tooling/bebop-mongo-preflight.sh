@@ -74,6 +74,50 @@ source "$BEBOP_TOOLING_LIB_DIR/mongo.sh"
 # We intentionally do NOT rely on the registry as primary source because
 # registry_add runs at phase 14 (after service start), so a fresh
 # provisioning would fail here on a stale registry read.
+# 0. External MongoDB? The tenant's config.env is authoritative for WHERE
+#    be-BOP connects, so that's what this preflight must check. When
+#    MONGODB_URL names anything other than a loopback mongod — an
+#    mongodb+srv:// cluster, or any remote host — there is no
+#    mongod@<tenant> to start and no single-node rs0 to initiate: the
+#    remote cluster owns its own topology. Verify the declared target is
+#    reachable and stop there.
+#
+#    Everything below this block assumes the "one local mongod per tenant"
+#    layout of the PoC. Without this branch, a tenant deliberately pointed
+#    at an external cluster still had a local mongod demanded of it, and
+#    bebop@<tenant> sat in start-pre until the wait timed out.
+CONFIG_ENV="/etc/be-BOP/${TENANT_ID}/config.env"
+DECLARED_URL=""
+if [[ -r "$CONFIG_ENV" ]]; then
+    DECLARED_URL=$(grep -oP '^MONGODB_URL=\K.*' "$CONFIG_ENV" 2>/dev/null || true)
+fi
+
+# Host of a mongodb:// or mongodb+srv:// URI: drop the scheme, drop any
+# user:password@ prefix, then cut at the first : / or ? that follows.
+_mongo_url_host() {
+    local hostpart="$1"
+    hostpart="${hostpart#mongodb+srv://}"
+    hostpart="${hostpart#mongodb://}"
+    hostpart="${hostpart##*@}"
+    hostpart="${hostpart%%[:/?]*}"
+    printf '%s' "$hostpart"
+}
+
+if [[ -n "$DECLARED_URL" ]]; then
+    case "$(_mongo_url_host "$DECLARED_URL")" in
+        127.0.0.1|localhost|::1|"")
+            : # loopback — the local-mongod path below applies
+            ;;
+        *)
+            log_info "preflight: external MongoDB declared in ${CONFIG_ENV} — not starting a local mongod for '${TENANT_ID}'"
+            mongo_wait_ready_uri "$DECLARED_URL" 30 1 \
+                || die "external MongoDB declared for '${TENANT_ID}' is not reachable"
+            log_info "preflight OK for '${TENANT_ID}' (external MongoDB)"
+            exit 0
+            ;;
+    esac
+fi
+
 PORT_ENV_FILE="/etc/be-BOP-mongodb/${TENANT_ID}/port.env"
 if [[ -r "$PORT_ENV_FILE" ]]; then
     # shellcheck disable=SC1090
