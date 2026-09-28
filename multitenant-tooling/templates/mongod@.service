@@ -45,6 +45,32 @@ EnvironmentFile=/etc/be-BOP-mongodb/%i/port.env
 # the credential file — no side effect.
 LoadCredential=keyfile:/etc/be-BOP-mongodb/keyfile
 
+# --wiredTigerCacheSizeGB is MANDATORY here, and 1 GiB is not a tuning
+# preference — it is what keeps the host alive.
+#
+# Left unset, WiredTiger sizes its cache at 50% of (host RAM - 1 GiB) and
+# each instance does that arithmetic on its own, blind to its siblings.
+# With one mongod per tenant that is a guaranteed oversubscription: on a
+# 24 GiB host every instance believes it may take ~11.5 GiB. They coexist
+# only because the cache fills lazily.
+#
+# It caught up with us on 2026-09-23 with 18 tenants: 19 mongod holding
+# 18.2 GiB of the 23.4 GiB in use (node: 4.5, phoenixd: 0.7), four of them
+# between 0.9 and 2.5 GiB against a 0.53 GiB median — a reporting query on
+# one tenant pulling its working set into an unbounded cache. The kernel
+# OOM-killed mongod@sandbox, then a second instance seven minutes later,
+# and the host went unreachable.
+#
+# Note this bounds the CACHE, not the RSS: expect ~1.4-1.8 GiB resident
+# per instance at this setting. Use MemoryHigh=/MemoryMax= for a hard
+# bound on the process.
+#
+# Per-tenant override, when one tenant genuinely needs more:
+#   /etc/systemd/system/mongod@<tenant>.service.d/cache.conf
+#     [Service]
+#     ExecStart=
+#     ExecStart=/usr/bin/mongod ... --wiredTigerCacheSizeGB 2 ...
+#
 # NOTE: ExecStart below uses bare $MONGO_AUTH_ARGS (no braces) so systemd
 # whitespace-SPLITS the value into distinct argv elements. With
 # ${MONGO_AUTH_ARGS} (braces), the whole "--auth --keyFile /..." string
@@ -55,6 +81,7 @@ ExecStart=/usr/bin/mongod \
     --bind_ip 127.0.0.1 \
     --port ${MONGO_PORT} \
     --replSet rs0 \
+    --wiredTigerCacheSizeGB 1 \
     --logpath /var/lib/be-BOP-mongodb/%i/mongod.log \
     --logappend \
     $MONGO_AUTH_ARGS
