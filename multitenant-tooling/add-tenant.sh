@@ -144,6 +144,27 @@ ENABLE_MAIL_RELAY=""  # set by --mail-relay / --no-mail-relay
 # deploy-default.json.profiles[<name>] to prepend runtimeConfig
 # overrides. Empty = no profile.
 PROFILE=""
+# Where this tenant came from, recorded once at fresh creation in
+# /etc/be-BOP/<tid>/origin and never rewritten afterwards.
+#
+# Why: nothing in the tooling used to persist it. A tenant that showed up
+# on a host left no trace of who or what created it — the only record was
+# the journal, which rolls. Asked after the fact ("where does this tenant
+# come from?"), the answer was unobtainable for anything older than the
+# journal retention.
+#
+# Set by --origin <string>. tooling-tenant-api.service passes the source
+# domain the webhook landed on; a manual run that omits the flag records
+# the invocation itself.
+#
+# It is NOT a registry column on purpose: lib/registry.sh's
+# _registry_repair_shifted_rows hardcodes twelve positional fields and
+# re-emits exactly twelve, so a thirteenth would mean re-auditing that
+# repair path plus all three migrations — on live hosts, for a metadata
+# field. The file rides the lifecycle of /etc/be-BOP/<tid>/ for free:
+# created by phase_dirs, archived by remove-tenant's `cp -a`, purged with
+# the directory.
+ORIGIN=""
 # Let's Encrypt staging mode. Use for repeated test provisionings so we
 # don't burn through prod's "5 duplicate certs per exact identifiers per
 # week" rate limit. Set via --staging on the CLI or BEBOP_LE_STAGING=true
@@ -211,6 +232,12 @@ Optional:
                           s3.<tenant_id>.<BEBOP_DNS_ZONE>. The main cert is
                           issued via HTTP-01 (separate from the S3 DNS-01
                           cert). Requires public IPv6 on the VDS.
+  --origin <string>       where this tenant comes from. Recorded once, at
+                          fresh creation, in /etc/be-BOP/<id>/origin, and
+                          never rewritten (reapply / --reactivate leave it
+                          alone). tooling-tenant-api passes the source
+                          domain the webhook landed on; omit it on a manual
+                          run and the invocation is recorded instead.
   --reactivate            restore a soft-deleted tenant (preserves data)
   --staging               issue certs against Let's Encrypt STAGING (untrusted
                           by browsers). Use for repeated test provisionings
@@ -239,6 +266,12 @@ Status semantics (looked up in /var/lib/be-BOP/tenants.tsv):
 EOF
 }
 
+# Snapshot the invocation before the loop consumes it — it's the fallback
+# value for --origin on a manual run. Quoted per-word so an argument with
+# spaces stays readable in the recorded line.
+INVOCATION=$(printf '%q ' "$(basename "$0")" "$@")
+INVOCATION="${INVOCATION% }"
+
 # Parse arguments — first non-flag is tenant_id.
 while (( $# )); do
     case "$1" in
@@ -252,6 +285,7 @@ while (( $# )); do
         --mail-relay)      ENABLE_MAIL_RELAY=true; shift ;;
         --no-mail-relay)   ENABLE_MAIL_RELAY=false; shift ;;
         --profile)         PROFILE="$2"; shift 2 ;;
+        --origin)          ORIGIN="$2"; shift 2 ;;
         --reactivate)      REACTIVATE=true; shift ;;
         --staging)         LE_STAGING=true; shift ;;
         --runtime-config)        parse_runtime_config_flag "false" "$2"; shift 2 ;;
@@ -796,6 +830,21 @@ phase_directories() {
     run_privileged install -d -m 0755 "/var/lib/be-BOP/${TENANT_ID}"
     run_privileged install -d -m 0755 "/var/lib/be-BOP/${TENANT_ID}/releases"
     run_privileged install -d -m 0755 "/etc/be-BOP/${TENANT_ID}"
+    # Record the origin, once. Write-if-absent rather than branching on
+    # fresh-vs-reapply: the first run is the only one that knows where the
+    # tenant came from, and every later run (reapply, --reactivate) must
+    # leave that answer untouched.
+    local origin_file="/etc/be-BOP/${TENANT_ID}/origin"
+    if ! run_privileged test -e "$origin_file"; then
+        local origin_value="${ORIGIN:-$INVOCATION}"
+        local origin_tmp
+        origin_tmp=$(mktemp)
+        printf 'origin=%s\nrecorded_at=%s\n' \
+            "$origin_value" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$origin_tmp"
+        run_privileged install -m 0644 "$origin_tmp" "$origin_file"
+        rm -f "$origin_tmp"
+        log_info "origin recorded in ${origin_file}: ${origin_value}"
+    fi
     if [[ "$ENABLE_PHOENIXD" == "true" ]]; then
         run_privileged install -d -m 0755 "/etc/phoenixd/${TENANT_ID}"
     fi

@@ -105,6 +105,8 @@ fi
 #   - garage_key        DROPPED (long, rarely needed for triage)
 #   - bebop_port / phoenixd_port / mongo_port DROPPED as standalone columns
 #   - expires_at        appended from test-tenant-expiry.tsv (empty if untracked)
+#   - origin            appended from /etc/be-BOP/<id>/origin (empty for
+#                       tenants created before the field existed)
 # Column headers in emitted output reflect the new schema.
 read_tsv() {
     local expiry_path="${TEST_TENANT_EXPIRY_PATH:-/var/lib/be-BOP/test-tenant-expiry.tsv}"
@@ -112,12 +114,29 @@ read_tsv() {
     if run_privileged test -f "$expiry_path"; then
         expiry_content=$(run_privileged cat "$expiry_path")
     fi
+    # Origin is NOT a registry column (see add-tenant.sh's ORIGIN comment:
+    # a 13th column would mean re-auditing registry.sh's shifted-row repair
+    # and its three migrations). It lives in /etc/be-BOP/<id>/origin, so we
+    # collect it here, one small read per tenant, and hand it to awk the
+    # same way as the expiry data.
+    local origin_data="" _tid _ofile _oval
+    while IFS= read -r _tid; do
+        [[ -z "$_tid" ]] && continue
+        _ofile="/etc/be-BOP/${_tid}/origin"
+        _oval=""
+        if run_privileged test -r "$_ofile"; then
+            _oval=$(run_privileged grep -oP '^origin=\K.*' "$_ofile" 2>/dev/null || true)
+        fi
+        origin_data+="${_tid}"$'\t'"${_oval}"$'\n'
+    done < <(run_privileged tail -n +2 "$REGISTRY_PATH" | cut -f1)
+
     local status_filter="${STATUS_FILTER:-}"
     # Registry columns: 1=tenant_id 2=domain 3=bebop_port 4=phoenixd_port
     # 5=mongo_port 6=mongodb_database 7=garage_bucket 8=garage_key
     # 9=bebop_version 10=created_at 11=status 12=external.
     run_privileged cat "$REGISTRY_PATH" | awk -F'\t' -v OFS='\t' \
-        -v sfilter="$status_filter" -v expiry_data="$expiry_content" '
+        -v sfilter="$status_filter" -v expiry_data="$expiry_content" \
+        -v origin_data="$origin_data" '
         BEGIN {
             if (expiry_data != "") {
                 n = split(expiry_data, lines, "\n")
@@ -127,17 +146,27 @@ read_tsv() {
                     if (f[1] != "") expiry[f[1]] = f[2]
                 }
             }
+            # No header on origin_data — we built it ourselves, so start at 1.
+            if (origin_data != "") {
+                m = split(origin_data, olines, "\n")
+                for (i = 1; i <= m; i++) {
+                    if (olines[i] == "") continue
+                    split(olines[i], g, "\t")
+                    if (g[1] != "") origin[g[1]] = g[2]
+                }
+            }
         }
         NR == 1 {
             print "tenant_id", "domain", "ln_port", "mongodb_database", \
                   "garage_bucket", "bebop_version", "created_at", "status", \
-                  "external", "expires_at"
+                  "external", "expires_at", "origin"
             next
         }
         {
             if (sfilter != "" && $11 != sfilter) next
             expires = ($1 in expiry) ? expiry[$1] : ""
-            print $1, $2 ":" $3, $4, $6 ":" $5, $7, $9, $10, $11, $12, expires
+            orig = ($1 in origin) ? origin[$1] : ""
+            print $1, $2 ":" $3, $4, $6 ":" $5, $7, $9, $10, $11, $12, expires, orig
         }
     '
 }

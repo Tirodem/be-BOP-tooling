@@ -371,9 +371,22 @@ def run(cmd: list[str], timeout: int = 600) -> tuple[int, str, str]:
 
 
 def add_tenant(tenant_id: str, admin_email: str, profile: str | None = None) -> tuple[int, str, str]:
+    # --origin records where the tenant came from in
+    # /etc/be-BOP/<id>/origin, written once and never rewritten. Without it
+    # an API-created tenant left no durable trace of its source: the only
+    # record was this daemon's journal, which rolls, so "where does this
+    # tenant come from?" became unanswerable within days.
+    #
+    # The profile IS the source domain — the webhook lands on
+    # /deploy-test-tenant/<source-domain> and that path segment is the
+    # profile key. When the route carried no profile we say so explicitly
+    # rather than leaving the field empty, which would be
+    # indistinguishable from a pre-feature tenant.
+    origin = f"api:{profile}" if profile else "api:no-profile"
     argv = [
         "add-tenant.sh", tenant_id,
         "--admin-email", admin_email,
+        "--origin", origin,
         "--non-interactive",
     ]
     if profile:
