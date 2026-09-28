@@ -67,6 +67,41 @@ else
     sub="_acme-challenge.${prefix}"
 fi
 
+# Clear any leftover TXT at this name BEFORE publishing the new one.
+#
+# The backends' record_create is idempotent on (name, type): when a record
+# already exists it returns that id and leaves the target untouched —
+# infomaniak.sh and ovh.sh both say so, and both say "use delete+create to
+# change the target". Correct for the A / AAAA records add-tenant
+# publishes, fatal here: an ACME validation value changes on every
+# attempt, so a leftover _acme-challenge TXT means we publish nothing,
+# poll for a value that never lands, and hand certbot a challenge still
+# pointing at a stale token. Let's Encrypt fails the validation, the
+# authorization leaves `pending`, and every later attempt on it reports
+#   urn:ietf:params:acme:error:malformed :: authorization must be pending
+#
+# Leftovers do happen: a cleanup hook that never ran (certbot killed
+# mid-issuance) or that failed against the provider API leaves the record
+# behind, and the next cert needing that name walks into it.
+#
+# record_find returns one id per call, hence the loop. The cap is a
+# runaway guard for a provider that reports a successful delete without
+# removing anything — failing the hook beats spinning.
+stale_deleted=0
+while (( stale_deleted < 10 )); do
+    stale_id=$(dns_provider_dns_record_find "$sub" TXT 2>/dev/null || true)
+    [[ -z "$stale_id" ]] && break
+    log_warn "certbot-dns-auth: clearing leftover TXT ${sub}.${zone} (id=${stale_id}) before publishing the new challenge"
+    dns_provider_dns_record_delete "$stale_id"
+    (( ++stale_deleted ))
+done
+if (( stale_deleted >= 10 )); then
+    die "certbot-dns-auth: TXT ${sub}.${zone} still present after 10 deletions — provider is not honouring delete"
+fi
+if (( stale_deleted > 0 )); then
+    dns_provider_dns_zone_refresh
+fi
+
 log_info "certbot-dns-auth: publishing TXT ${sub}.${zone} for ACME challenge"
 dns_provider_dns_record_create "$sub" TXT "$CERTBOT_VALIDATION" >/dev/null
 dns_provider_dns_zone_refresh
@@ -116,8 +151,19 @@ poll_txt_propagation() {
         log_debug "certbot-dns-auth: propagation ${seen}/${nservers_count} NS; retrying in 2s"
         sleep 2
     done
-    log_warn "certbot-dns-auth: propagation timeout after ${timeout}s (${seen}/${nservers_count} NS ready); proceeding — LE will retry"
-    return 0
+    # Fail the hook rather than tell certbot the challenge is ready.
+    #
+    # This used to `return 0` on the grounds that "LE will retry". It
+    # doesn't: certbot goes on to ask Let's Encrypt to validate a TXT that
+    # isn't served yet, the validation fails, and the authorization leaves
+    # `pending` for good. Every later attempt on it then reports
+    # "authorization must be pending" — a recoverable wait turned into a
+    # burnt authorization.
+    #
+    # Exiting non-zero makes certbot fail this certificate and move on to
+    # the next one in the batch, leaving the authorization untouched.
+    log_error "certbot-dns-auth: propagation timeout after ${timeout}s (${seen}/${nservers_count} NS ready); refusing to declare the challenge ready"
+    return 1
 }
 
 poll_txt_propagation "${sub}.${zone}" "$CERTBOT_VALIDATION" "$ACME_PROPAGATION_SECONDS"
