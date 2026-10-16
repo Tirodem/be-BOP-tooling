@@ -272,6 +272,12 @@ step_install_apt_packages() {
         ca-certificates curl gpg jq openssl unzip zip stow xxd
         util-linux
         dnsutils                # provides `dig`, used by lib/dns.sh for pre-flight DNS checks
+        git                     # build a be-BOP branch on the host, from source, when
+                                # the CI artifact must not be used — a branch carrying
+                                # unreleased security fixes has no business transiting
+                                # through a third-party artifact host. scripts/build-release.sh
+                                # also derives the artifact name from `git rev-parse`,
+                                # so a plain tarball extraction is not a substitute.
         rclone
         nginx apache2-utils
         certbot
