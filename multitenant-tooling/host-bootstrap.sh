@@ -83,7 +83,7 @@ BEBOP_TOOLING_SYSLOG_IDENT="tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
 
 # === Constants (overridable via environment) ===========================
-: "${NODEJS_MAJOR_VERSION:=20}"
+: "${NODEJS_MAJOR_VERSION:=22}"
 : "${GARAGE_VERSION:=2.2.0}"
 : "${PHOENIXD_VERSION:=0.9.1}"
 # Pin pnpm so bootstraps are reproducible across days AND aligned with
