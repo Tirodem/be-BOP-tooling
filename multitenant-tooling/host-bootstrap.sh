@@ -338,33 +338,71 @@ step_install_mongodb() {
 }
 
 # === Node.js + pnpm =====================================================
+# Pointe le dépôt NodeSource sur $NODEJS_MAJOR_VERSION et installe.
+#
+# `gpg --dearmor --yes` : sans --yes, gpg demande confirmation avant
+# d'écraser un trousseau existant, et la question part sur /dev/tty. Sur un
+# hôte déjà provisionné — donc avec le trousseau en place — le bootstrap
+# s'arrête sans que rien dans sa sortie ne dise qu'on attend une touche.
+_install_nodejs_from_nodesource() {
+    local keyring=/usr/share/keyrings/nodesource.gpg
+    maybe_run run_privileged bash -c "
+        curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key |
+        gpg --dearmor --yes -o '${keyring}' &&
+        echo 'deb [signed-by=${keyring}] https://deb.nodesource.com/node_${NODEJS_MAJOR_VERSION}.x nodistro main' \
+            > /etc/apt/sources.list.d/nodesource.list
+    "
+    maybe_run run_privileged env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    maybe_run run_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
+}
+
 step_install_nodejs_pnpm() {
+    local actual=""
     if command -v node >/dev/null 2>&1; then
-        local actual
         actual=$(node --version 2>/dev/null | sed 's/^v//' | cut -d. -f1)
-        if [[ "$actual" == "$NODEJS_MAJOR_VERSION" ]]; then
-            log_info "Node.js v${actual} already installed ✓"
-        else
-            log_warn "Node.js v${actual} installed; expected v${NODEJS_MAJOR_VERSION}"
-        fi
+    fi
+    if [[ "$actual" == "$NODEJS_MAJOR_VERSION" ]]; then
+        log_info "Node.js v${actual} already installed ✓"
+    elif [[ -n "$actual" ]]; then
+        # Un majeur différent se remplace, il ne se signale pas.
+        #
+        # Cette branche se contentait d'un log_warn, si bien qu'un bump de
+        # NODEJS_MAJOR_VERSION n'avait aucun effet sur un hôte déjà
+        # provisionné : le dépôt NodeSource restait pointé sur l'ancien
+        # majeur et Node ne bougeait pas. Constaté en passant de 20 à 22 —
+        # le bootstrap annonçait « expected v22 », continuait, et le build
+        # d'une branche be-BOP échouait ensuite sur
+        # « Expected version: >=22.19.0, Got: v20.20.2 ». L'avertissement
+        # passait inaperçu au milieu de la sortie du bootstrap.
+        log_info "Node.js v${actual} installé, v${NODEJS_MAJOR_VERSION} attendu — bascule du dépôt NodeSource et mise à niveau..."
+        _install_nodejs_from_nodesource
+        local after
+        after=$(node --version 2>/dev/null | sed 's/^v//' | cut -d. -f1)
+        [[ "$DRY_RUN" == "true" || "$after" == "$NODEJS_MAJOR_VERSION" ]] \
+            || die "Node.js toujours en v${after} après mise à niveau vers v${NODEJS_MAJOR_VERSION} — vérifie /etc/apt/sources.list.d/nodesource.list et un éventuel paquet nodejs épinglé par la distribution"
+        log_info "Node.js v${after} ✓"
     else
         log_info "Configuring NodeSource repository for Node.js ${NODEJS_MAJOR_VERSION}.x..."
-        local keyring=/usr/share/keyrings/nodesource.gpg
-        maybe_run run_privileged bash -c "
-            curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key |
-            gpg --dearmor -o '${keyring}' &&
-            echo 'deb [signed-by=${keyring}] https://deb.nodesource.com/node_${NODEJS_MAJOR_VERSION}.x nodistro main' \
-                > /etc/apt/sources.list.d/nodesource.list
-        "
-        maybe_run run_privileged env DEBIAN_FRONTEND=noninteractive apt-get update -qq
-        maybe_run run_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y nodejs
+        _install_nodejs_from_nodesource
     fi
     if ! command -v corepack >/dev/null 2>&1; then
         die "corepack not available — Node.js install seems broken"
     fi
     log_info "Enabling corepack and pinning pnpm@${PNPM_VERSION}..."
-    maybe_run run_privileged corepack enable
-    maybe_run run_privileged corepack prepare "pnpm@${PNPM_VERSION}" --activate
+    # COREPACK_ENABLE_DOWNLOAD_PROMPT=0 : sans ça, `corepack prepare` écrit
+    # « Corepack is about to download … ? Do you want to continue? [Y/n] »
+    # et attend une touche. Le prompt n'est pas terminé par un retour à la
+    # ligne, donc sur un bootstrap il ne ressemble pas à une question : le
+    # script paraît figé après « Enabling corepack… », sans indice de ce
+    # qu'on attend. Observé sur un hôte en production, plusieurs minutes de
+    # blocage avant qu'on comprenne.
+    #
+    # Télécharger est bien l'intention — la version est épinglée juste
+    # au-dessus — donc on l'assume au lieu de la faire confirmer. Même
+    # réglage que tenant-cli.sh et lib/release.sh pour leurs appels pnpm.
+    maybe_run run_privileged env COREPACK_ENABLE_DOWNLOAD_PROMPT=0 corepack enable
+    maybe_run run_privileged env COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+        corepack prepare "pnpm@${PNPM_VERSION}" --activate
     # Fail-fast guard: if the pinned pnpm can't run (Node/pnpm ABI
     # mismatch introduced by a future bump), we crash HERE with a
     # meaningful message instead of leaving a broken pnpm for the first
