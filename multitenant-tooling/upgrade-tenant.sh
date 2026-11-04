@@ -5,7 +5,8 @@
 # upgrade-tenant.sh — upgrade a single be-BOP tenant to a new release.
 #
 # Steps:
-#   1. Resolve --version (default: "latest").
+#   1. Resolve --version (default: "latest"; "branch=<name>" for the newest
+#      CI artifact of a be-BOP branch).
 #   2. Note the currently-active release tag (for rollback).
 #   3. Download + extract + pnpm install the new release.
 #   4. Atomically swap the 'current' symlink.
@@ -244,7 +245,16 @@ main() {
     # Skip GitHub API entirely when the cache already holds the requested
     # version (e.g. when upgrade-all has pre-warmed it). Otherwise resolve
     # "latest" / validate the tag the normal way.
-    if [[ "$VERSION" != "latest" ]] && release_cache_has "$VERSION"; then
+    # "branch=<name>" targets the newest CI artifact of that branch; its
+    # cache key embeds the head SHA, so a new push yields a new tag.
+    local new_url=""
+    if [[ "$VERSION" == branch=* ]]; then
+        local resolved
+        resolved=$(release_resolve_branch "${VERSION#branch=}") \
+            || die "cannot resolve a CI artifact for branch '${VERSION#branch=}'"
+        new_tag=$(cut -f1 <<<"$resolved")
+        new_url=$(cut -f2 <<<"$resolved")
+    elif [[ "$VERSION" != "latest" ]] && release_cache_has "$VERSION"; then
         new_tag="$VERSION"
         log_debug "cache hit for ${VERSION}; skipping GitHub API resolve"
     else
@@ -268,7 +278,11 @@ main() {
         exit 0
     fi
 
-    release_cache_ensure "$new_tag"
+    if [[ -n "$new_url" ]]; then
+        release_cache_ensure_from_url "$new_tag" "$new_url"
+    else
+        release_cache_ensure "$new_tag"
+    fi
     if [[ "$new_tag" != "$old_tag" ]]; then
         pre_swap_mongodump "$TENANT_ID" "$old_tag" "$new_tag"
     fi

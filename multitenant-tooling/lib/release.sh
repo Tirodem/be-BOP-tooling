@@ -259,6 +259,82 @@ release_cache_ensure() {
     release_cache_ensure_from_url "$tag" "$url"
 }
 
+# release_resolve_branch_artifact <branch_name> <artifact_name>
+# Walks the latest successful workflow runs on <branch_name> and prints
+# "<run_id>\t<head_sha>\t<artifact_id>" for the first run that uploaded
+# an artifact named <artifact_name>. Dies if none is found.
+# Requires BEBOP_GITHUB_PAT (Actions:read + Contents:read on the repo).
+release_resolve_branch_artifact() {
+    local branch="$1" want_name="$2"
+    if [[ -z "${BEBOP_GITHUB_PAT:-}" ]]; then
+        die "branch deploys require BEBOP_GITHUB_PAT in ${SECRETS_FILE:-/etc/be-BOP-tooling/secrets.env} (fine-grained PAT, Actions:read + Contents:read on ${BEBOP_GITHUB_REPO})"
+    fi
+    local gh_curl=(
+        --silent --show-error --fail --location
+        --connect-timeout "${CURL_CONNECT_TIMEOUT:-30}" --max-time "${CURL_DOWNLOAD_TIMEOUT:-600}"
+        -H "Authorization: Bearer ${BEBOP_GITHUB_PAT}"
+        -H "Accept: application/vnd.github+json"
+        -H "X-GitHub-Api-Version: 2022-11-28"
+    )
+    local runs_json
+    runs_json=$(curl "${gh_curl[@]}" \
+        "https://api.github.com/repos/${BEBOP_GITHUB_REPO}/actions/runs?branch=${branch}&status=success&per_page=10") \
+        || die "GitHub API: failed to list workflow runs on '${branch}'"
+    local runs_count
+    runs_count=$(echo "$runs_json" | jq '.workflow_runs | length')
+    if (( runs_count == 0 )); then
+        die "no successful workflow run found on branch '${branch}' (CI rouge ? branche jamais poussée ?)"
+    fi
+    local i rid rsha aid
+    for ((i=0; i<runs_count; i++)); do
+        rid=$(echo "$runs_json" | jq -r ".workflow_runs[$i].id")
+        rsha=$(echo "$runs_json" | jq -r ".workflow_runs[$i].head_sha")
+        aid=$(curl "${gh_curl[@]}" \
+            "https://api.github.com/repos/${BEBOP_GITHUB_REPO}/actions/runs/${rid}/artifacts" \
+            | jq -r --arg n "$want_name" '.artifacts[] | select(.name == $n) | .id' | head -1)
+        if [[ -n "$aid" ]]; then
+            printf '%s\t%s\t%s\n' "$rid" "$rsha" "$aid"
+            return 0
+        fi
+    done
+    die "no '${want_name}' artifact found in the ${runs_count} latest successful runs on '${branch}' (artifact expired, wrong name, or workflow doesn't upload it)"
+}
+
+# release_branch_cache_name <branch> <head_sha>
+# Cache key of a branch deploy: "<branch>.<sha8>", with '/' in the branch
+# name replaced by '__' so the entry stays a direct child of the cache root.
+release_branch_cache_name() {
+    printf '%s.%s\n' "${1//\//__}" "${2:0:8}"
+}
+
+# release_tag_branch <name>
+# If <name> is a branch-deploy cache key (see release_branch_cache_name),
+# echo the branch it was built from and return 0. Return 1 for anything
+# else: release tags (rel/YYYY-MM-DD/<sha>) always contain a '/', which a
+# branch key never does. A branch whose name holds a literal '__' comes
+# back with a '/' in its place — the key does not round-trip for those.
+release_tag_branch() {
+    local name="$1"
+    [[ "$name" == */* || "$name" == be-BOP.release.* ]] && return 1
+    [[ "$name" =~ ^(.+)\.[0-9a-f]{8}$ ]] || return 1
+    local branch="${BASH_REMATCH[1]}"
+    printf '%s\n' "${branch//__//}"
+}
+
+# release_resolve_branch <branch>
+# Echo "<cache_name>\t<download_url>" for the newest CI artifact of
+# <branch>. Returns non-zero if no usable artifact can be found.
+release_resolve_branch() {
+    local branch="$1"
+    local artifact_name="${BEBOP_BRANCH_ARTIFACT_NAME:-be-BOP-release}"
+    local resolved head_sha artifact_id
+    resolved=$(release_resolve_branch_artifact "$branch" "$artifact_name") || return 1
+    head_sha=$(cut -f2 <<<"$resolved")
+    artifact_id=$(cut -f3 <<<"$resolved")
+    printf '%s\t%s\n' "$(release_branch_cache_name "$branch" "$head_sha")" \
+        "https://api.github.com/repos/${BEBOP_GITHUB_REPO}/actions/artifacts/${artifact_id}/zip"
+}
+
 # release_resolve_nth_before <reference_tag> <k>
 # Echo the k-th release older than <reference_tag> in the GitHub list of
 # releases-with-matching-asset (newest-first ordering as returned by the API).

@@ -16,6 +16,12 @@
 #       wait for all, then aggregate results. Total downtime overlaps
 #       across tenants but the wall-clock is shorter for large fleets.
 #
+#   --follow-branch
+#       Tenants running a branch deploy (installed with tenant-cli.sh
+#       "branch=<name>") move to the newest CI artifact of THAT branch
+#       instead of the release target. Tenants on a release still get
+#       --version.
+#
 # Selection:
 #   --filter <regex>
 #       Only operate on tenants whose tenant_id matches the regex
@@ -56,6 +62,7 @@ VERSION="latest"
 MODE="rolling"
 FILTER=""
 CONTINUE_ON_FAILURE=false
+FOLLOW_BRANCH=false
 DRY_RUN=false
 RUN_NON_INTERACTIVE=false
 VERBOSE=false
@@ -73,6 +80,8 @@ Options:
   --parallel                 all tenants in parallel
   --filter <regex>           only tenants matching this regex (grep -E)
   --continue-on-failure      in --rolling mode, do not abort on first error
+  --follow-branch            tenants on a branch deploy move to the newest
+                             build of their own branch, not to --version
   --secrets-file <path>      override default ${SECRETS_FILE}
   --non-interactive          no prompts; exit if input would be required
   --dry-run                  print actions without executing
@@ -95,6 +104,7 @@ while (( $# )); do
         --parallel)             MODE=parallel; shift ;;
         --filter)               FILTER="$2"; shift 2 ;;
         --continue-on-failure)  CONTINUE_ON_FAILURE=true; shift ;;
+        --follow-branch)        FOLLOW_BRANCH=true; shift ;;
         --secrets-file)         SECRETS_FILE="$2"; shift 2 ;;
         --non-interactive)      RUN_NON_INTERACTIVE=true; shift ;;
         --dry-run)              DRY_RUN=true; shift ;;
@@ -142,7 +152,7 @@ locate_upgrade_tenant() {
 # Compose the upgrade-tenant.sh argv to forward.
 upgrade_tenant_argv() {
     local tenant="$1"
-    local args=("$tenant" --version "$VERSION" --secrets-file "$SECRETS_FILE")
+    local args=("$tenant" --version "${TARGET_SPEC[$tenant]:-$VERSION}" --secrets-file "$SECRETS_FILE")
     [[ "$DRY_RUN" == "true" ]]            && args+=(--dry-run)
     [[ "$VERBOSE" == "true" ]]            && args+=(--verbose)
     [[ "$RUN_NON_INTERACTIVE" == "true" ]] && args+=(--non-interactive)
@@ -219,25 +229,52 @@ main() {
     fi
     log_info "upgrade-all: target=${VERSION}, mode=${MODE}, filter='${FILTER:-(none)}', tenants=${#filtered[@]}: ${filtered[*]}"
 
+    local failed=()
+    declare -gA TARGET_SPEC=()
+
     # Categorize tenants BEFORE iterating: a tenant whose current symlink
     # already resolves to the target tag is bypassed entirely (no child
     # process, no service restart). Cleaner separation in the summary +
     # notification than relying on each child to no-op silently.
+    #
+    # --follow-branch: a tenant on a branch deploy is compared against the
+    # newest build of its branch (resolved once per branch) and handed to
+    # upgrade-tenant.sh as "branch=<name>".
     local bypassed=() to_upgrade=()
-    local t current
+    local t current branch target
+    local -A branch_head=()
     for t in "${filtered[@]}"; do
         current=$(release_get_current_tag "$t")
-        if [[ "$current" == "$VERSION" ]]; then
+        target="$VERSION"
+        if [[ "$FOLLOW_BRANCH" == "true" ]] && branch=$(release_tag_branch "$current"); then
+            if [[ -z "${branch_head[$branch]+x}" ]]; then
+                branch_head[$branch]=$(release_resolve_branch "$branch" | cut -f1) || true
+            fi
+            if [[ -z "${branch_head[$branch]}" ]]; then
+                log_error "upgrade-all: ${t}: no CI artifact found for branch '${branch}'"
+                failed+=("$t")
+                continue
+            fi
+            target="${branch_head[$branch]}"
+            TARGET_SPEC[$t]="branch=${branch}"
+            log_info "upgrade-all: ${t} follows branch '${branch}' → ${target}"
+        fi
+        if [[ "$current" == "$target" ]]; then
             bypassed+=("$t")
         else
             to_upgrade+=("$t")
         fi
     done
     if (( ${#bypassed[@]} > 0 )); then
-        log_info "upgrade-all: bypassing ${#bypassed[@]} tenant(s) already on ${VERSION}: ${bypassed[*]}"
+        log_info "upgrade-all: bypassing ${#bypassed[@]} tenant(s) already on target: ${bypassed[*]}"
     fi
 
-    local failed=() succeeded=()
+    local succeeded=()
+
+    if (( ${#failed[@]} > 0 )) && [[ "$MODE" == rolling && "$CONTINUE_ON_FAILURE" != "true" ]]; then
+        log_error "rolling upgrade aborted: no branch build for ${failed[*]} (use --continue-on-failure to keep going)"
+        to_upgrade=()
+    fi
 
     if (( ${#to_upgrade[@]} > 0 )); then
         case "$MODE" in
