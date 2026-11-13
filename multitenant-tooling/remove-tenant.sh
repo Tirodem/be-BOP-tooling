@@ -191,13 +191,24 @@ delete_dns_records() {
         log_info "main domain ${DOMAIN} is operator-managed (external) — skipping DNS lookup"
     else
         log_info "deleting DNS A record for ${DOMAIN}..."
-        id=$(dns_provider_dns_record_find "$TENANT_ID" A 2>/dev/null || true)
-        [[ -n "$id" ]] && dns_provider_dns_record_delete "$id"
+        # A failed lookup must stop the removal: swallowing it skipped the
+        # delete and let a purge report "complete" with the record still
+        # published. The registry row is dropped last, so a re-run resumes.
+        id=$(dns_provider_dns_record_find "$TENANT_ID" A) \
+            || die "DNS lookup failed for ${DOMAIN} — record left in place, re-run once the DNS API answers"
+        if [[ -n "$id" ]]; then
+            dns_provider_dns_record_delete "$id" \
+                || die "DNS delete failed for ${DOMAIN} (id=${id}) — re-run once the DNS API answers"
+        fi
     fi
     if has_local_s3_tenant; then
         log_info "deleting DNS A record for ${S3_DOMAIN}..."
-        id=$(dns_provider_dns_record_find "s3.${TENANT_ID}" A 2>/dev/null || true)
-        [[ -n "$id" ]] && dns_provider_dns_record_delete "$id"
+        id=$(dns_provider_dns_record_find "s3.${TENANT_ID}" A) \
+            || die "DNS lookup failed for ${S3_DOMAIN} — record left in place, re-run once the DNS API answers"
+        if [[ -n "$id" ]]; then
+            dns_provider_dns_record_delete "$id" \
+                || die "DNS delete failed for ${S3_DOMAIN} (id=${id}) — re-run once the DNS API answers"
+        fi
     else
         log_info "tenant has no local S3 (--no-local-s3 at create time) — skipping S3 DNS record"
     fi

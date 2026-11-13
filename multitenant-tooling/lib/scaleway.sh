@@ -441,7 +441,13 @@ mail_upstream_teardown_domain() {
     for entry in "${records_to_delete[@]}"; do
         dns_type="${entry%%:*}"
         host="${entry#*:}"
-        id=$(dns_provider_dns_record_find "$host" "$dns_type" 2>/dev/null || true)
-        [[ -n "$id" ]] && dns_provider_dns_record_delete "$id" 2>/dev/null || true
+        # Errors are fatal here, as in remove-tenant.sh's delete_dns_records:
+        # a swallowed failure left the record published with no trace.
+        id=$(dns_provider_dns_record_find "$host" "$dns_type") \
+            || die "mail_upstream_teardown_domain: DNS lookup failed for ${dns_type} ${host}.${zone} — re-run once the DNS API answers"
+        if [[ -n "$id" ]]; then
+            dns_provider_dns_record_delete "$id" \
+                || die "mail_upstream_teardown_domain: DNS delete failed for ${dns_type} ${host}.${zone} (id=${id})"
+        fi
     done
 }
