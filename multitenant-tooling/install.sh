@@ -359,18 +359,32 @@ if secrets_have_values; then
         echo "  [e] Edit       — open the file in \$EDITOR / nano before bootstrap"
         echo "  [r] Reset      — backup + replace with the empty template + edit"
         read -r -p "Choose [k/e/r] (default: k): " choice
+        # Edit and reset touch live credentials: edit asks a second time,
+        # reset requires a typed phrase. Anything else keeps the file.
+        readonly RESET_SECRETS_CONFIRMATION_PHRASE="RESET MY SECRETS, I GARANTEE I'M SURE I KNOW WHAT I'M DOING, i can even tell it in lowercase, i'm sure of myself and i confirm the reset"
         case "${choice:-k}" in
             e|E)
-                editor="${EDITOR:-nano}"
-                if command -v "$editor" >/dev/null 2>&1; then
-                    log "Opening ${SECRETS_FILE} in ${editor}..."
-                    "$editor" "$SECRETS_FILE"
+                read -r -p "Really edit ${SECRETS_FILE}? [y/N]: " edit_confirm
+                if [[ "$edit_confirm" == "y" || "$edit_confirm" == "Y" ]]; then
+                    editor="${EDITOR:-nano}"
+                    if command -v "$editor" >/dev/null 2>&1; then
+                        log "Opening ${SECRETS_FILE} in ${editor}..."
+                        "$editor" "$SECRETS_FILE"
+                    else
+                        warn "editor '${editor}' not found — proceeding with current values"
+                    fi
                 else
-                    warn "editor '${editor}' not found — proceeding with current values"
+                    log "Edit not confirmed — keeping existing $SECRETS_FILE"
                 fi
                 ;;
             r|R)
-                reset_secrets_to_template
+                warn "Reset replaces ${SECRETS_FILE} with the EMPTY template (a backup copy is kept)."
+                read -r -p "Type '${RESET_SECRETS_CONFIRMATION_PHRASE}' (case sensitive) to confirm: " reset_confirm
+                if [[ "$reset_confirm" == "$RESET_SECRETS_CONFIRMATION_PHRASE" ]]; then
+                    reset_secrets_to_template
+                else
+                    log "Reset not confirmed — keeping existing $SECRETS_FILE"
+                fi
                 ;;
             *)
                 log "Keeping existing $SECRETS_FILE"
