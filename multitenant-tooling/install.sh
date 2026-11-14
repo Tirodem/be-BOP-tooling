@@ -361,7 +361,7 @@ if secrets_have_values; then
         read -r -p "Choose [k/e/r] (default: k): " choice
         # Edit and reset touch live credentials: edit asks a second time,
         # reset requires a typed phrase. Anything else keeps the file.
-        readonly RESET_SECRETS_CONFIRMATION_PHRASE="RESET MY SECRETS, I GARANTEE I'M SURE I KNOW WHAT I'M DOING, i can even tell it in lowercase, i'm sure of myself and i confirm the reset"
+        readonly RESET_SECRETS_CONFIRMATION_PHRASE="RESET MY SECRETS, I GUARANTEE I'M SURE I KNOW WHAT I'M DOING, i can even tell it in lowercase, i'm sure of myself and i confirm the reset"
         case "${choice:-k}" in
             e|E)
                 read -r -p "Really edit ${SECRETS_FILE}? [y/N]: " edit_confirm
