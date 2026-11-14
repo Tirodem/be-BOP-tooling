@@ -92,30 +92,12 @@ if [[ -r "$CONFIG_ENV" ]]; then
     DECLARED_URL=$(grep -oP '^MONGODB_URL=\K.*' "$CONFIG_ENV" 2>/dev/null || true)
 fi
 
-# Host of a mongodb:// or mongodb+srv:// URI: drop the scheme, drop any
-# user:password@ prefix, then cut at the first : / or ? that follows.
-_mongo_url_host() {
-    local hostpart="$1"
-    hostpart="${hostpart#mongodb+srv://}"
-    hostpart="${hostpart#mongodb://}"
-    hostpart="${hostpart##*@}"
-    hostpart="${hostpart%%[:/?]*}"
-    printf '%s' "$hostpart"
-}
-
-if [[ -n "$DECLARED_URL" ]]; then
-    case "$(_mongo_url_host "$DECLARED_URL")" in
-        127.0.0.1|localhost|::1|"")
-            : # loopback — the local-mongod path below applies
-            ;;
-        *)
-            log_info "preflight: external MongoDB declared in ${CONFIG_ENV} — not starting a local mongod for '${TENANT_ID}'"
-            mongo_wait_ready_uri "$DECLARED_URL" 30 1 \
-                || die "external MongoDB declared for '${TENANT_ID}' is not reachable"
-            log_info "preflight OK for '${TENANT_ID}' (external MongoDB)"
-            exit 0
-            ;;
-    esac
+if mongo_url_is_external "$DECLARED_URL"; then
+    log_info "preflight: external MongoDB declared in ${CONFIG_ENV} — not starting a local mongod for '${TENANT_ID}'"
+    mongo_wait_ready_uri "$DECLARED_URL" 30 1 \
+        || die "external MongoDB declared for '${TENANT_ID}' is not reachable"
+    log_info "preflight OK for '${TENANT_ID}' (external MongoDB)"
+    exit 0
 fi
 
 PORT_ENV_FILE="/etc/be-BOP-mongodb/${TENANT_ID}/port.env"

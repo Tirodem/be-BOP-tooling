@@ -154,6 +154,28 @@ for t in "${TENANT_IDS[@]}"; do
     esac
 done
 
+# A tenant whose config.env points MONGODB_URL at an external cluster
+# keeps its data outside this host: that cluster's own backups cover it,
+# and mongodump from here fails. It is skipped, with --all as well as
+# when named explicitly.
+EXTERNAL_SKIPPED=()
+SELECTED_IDS=("${TENANT_IDS[@]}")
+TENANT_IDS=()
+for t in "${SELECTED_IDS[@]}"; do
+    if mongo_url_is_external "$(mongo_tenant_url "$t")"; then
+        EXTERNAL_SKIPPED+=("$t")
+    else
+        TENANT_IDS+=("$t")
+    fi
+done
+if (( ${#EXTERNAL_SKIPPED[@]} > 0 )); then
+    log_info "backup-tenants: ${#EXTERNAL_SKIPPED[@]} tenant(s) with external MongoDB skipped (not backed up): ${EXTERNAL_SKIPPED[*]}"
+fi
+if (( ${#TENANT_IDS[@]} == 0 )); then
+    log_info "no tenants to back up"
+    exit 0
+fi
+
 log_info "backup-tenants: ${#TENANT_IDS[@]} tenant(s): ${TENANT_IDS[*]}  (mode: $(if [[ "$FOR_HANDOFF" == "true" ]]; then echo "handoff"; else echo "ops"; fi))"
 
 # === Per-tenant backup ===================================================
@@ -350,6 +372,7 @@ echo "==========================================================================
 echo "  Selected:  ${#TENANT_IDS[@]}"
 echo "  Succeeded: ${#SUCCEEDED[@]}  ${SUCCEEDED[*]:-}"
 echo "  Failed:    ${#FAILED[@]}  ${FAILED[*]:-}"
+echo "  External:  ${#EXTERNAL_SKIPPED[@]}  ${EXTERNAL_SKIPPED[*]:-}    (skipped — MongoDB outside this host)"
 echo "=========================================================================="
 
 if [[ "$FOR_HANDOFF" == "true" && ${#SUCCEEDED[@]} -gt 0 ]]; then

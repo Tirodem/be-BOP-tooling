@@ -152,6 +152,14 @@ mongo_wait_ready_uri() {
     return 1
 }
 
+# _mongo_is_uri <port_or_uri>
+# Returns 0 for a mongodb:// or mongodb+srv:// URI, 1 for anything else
+# (a bare port). Single scheme test shared by every helper below, so both
+# schemes behave identically everywhere.
+_mongo_is_uri() {
+    [[ "$1" == mongodb://* || "$1" == mongodb+srv://* ]]
+}
+
 # _mongo_conn_argv <port_or_uri>
 # Populates the global array MONGO_CONN_ARGV with the right mongosh
 # connection args for either form. When <arg> looks like mongodb://…
@@ -167,11 +175,44 @@ _mongo_conn_argv() {
     # reachable here before — every tenant used a local mongod — but a
     # tenant whose config.env declares an external cluster now flows
     # through these helpers, and the scheme test is what routes it.
-    if [[ "$1" == mongodb://* || "$1" == mongodb+srv://* ]]; then
+    if _mongo_is_uri "$1"; then
         MONGO_CONN_ARGV=("$1")
     else
         MONGO_CONN_ARGV=(--port "$1")
     fi
+}
+
+# mongo_url_host <mongodb_url>
+# Host of a mongodb:// or mongodb+srv:// URI: drop the scheme, drop any
+# user:password@ prefix, then cut at the first : / or ? that follows.
+mongo_url_host() {
+    local hostpart="$1"
+    hostpart="${hostpart#mongodb+srv://}"
+    hostpart="${hostpart#mongodb://}"
+    hostpart="${hostpart##*@}"
+    hostpart="${hostpart%%[:/?]*}"
+    printf '%s' "$hostpart"
+}
+
+# mongo_url_is_external <mongodb_url>
+# Returns 0 when the URI names anything other than a loopback mongod
+# (a mongodb+srv:// cluster or any remote host), 1 otherwise — including
+# for an empty URI, which means "local mongod".
+mongo_url_is_external() {
+    [[ -n "$1" ]] || return 1
+    case "$(mongo_url_host "$1")" in
+        127.0.0.1|localhost|::1|"") return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# mongo_tenant_url <tenant_id>
+# Prints MONGODB_URL from /etc/be-BOP/<tenant_id>/config.env, or nothing
+# when the file or the key is absent.
+mongo_tenant_url() {
+    local cfg="/etc/be-BOP/${1}/config.env"
+    run_privileged test -r "$cfg" || return 0
+    run_privileged grep -oP '^MONGODB_URL=\K.*' "$cfg" 2>/dev/null || true
 }
 
 # mongo_db_drop <port_or_uri> <db_name>
@@ -199,7 +240,7 @@ mongo_dump_db() {
     fi
     log_info "mongo: mongodump db='${db}' → ${out}"
     local -a conn_argv
-    if [[ "$target" == mongodb://* ]]; then
+    if _mongo_is_uri "$target"; then
         conn_argv=(--uri "$target")
     else
         conn_argv=(--port "$target")
@@ -222,7 +263,7 @@ mongo_restore_db() {
     fi
     log_info "mongo: mongorestore db='${db}' ← ${db_subdir}"
     local -a conn_argv
-    if [[ "$target" == mongodb://* ]]; then
+    if _mongo_is_uri "$target"; then
         conn_argv=(--uri "$target")
     else
         conn_argv=(--port "$target")
