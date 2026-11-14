@@ -171,8 +171,19 @@ done
 if (( ${#EXTERNAL_SKIPPED[@]} > 0 )); then
     log_info "backup-tenants: ${#EXTERNAL_SKIPPED[@]} tenant(s) with external MongoDB skipped (not backed up): ${EXTERNAL_SKIPPED[*]}"
 fi
+# Line appended to every notification so a skipped tenant is never silent.
+EXTERNAL_NOTE=""
+if (( ${#EXTERNAL_SKIPPED[@]} > 0 )); then
+    EXTERNAL_NOTE="
+Skipped (external MongoDB, not backed up): ${EXTERNAL_SKIPPED[*]}"
+fi
 if (( ${#TENANT_IDS[@]} == 0 )); then
     log_info "no tenants to back up"
+    if (( ${#EXTERNAL_SKIPPED[@]} > 0 )); then
+        notify_success \
+            "[be-BOP tooling] backup-tenants: nothing backed up (${#EXTERNAL_SKIPPED[@]} skipped)" \
+            "Tenants: (none)${EXTERNAL_NOTE}"
+    fi
     exit 0
 fi
 
@@ -401,9 +412,9 @@ if [[ ${#FAILED[@]} -gt 0 ]]; then
     notify_failure \
         "[be-BOP tooling] backup-tenants had ${#FAILED[@]} failure(s)" \
         "Failed tenants: ${FAILED[*]}
-Succeeded:      ${SUCCEEDED[*]:-(none)}"
+Succeeded:      ${SUCCEEDED[*]:-(none)}${EXTERNAL_NOTE}"
     exit 1
 fi
 notify_success \
-    "[be-BOP tooling] backup-tenants OK (${#SUCCEEDED[@]} tenants)" \
-    "Tenants: ${SUCCEEDED[*]}"
+    "[be-BOP tooling] backup-tenants OK (${#SUCCEEDED[@]} tenants$( (( ${#EXTERNAL_SKIPPED[@]} > 0 )) && echo ", ${#EXTERNAL_SKIPPED[@]} skipped"))" \
+    "Tenants: ${SUCCEEDED[*]}${EXTERNAL_NOTE}"
