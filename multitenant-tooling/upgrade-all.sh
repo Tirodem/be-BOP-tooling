@@ -22,6 +22,12 @@
 #       instead of the release target. Tenants on a release still get
 #       --version.
 #
+#   --include-frozen (requires --follow-branch)
+#       Frozen tenants running a CI branch deploy are not skipped: they
+#       move to the newest artifact of their branch too, and stay frozen.
+#       Frozen tenants on a release, a source build or a manual build are
+#       still skipped.
+#
 # Selection:
 #   --filter <regex>
 #       Only operate on tenants whose tenant_id matches the regex
@@ -63,6 +69,7 @@ MODE="rolling"
 FILTER=""
 CONTINUE_ON_FAILURE=false
 FOLLOW_BRANCH=false
+INCLUDE_FROZEN=false
 DRY_RUN=false
 RUN_NON_INTERACTIVE=false
 VERBOSE=false
@@ -82,6 +89,9 @@ Options:
   --continue-on-failure      in --rolling mode, do not abort on first error
   --follow-branch            tenants on a branch deploy move to the newest
                              build of their own branch, not to --version
+  --include-frozen           with --follow-branch: frozen tenants on a CI
+                             branch deploy follow their branch too (they
+                             stay frozen); other frozen tenants are skipped
   --secrets-file <path>      override default ${SECRETS_FILE}
   --non-interactive          no prompts; exit if input would be required
   --dry-run                  print actions without executing
@@ -105,6 +115,7 @@ while (( $# )); do
         --filter)               FILTER="$2"; shift 2 ;;
         --continue-on-failure)  CONTINUE_ON_FAILURE=true; shift ;;
         --follow-branch)        FOLLOW_BRANCH=true; shift ;;
+        --include-frozen)       INCLUDE_FROZEN=true; shift ;;
         --secrets-file)         SECRETS_FILE="$2"; shift 2 ;;
         --non-interactive)      RUN_NON_INTERACTIVE=true; shift ;;
         --dry-run)              DRY_RUN=true; shift ;;
@@ -115,6 +126,10 @@ while (( $# )); do
         *) die "unexpected positional arg: $1" ;;
     esac
 done
+
+if [[ "$INCLUDE_FROZEN" == "true" && "$FOLLOW_BRANCH" != "true" ]]; then
+    die "--include-frozen only applies with --follow-branch"
+fi
 
 BEBOP_TOOLING_SYSLOG_IDENT="tooling-${SCRIPT_NAME}"
 export BEBOP_TOOLING_SYSLOG_IDENT
@@ -157,6 +172,21 @@ upgrade_tenant_argv() {
     [[ "$VERBOSE" == "true" ]]            && args+=(--verbose)
     [[ "$RUN_NON_INTERACTIVE" == "true" ]] && args+=(--non-interactive)
     printf '%s\n' "${args[@]}"
+}
+
+# One line per tenant naming what it was sent to: its branch when it
+# follows one (--follow-branch), the release target otherwise.
+target_lines() {
+    local t spec
+    (( $# )) || { printf '  (none)\n'; return 0; }
+    for t in "$@"; do
+        spec="${TARGET_SPEC[$t]:-}"
+        if [[ "$spec" == branch=* ]]; then
+            printf '  %s → branch %s\n' "$t" "${spec#branch=}"
+        else
+            printf '  %s → %s\n' "$t" "$VERSION"
+        fi
+    done
 }
 
 # === Main ===============================================================
@@ -203,7 +233,7 @@ main() {
     upgrade_tenant_path=$(locate_upgrade_tenant)
 
     # Build the tenant list.
-    local all_active=() filtered=() frozen_skipped=()
+    local all_active=() filtered=() frozen_skipped=() frozen_followed=()
     while IFS= read -r t; do
         [[ -z "$t" ]] && continue
         all_active+=("$t")
@@ -213,14 +243,24 @@ main() {
         # freeze-tenant.sh add <id> → SKIPPED by upgrade-all (manual + nightly).
         # Single-tenant upgrade-tenant.sh <id> runs ignore this list.
         if freeze_is_frozen "$t"; then
-            frozen_skipped+=("$t")
-            continue
+            # --include-frozen: a frozen CI branch deploy still follows its
+            # branch. A release, a source build or a manual build stays put.
+            if [[ "$INCLUDE_FROZEN" == "true" ]] \
+                && release_tag_branch "$(release_get_current_tag "$t")" >/dev/null; then
+                frozen_followed+=("$t")
+            else
+                frozen_skipped+=("$t")
+                continue
+            fi
         fi
         filtered+=("$t")
     done < <(registry_list_by_status active)
 
     if (( ${#frozen_skipped[@]} > 0 )); then
         log_info "upgrade-all: ${#frozen_skipped[@]} tenant(s) frozen (skipped, see $(freeze_list_path)): ${frozen_skipped[*]}"
+    fi
+    if (( ${#frozen_followed[@]} > 0 )); then
+        log_info "upgrade-all: ${#frozen_followed[@]} frozen tenant(s) on a branch deploy included (--include-frozen): ${frozen_followed[*]}"
     fi
 
     if (( ${#filtered[@]} == 0 )); then
@@ -250,13 +290,13 @@ main() {
             if [[ -z "${branch_head[$branch]+x}" ]]; then
                 branch_head[$branch]=$(release_resolve_branch "$branch" | cut -f1) || true
             fi
+            TARGET_SPEC[$t]="branch=${branch}"
             if [[ -z "${branch_head[$branch]}" ]]; then
                 log_error "upgrade-all: ${t}: no CI artifact found for branch '${branch}'"
                 failed+=("$t")
                 continue
             fi
             target="${branch_head[$branch]}"
-            TARGET_SPEC[$t]="branch=${branch}"
             log_info "upgrade-all: ${t} follows branch '${branch}' → ${target}"
         fi
         if [[ "$current" == "$target" ]]; then
@@ -359,6 +399,7 @@ main() {
 ==========================================================================
   Selected:   ${#filtered[@]}  (${filtered[*]})
   Frozen:     ${#frozen_skipped[@]}  ${frozen_skipped[*]:-}    (skipped — freeze-tenant.sh)
+  Frozen in:  ${#frozen_followed[@]}  ${frozen_followed[*]:-}    (on a branch deploy, --include-frozen)
   Bypassed:   ${#bypassed[@]}  ${bypassed[*]:-}    (already on target)
   Upgraded:   ${#succeeded[@]} ${succeeded[*]:-}
   Failed:     ${#failed[@]}    ${failed[*]:-}
@@ -369,10 +410,13 @@ EOF
     if (( ${#failed[@]} > 0 )); then
         notify_failure \
             "[be-BOP tooling] upgrade-all (${VERSION}) had ${#failed[@]} failure(s)" \
-            "Failed tenants:  ${failed[*]}
-Upgraded:        ${succeeded[*]:-(none)}
-Bypassed:        ${bypassed[*]:-(none)}
-Mode:            ${MODE}"
+            "Failed:
+$(target_lines "${failed[@]}")
+Upgraded:
+$(target_lines "${succeeded[@]}")
+Bypassed:
+$(target_lines "${bypassed[@]}")
+Mode: ${MODE}"
         exit 1
     fi
     # All-bypass case: nothing actually changed; still notify so operators
@@ -380,13 +424,15 @@ Mode:            ${MODE}"
     if (( ${#succeeded[@]} == 0 )); then
         notify_success \
             "[be-BOP tooling] upgrade-all NO-OP (${#bypassed[@]} tenants already on ${VERSION})" \
-            "All ${#bypassed[@]} selected tenants were already on ${VERSION} — nothing to do.
-Tenants: ${bypassed[*]}"
+            "All ${#bypassed[@]} selected tenants were already on their target — nothing to do.
+$(target_lines "${bypassed[@]}")"
     else
         notify_success \
             "[be-BOP tooling] upgrade-all OK (${#succeeded[@]} upgraded, ${#bypassed[@]} bypassed → ${VERSION})" \
-            "Upgraded:  ${succeeded[*]}
-Bypassed:  ${bypassed[*]:-(none)}"
+            "Upgraded:
+$(target_lines "${succeeded[@]}")
+Bypassed:
+$(target_lines "${bypassed[@]}")"
     fi
 }
 
