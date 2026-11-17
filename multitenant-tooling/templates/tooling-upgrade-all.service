@@ -13,5 +13,5 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/upgrade-all.sh --continue-on-failure --non-interactive
+ExecStart=/usr/local/bin/upgrade-all.sh --follow-branch --continue-on-failure --non-interactive
 SyslogIdentifier=tooling-upgrade-all
