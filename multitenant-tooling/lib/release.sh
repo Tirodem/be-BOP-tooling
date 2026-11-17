@@ -335,6 +335,111 @@ release_resolve_branch() {
         "https://api.github.com/repos/${BEBOP_GITHUB_REPO}/actions/artifacts/${artifact_id}/zip"
 }
 
+# release_source_cache_name <branch> <head_sha>
+# Cache key of a branch built on this host from source:
+# "<branch>.<sha8>.src", '/' replaced by '__'. The ".src" suffix keeps it
+# apart from a CI-artifact key of the same commit, and release_tag_branch
+# does not treat it as a branch deploy.
+release_source_cache_name() {
+    printf '%s.%s.src\n' "${1//\//__}" "${2:0:8}"
+}
+
+# release_resolve_source <branch>
+# Echo "<cache_name>\t<head_sha>" for the head of <branch> on
+# $BEBOP_GITHUB_REPO, read with git ls-remote. No CI run and no artifact
+# are involved: this is the path for branches that have no pull request.
+release_resolve_source() {
+    local branch="$1" sha
+    sha=$(git ls-remote "https://github.com/${BEBOP_GITHUB_REPO}.git" "refs/heads/${branch}" | cut -f1) \
+        || { log_error "release: git ls-remote failed for ${BEBOP_GITHUB_REPO}"; return 1; }
+    if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+        log_error "release: branch '${branch}' not found on ${BEBOP_GITHUB_REPO}"
+        return 1
+    fi
+    printf '%s\t%s\n' "$(release_source_cache_name "$branch" "$sha")" "$sha"
+}
+
+# release_cache_ensure_from_source <name> <branch> <head_sha>
+# Idempotent: no-op when the cache already holds <name>. Otherwise clones
+# <branch> (depth 1), checks it is still at <head_sha>, fetches its Git LFS
+# files (be-BOP keeps assets/*.csv in LFS — the IP geolocation database
+# among them; a plain clone only holds the pointers, which build-release.sh
+# would copy as-is), runs the be-BOP
+# scripts/build-release.sh, and installs the resulting release directory
+# under $BEBOP_RELEASE_CACHE_ROOT/<name> — same lock and same staging +
+# pnpm install --prod as release_cache_ensure_from_url.
+release_cache_ensure_from_source() {
+    local name="$1" branch="$2" sha="$3"
+    if release_cache_has "$name"; then
+        log_debug "cache: ${name} already present at $(release_cache_dir "$name")"
+        return 0
+    fi
+    run_privileged install -d -m 0755 "$BEBOP_RELEASE_CACHE_ROOT"
+    local lock="${BEBOP_RELEASE_CACHE_ROOT}/.${name//\//__}.lock"
+    run_privileged touch "$lock"
+    run_privileged chmod 0644 "$lock"
+
+    (
+        exec 9<>"$lock" || die "release_cache: cannot open lock ${lock}"
+        flock -x 9 || die "release_cache: failed to acquire lock ${lock}"
+        if release_cache_has "$name"; then
+            log_debug "cache: ${name} populated by concurrent caller while waiting on lock"
+            exit 0
+        fi
+        local cache_dir
+        cache_dir=$(release_cache_dir "$name")
+        local tmp
+        tmp=$(mktemp -d /var/tmp/bebop-src-build.XXXXXX)
+        # shellcheck disable=SC2064
+        trap "rm -rf '$tmp'" EXIT
+        log_info "cache: cloning ${branch} (${sha:0:8}) from ${BEBOP_GITHUB_REPO}..."
+        git clone --quiet --depth 1 --branch "$branch" \
+                "https://github.com/${BEBOP_GITHUB_REPO}.git" "${tmp}/src" \
+            || die "cache: git clone failed for branch '${branch}'"
+        local cloned
+        cloned=$(git -C "${tmp}/src" rev-parse HEAD)
+        [[ "$cloned" == "$sha" ]] \
+            || die "cache: branch '${branch}' moved during the deploy (expected ${sha:0:8}, cloned ${cloned:0:8}) — re-run"
+        command -v git-lfs >/dev/null 2>&1 \
+            || die "cache: git-lfs is not installed (apt install git-lfs, or re-run host-bootstrap.sh)"
+        log_info "cache: fetching Git LFS files for ${name}..."
+        ( cd "${tmp}/src" && git lfs install --local >/dev/null && git lfs pull ) \
+            || die "cache: git lfs pull failed for branch '${branch}'"
+        log_info "cache: building ${name} with scripts/build-release.sh..."
+        mkdir -p "${tmp}/home"
+        if ! ( cd "${tmp}/src" && env HOME="${tmp}/home" COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+                bash ./scripts/build-release.sh ); then
+            die "cache: scripts/build-release.sh failed for ${name}"
+        fi
+        local payload_dir
+        payload_dir=$(find "${tmp}/src/release" -mindepth 1 -maxdepth 1 -type d -name 'bebop-*' | head -1)
+        [[ -n "$payload_dir" && -f "${payload_dir}/package.json" ]] \
+            || die "cache: build produced no release/bebop-*/package.json for ${name}"
+        local lfs_pointers
+        lfs_pointers=$(grep -rl '^version https://git-lfs.github.com/spec/v1' "$payload_dir" 2>/dev/null || true)
+        [[ -z "$lfs_pointers" ]] \
+            || die "cache: release ${name} still holds Git LFS pointers instead of files: ${lfs_pointers//$'\n'/ }"
+
+        local staging="${cache_dir}.staging.$$"
+        run_privileged install -d -m 0755 "$(dirname "$cache_dir")"
+        run_privileged rm -rf "$staging" "$cache_dir"
+        run_privileged mv "$payload_dir" "$staging"
+        run_privileged chown -R root:root "$staging"
+        run_privileged find "$staging" -type d -exec chmod 0755 {} +
+        run_privileged find "$staging" -type f -exec chmod 0644 {} +
+        log_info "cache: installing deps for ${name}..."
+        if ! ( cd "$staging" && run_privileged env \
+                HOME=/tmp COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
+                pnpm install --prod --frozen-lockfile ); then
+            run_privileged rm -rf "$staging"
+            die "cache: pnpm install failed for ${name}"
+        fi
+        run_privileged touch "${staging}/.bebop_install_success"
+        run_privileged mv -T "$staging" "$cache_dir"
+        log_info "cache: ${name} ready at ${cache_dir}"
+    ) || return $?
+}
+
 # release_resolve_nth_before <reference_tag> <k>
 # Echo the k-th release older than <reference_tag> in the GitHub list of
 # releases-with-matching-asset (newest-first ordering as returned by the API).

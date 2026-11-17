@@ -278,6 +278,8 @@ step_install_apt_packages() {
                                 # through a third-party artifact host. scripts/build-release.sh
                                 # also derives the artifact name from `git rev-parse`,
                                 # so a plain tarball extraction is not a substitute.
+        git-lfs                 # be-BOP keeps assets/*.csv in Git LFS; without it a
+                                # source build ships the pointers, not the files
         rclone
         nginx apache2-utils
         certbot

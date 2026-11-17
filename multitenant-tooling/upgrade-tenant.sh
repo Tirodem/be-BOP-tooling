@@ -6,7 +6,8 @@
 #
 # Steps:
 #   1. Resolve --version (default: "latest"; "branch=<name>" for the newest
-#      CI artifact of a be-BOP branch).
+#      CI artifact of a be-BOP branch; "source=<name>" to build the head of
+#      a branch on this host, for branches without a pull request).
 #   2. Note the currently-active release tag (for rollback).
 #   3. Download + extract + pnpm install the new release.
 #   4. Atomically swap the 'current' symlink.
@@ -80,6 +81,12 @@ Usage:
 
 Options:
   --version <tag>             release tag, or "latest" (default)
+                              branch=<name>: newest CI artifact of a branch
+                                (needs a pull request, hence a CI run)
+                              source=<name>: build the head of a branch on
+                                this host from source (no pull request, no
+                                CI artifact); the tenant is then frozen so
+                                upgrade-all.sh leaves it alone
   --no-rollback-on-failure    do NOT revert the symlink if the healthcheck
                               fails (default: rollback enabled)
   --runtime-config KEY=VALUE
@@ -247,8 +254,15 @@ main() {
     # "latest" / validate the tag the normal way.
     # "branch=<name>" targets the newest CI artifact of that branch; its
     # cache key embeds the head SHA, so a new push yields a new tag.
-    local new_url=""
-    if [[ "$VERSION" == branch=* ]]; then
+    local new_url="" src_branch="" src_sha=""
+    if [[ "$VERSION" == source=* ]]; then
+        local resolved
+        src_branch="${VERSION#source=}"
+        resolved=$(release_resolve_source "$src_branch") \
+            || die "cannot resolve the head of branch '${src_branch}'"
+        new_tag=$(cut -f1 <<<"$resolved")
+        src_sha=$(cut -f2 <<<"$resolved")
+    elif [[ "$VERSION" == branch=* ]]; then
         local resolved
         resolved=$(release_resolve_branch "${VERSION#branch=}") \
             || die "cannot resolve a CI artifact for branch '${VERSION#branch=}'"
@@ -278,7 +292,9 @@ main() {
         exit 0
     fi
 
-    if [[ -n "$new_url" ]]; then
+    if [[ -n "$src_branch" ]]; then
+        release_cache_ensure_from_source "$new_tag" "$src_branch" "$src_sha"
+    elif [[ -n "$new_url" ]]; then
         release_cache_ensure_from_url "$new_tag" "$new_url"
     else
         release_cache_ensure "$new_tag"
@@ -326,9 +342,30 @@ main() {
         # shellcheck disable=SC2064
         trap "registry_unlock" EXIT
         registry_set_field "$TENANT_ID" bebop_version "$new_tag"
+        registry_unlock
+        # A source build is not a release upgrade-all.sh knows how to
+        # follow: without the freeze, the next run puts the tenant back on
+        # the latest release.
+        local freeze_note=""
+        if [[ -n "$src_branch" ]]; then
+            if "${SCRIPT_DIR}/freeze-tenant.sh" add "$TENANT_ID"; then
+                freeze_note="
+Built from source (${src_branch}); tenant frozen — upgrade-all.sh skips it until: freeze-tenant.sh remove ${TENANT_ID}"
+            else
+                log_error "upgrade: ${TENANT_ID} runs a source build but could NOT be frozen — run: freeze-tenant.sh add ${TENANT_ID}"
+                freeze_note="
+WARNING: built from source but NOT frozen — the next upgrade-all.sh run will replace it. Run: freeze-tenant.sh add ${TENANT_ID}"
+            fi
+        fi
+        local branch_note=""
+        if [[ "$VERSION" == branch=* ]]; then
+            branch_note=" (branch ${VERSION#branch=})"
+        elif [[ -n "$src_branch" ]]; then
+            branch_note=" (branch ${src_branch}, built from source)"
+        fi
         notify_success \
             "[be-BOP tooling] upgrade ${TENANT_ID} OK" \
-            "Tenant ${TENANT_ID} upgraded ${old_tag} → ${new_tag}."
+            "Tenant ${TENANT_ID} upgraded ${old_tag} → ${new_tag}${branch_note}.${freeze_note}"
         log_info "upgrade OK: ${TENANT_ID} now on ${new_tag}"
         exit 0
     fi
