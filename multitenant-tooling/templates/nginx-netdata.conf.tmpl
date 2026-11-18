@@ -36,8 +36,9 @@ server {
 
 # --- HTTPS Netdata reverse proxy with basic auth -----------------------------
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    # HTTP/2 stays off until the distributions ship nginx with the fixes of CVE-2026-123633 and CVE-2026-123007.
+    listen 443 ssl;
+    listen [::]:443 ssl;
     server_name @netdata_hostname@;
 
     ssl_certificate     /etc/letsencrypt/live/netdata-host/fullchain.pem;
