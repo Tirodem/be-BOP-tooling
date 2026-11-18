@@ -766,6 +766,36 @@ EOF
 # the OLD cert (read at startup) until manual intervention, and the cert
 # eventually expires. We install a post-renewal hook so every renewal
 # triggers a reload across the entire fleet.
+# === HTTP/2 off in the vhosts already installed =========================
+# The templates no longer enable HTTP/2 (CVE-2026-123633, CVE-2026-123007),
+# but a vhost is only rendered when its tenant is created or re-applied.
+# Updating the tooling must be enough to protect a host: this step patches
+# the vhosts already on disk and restarts nginx, through fix-http2-vhosts.sh.
+# No-op on a fresh host and on a host already patched.
+#
+# Runs right after nginx is up, before any step that can die on external
+# state (DNS provider, certificates), so that a failure there cannot leave
+# the host exposed. A failure here is reported loudly but does not stop the
+# bootstrap: the rest of the host setup must not depend on it.
+step_disable_http2_in_installed_vhosts() {
+    local fix="${SCRIPT_DIR}/fix-http2-vhosts.sh"
+    if [[ ! -f "$fix" ]]; then
+        log_warn "HTTP/2: ${fix} not found — vhosts already installed are NOT patched"
+        return 0
+    fi
+    if ! command -v nginx >/dev/null 2>&1; then
+        log_info "HTTP/2: nginx not installed yet — no vhost to patch"
+        return 0
+    fi
+    local args=()
+    [[ "$DRY_RUN" == "true" ]] && args+=( --dry-run )
+    [[ "$VERBOSE" == "true" ]] && args+=( --verbose )
+    log_info "HTTP/2: removing it from the nginx vhosts already installed..."
+    if ! bash "$fix" "${args[@]+"${args[@]}"}"; then
+        log_warn "HTTP/2: fix-http2-vhosts.sh FAILED — HTTP/2 may still be on, see the errors above and re-run: sudo ${fix}"
+    fi
+}
+
 step_install_certbot_nginx_reload_hook() {
     log_info "Installing certbot post-renewal nginx reload hook..."
     maybe_run run_privileged install -d -m 0755 /etc/letsencrypt/renewal-hooks/post
@@ -1840,6 +1870,7 @@ main() {
 
     step_write_nginx_default_vhost
     step_start_nginx
+    step_disable_http2_in_installed_vhosts
 
     step_remove_legacy_ovh_ini
     step_cleanup_legacy_unit_names

@@ -61,7 +61,9 @@ Options:
 10. Creates the `be-bop-cli` system user (parity with v1).
 11. Writes `/etc/garage.toml` (no `root_domain` — see root README) and
     `/etc/systemd/system/garage.service`, starts Garage, applies layout.
-12. Writes a 444 catch-all default nginx vhost; enables nginx.
+12. Writes a 444 catch-all default nginx vhost; enables nginx; removes HTTP/2
+    from the vhosts already installed (`fix-http2-vhosts.sh`) and restarts
+    nginx if one of them changed.
 13. (No-op now — kept for backwards compat: removes any legacy
     `/etc/letsencrypt/ovh.ini` left behind by hosts previously using
     the `certbot-dns-ovh` plugin. Credentials come from `secrets.env`

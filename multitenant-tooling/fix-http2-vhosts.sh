@@ -31,7 +31,8 @@
 #   5. Checks the configuration nginx loads for a remaining HTTP/2 listener.
 #
 # Idempotent: a vhost without HTTP/2 is left untouched, and nginx is only
-# restarted when a file changed.
+# restarted when a file changed. host-bootstrap.sh runs it on every pass,
+# so updating the tooling is enough; it can also be run by hand.
 #
 # Usage:
 #   sudo fix-http2-vhosts.sh                    # patch + nginx restart
